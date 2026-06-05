@@ -1,0 +1,3987 @@
+openapi: "3.0.3"
+info:
+  title: SML Staff Marketplace API
+  version: "1.1.0"
+  description: |
+    Express.js port of the original Java/JAX-RS MarketPlaceWebService.
+
+    All endpoints are under `/service/v1` (included in the server URL below).
+
+    **Auth note**: Failed login returns HTTP 200 with `data: []` — not HTTP 401.
+
+    **Image endpoints**: Return binary `image/png`. `/imagesguid` never returns 404 — returns empty buffer instead.
+
+servers:
+  - url: http://localhost:47309/service/v1
+    description: Local development (current SML Staff Ubon)
+  - url: http://localhost:47300/service/v1
+    description: Local development (legacy preview)
+
+tags:
+  - name: Auth
+    description: Employee and customer login
+  - name: Product
+    description: Product catalog, pricing, and inventory
+  - name: Promotion
+    description: Sales promotion calculation
+  - name: Cart
+    description: Shopping cart (staff_cart_order)
+  - name: Order
+    description: Order creation, payment, cancellation, history
+  - name: Customer
+    description: Customer and employee master data
+  - name: Financial
+    description: Credit terms, advance payments, outstanding balance
+  - name: Document
+    description: Invoice and document retrieval
+  - name: Favorites
+    description: Customer favourite items
+  - name: Images
+    description: Product image serving with ETag caching
+  - name: POS
+    description: POS master data (branch, warehouse, shelf, config) and POS invoice creation
+  - name: Purchase
+    description: Purchase/PU document creation, edit, reference PO, supplier, and purchase pricing
+  - name: Print
+    description: Sale and purchase print form selection and HTML render endpoints
+
+security:
+  - GUIDHeader: []
+
+components:
+  securitySchemes:
+    GUIDHeader:
+      type: apiKey
+      in: header
+      name: GUID
+      description: Session identifier required by most endpoints
+
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        ERROR:
+          type: string
+          example: "database connection error"
+
+    ErrorResponseLower:
+      type: object
+      properties:
+        error:
+          type: string
+
+    SuccessOnly:
+      type: object
+      properties:
+        success:
+          type: boolean
+
+    EmployeeUser:
+      type: object
+      properties:
+        user_code:
+          type: string
+          example: "ADMIN"
+        user_name:
+          type: string
+          example: "ผู้ดูแลระบบ"
+        permissions:
+          type: array
+          description: Permission keys resolved from sml_staff_permission; empty/missing table defaults to all permissions.
+          items:
+            type: string
+          example: ["sell.view", "purchase.pu.view", "purchase.pu.create"]
+
+    CustomerUser:
+      type: object
+      properties:
+        user_code:
+          type: string
+          example: "C00001"
+        user_name:
+          type: string
+          example: "บริษัท ABC จำกัด"
+        address:
+          type: string
+        telephone:
+          type: string
+        tax_id:
+          type: string
+          description: From ar_customer_detail, "" if not set
+
+    Category:
+      type: object
+      properties:
+        code:
+          type: string
+          example: "CAT001"
+        name:
+          type: string
+          example: "เครื่องดื่ม"
+
+    ProductPagination:
+      type: object
+      properties:
+        total:
+          type: integer
+          example: 150
+        perPage:
+          type: integer
+          example: 20
+        page:
+          type: integer
+          description: 0-based (= floor(offset/limit))
+          example: 0
+        totalPage:
+          type: integer
+          example: 8
+
+    FlatPagination:
+      type: object
+      properties:
+        page:
+          type: integer
+          example: 1
+        page_size:
+          type: integer
+          example: 20
+        total_count:
+          type: integer
+          example: 5
+
+    PromotionItem:
+      type: object
+      properties:
+        from_qty:
+          type: number
+        to_qty:
+          type: number
+        unit_name:
+          type: string
+        price:
+          type: number
+        line_number:
+          type: integer
+
+    PromotionProcessItemInput:
+      type: object
+      required: [item_code, unit_code, qty, price, amount, stand_value, divide_value]
+      properties:
+        item_code: { type: string, example: "ITM001" }
+        item_name: { type: string }
+        unit_code: { type: string, example: "PCS" }
+        barcode: { type: string }
+        qty: { type: number, example: 2 }
+        price: { type: number, example: 100 }
+        amount: { type: number, description: "ProductItem._amount from POS; send the line amount after item discount" }
+        stand_value: { type: number, description: "ProductItem._standValue" }
+        divide_value: { type: number, description: "ProductItem._divideValue" }
+        price_type: { type: integer, description: "Matches ProductItem._price_type from the C# flow" }
+        discount_number: { type: integer, default: 0 }
+        drink_type: { type: integer, default: 0 }
+        have_point: { type: boolean, default: false }
+
+    PromotionProcessRequest:
+      type: object
+      required: [items]
+      properties:
+        cust_code: { type: string, example: "C00001" }
+        member_code: { type: string, description: "POS _memberCode. Unlike cust_code, this controls MemberCondition." }
+        pos_default_cust: { type: string, description: "If member_code equals this value, the endpoint treats member_code as empty, matching POS." }
+        version:
+          type: string
+          description: "Optional _myGlobal version name, e.g. SMLTomYumGoong, used by food/drink no-discount logic."
+        promotion_fixed_unitcode:
+          type: boolean
+          description: "Optional override; defaults to erp_option.promotion_fixed_unitcode"
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/PromotionProcessItemInput' }
+
+    PromotionProcessResult:
+      type: object
+      properties:
+        _promotionCode: { type: string }
+        _promotionName: { type: string }
+        _qty: { type: number }
+        _amount: { type: number }
+        _no_discount_amount: { type: number }
+        _noPointAmount: { type: number }
+
+    ProductListItem:
+      type: object
+      properties:
+        item_code:
+          type: string
+        item_name:
+          type: string
+        item_type:
+          type: string
+          description: '"0" = normal, "3" = set'
+        sold_out:
+          type: string
+          enum: ["0", "1"]
+        is_promotion:
+          type: string
+          enum: ["0", "1"]
+        favorite_item:
+          type: string
+        unit_standard:
+          type: string
+        start_sale_unit:
+          type: string
+        unit_cost:
+          type: string
+        is_return:
+          type: string
+          enum: ["0", "1"]
+
+    ProductDetailItem:
+      type: object
+      properties:
+        barcode:
+          type: string
+        item_type:
+          type: string
+        item_code:
+          type: string
+        item_name:
+          type: string
+        unit_code:
+          type: string
+        balance_qty:
+          type: number
+        sold_out:
+          type: string
+        sum_sale:
+          type: number
+        wh_code:
+          type: string
+        shelf_code:
+          type: string
+        stand_value:
+          type: number
+        divide_value:
+          type: number
+        ratio:
+          type: number
+        favorite_item:
+          type: string
+        price:
+          type: string
+          description: String decimal, "0" if no price found
+        is_return:
+          type: string
+        description:
+          type: string
+        type:
+          type: string
+          description: Price type from getProductPriceLocalx
+        mode:
+          type: string
+        price_type:
+          type: string
+          description: '"3" = customer-specific, "4" = group'
+        promotion:
+          type: array
+          items:
+            $ref: '#/components/schemas/PromotionItem'
+
+    ProductSetSubItem:
+      type: object
+      properties:
+        item_code:
+          type: string
+        item_name:
+          type: string
+        unit_code:
+          type: string
+        qty:
+          type: number
+        balance_qty:
+          type: integer
+        price:
+          type: number
+        sum_amount:
+          type: number
+        barcode:
+          type: string
+        price_ratio:
+          type: number
+        stand_value:
+          type: number
+        divide_value:
+          type: number
+
+    CartItemInput:
+      type: object
+      required: [cust_code, item_code, unit_code]
+      properties:
+        cust_code:
+          type: string
+          example: "C00001"
+        emp_code:
+          type: string
+        guid_code:
+          type: string
+          format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        item_code:
+          type: string
+          example: "ITM001"
+        item_name:
+          type: string
+        unit_code:
+          type: string
+          example: "ขวด"
+        barcode:
+          type: string
+          default: ""
+        qty:
+          type: number
+          default: 1
+        price:
+          type: number
+          default: 0
+        item_type:
+          type: string
+          enum: ["0", "3"]
+          default: "0"
+        wh_code:
+          type: string
+        shelf_code:
+          type: string
+        stand_value:
+          type: number
+          default: 1
+        divide_value:
+          type: number
+          default: 1
+        ratio:
+          type: number
+          default: 1
+
+    CartItem:
+      type: object
+      properties:
+        cust_code:
+          type: string
+        guid_code:
+          type: string
+          format: uuid
+        item_code:
+          type: string
+        item_name:
+          type: string
+        unit_code:
+          type: string
+        item_type:
+          type: string
+        barcode:
+          type: string
+        qty:
+          type: string
+        price:
+          type: string
+        wh_code:
+          type: string
+        shelf_code:
+          type: string
+        creator_code:
+          type: string
+        create_datetime:
+          type: string
+          format: date-time
+        stand_value:
+          type: string
+        divide_value:
+          type: string
+        ratio:
+          type: string
+        balance_qty:
+          type: integer
+          description: Always 0 — use /validatecartstock for real stock
+
+    CartOrderItem:
+      allOf:
+        - $ref: '#/components/schemas/CartItem'
+        - type: object
+          properties:
+            tax_type:
+              type: integer
+            price_confirm:
+              type: string
+              description: '"0" if item_type != "3"; else set price'
+
+    StockCheckInput:
+      type: object
+      properties:
+        item_code:
+          type: string
+        unit_code:
+          type: string
+
+    StockResult:
+      type: object
+      properties:
+        item_code:
+          type: string
+        unit_code:
+          type: string
+        balance_qty:
+          type: integer
+
+    StockIssue:
+      type: object
+      properties:
+        item_code:
+          type: string
+        item_name:
+          type: string
+        qty_in_cart:
+          type: integer
+        balance_qty:
+          type: integer
+        issue_type:
+          type: string
+          enum: [out_of_stock, exceeding]
+
+    CartOrderPriceInput:
+      type: object
+      required: [item_code, unit_code]
+      properties:
+        item_code:
+          type: string
+        unit_code:
+          type: string
+        qty:
+          type: number
+          default: 1
+        item_type:
+          type: string
+          default: "0"
+        price:
+          type: number
+          description: Used only when item_type = "3"
+
+    CartOrderPriceResult:
+      type: object
+      properties:
+        item_code:
+          type: string
+        unit_code:
+          type: string
+        price_confirm:
+          type: number
+        success:
+          type: boolean
+        error_type:
+          type: string
+        message:
+          type: string
+
+    OrderSubItem:
+      type: object
+      properties:
+        item_code:
+          type: string
+        item_name:
+          type: string
+        unit_code:
+          type: string
+        qty:
+          type: number
+        price:
+          type: number
+        sum_amount:
+          type: number
+        wh_code:
+          type: string
+        shelf_code:
+          type: string
+        stand_value:
+          type: number
+        divide_value:
+          type: number
+        price_ratio:
+          type: number
+
+    OrderItemInput:
+      type: object
+      required: [item_code, unit_code, qty, price, sum_amount, item_type]
+      properties:
+        item_code:
+          type: string
+        item_name:
+          type: string
+        unit_code:
+          type: string
+        qty:
+          type: number
+        price:
+          type: number
+        sum_amount:
+          type: number
+        wh_code:
+          type: string
+        shelf_code:
+          type: string
+        stand_value:
+          type: number
+        divide_value:
+          type: number
+        ratio:
+          type: number
+        item_type:
+          type: string
+          enum: ["0", "3"]
+        sub_item:
+          type: array
+          description: Required when item_type = "3"
+          items:
+            $ref: '#/components/schemas/OrderSubItem'
+
+    SendOrderRequest:
+      type: object
+      required: [doc_no, doc_date, cust_code, total_after_vat, items]
+      properties:
+        doc_no:
+          type: string
+          description: Should contain "MQT" to appear in getOrderHistory
+          example: "MQT2401150001"
+        doc_date:
+          type: string
+          format: date
+          example: "2024-01-15"
+        send_date:
+          type: string
+          format: date
+        send_day:
+          type: string
+          default: "0"
+        cust_code:
+          type: string
+          example: "C00001"
+        send_type:
+          type: string
+          default: "0"
+        total_after_vat:
+          type: string
+          description: Total incl. VAT — server calculates total_before_vat and total_vat_value at 7%
+          example: "1284.00"
+        total_value:
+          type: string
+          default: "0"
+        total_except_vat:
+          type: string
+          default: "0"
+        total_amount:
+          type: string
+          default: "0"
+        doc_time:
+          type: string
+          example: "08:30:00"
+        remark:
+          type: string
+        emp_code:
+          type: string
+        credit_day:
+          type: string
+          default: "0"
+        credit_date:
+          type: string
+          format: date
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItemInput'
+
+    PayDocDetail:
+      type: object
+      required: [doc_no, doc_date, total_amount]
+      properties:
+        doc_no:
+          type: string
+        doc_date:
+          type: string
+          format: date
+        total_amount:
+          type: string
+
+    PayRequest:
+      type: object
+      required: [doc_no, cust_code, doc_date, total_amount, doc_detail]
+      properties:
+        doc_no:
+          type: string
+          example: "RC2401150001"
+        doc_date:
+          type: string
+          format: date
+        doc_time:
+          type: string
+        cust_code:
+          type: string
+        wallet_amount:
+          type: string
+          default: "0"
+        total_amount:
+          type: string
+          example: "1284.00"
+        trans_number:
+          type: string
+          default: "0"
+        no_approved:
+          type: string
+          default: "0"
+        emp_code:
+          type: string
+        remark:
+          type: string
+        doc_detail:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/PayDocDetail'
+
+    CancelOrderRequest:
+      type: object
+      required: [doc_date, doc_no, doc_ref, cust_code]
+      properties:
+        doc_date:
+          type: string
+          format: date
+          example: "2024-01-15"
+        doc_no:
+          type: string
+          description: New SOC document number
+          example: "SOC2401150001"
+        doc_ref:
+          type: string
+          description: QT document number to cancel
+          example: "MQT2401150001"
+        cust_code:
+          type: string
+        doc_time:
+          type: string
+        emp_code:
+          type: string
+        remark:
+          type: string
+        send_type:
+          type: string
+
+    CancelOrderResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        msg:
+          type: string
+          enum: [success, duplicate_doc_no, ref_doc_not_found, already_cancelled, ref_doc_has_no_detail]
+        cancel_doc_no:
+          type: string
+        ref_doc_no:
+          type: string
+
+    OrderHistoryItem:
+      type: object
+      properties:
+        doc_no:
+          type: string
+        doc_date:
+          type: string
+          format: date
+        doc_time:
+          type: string
+        cust_code:
+          type: string
+        send_type:
+          type: integer
+        total_amount:
+          type: number
+        emp_code:
+          type: string
+        emp_name:
+          type: string
+        balance:
+          type: number
+        remark_qt:
+          type: string
+        remark_cancel:
+          type: string
+        remark_inv:
+          type: string
+        remark_5:
+          type: string
+        inv_doc_no:
+          type: string
+        inv_doc_date:
+          type: string
+        wallet_amount:
+          type: number
+        total_except_vat:
+          type: number
+        total_after_vat:
+          type: number
+        total_vat_value:
+          type: number
+        cn_total_amount:
+          type: number
+        status:
+          type: string
+          enum: [pending, packing, payment, success, partial, cancel]
+
+    OrderHeader:
+      type: object
+      properties:
+        doc_no:
+          type: string
+        doc_date:
+          type: string
+          format: date
+        doc_time:
+          type: string
+        cust_code:
+          type: string
+        send_type:
+          type: integer
+        send_date:
+          type: string
+          format: date
+        send_day:
+          type: integer
+        total_amount:
+          type: number
+        total_except_vat:
+          type: number
+        total_after_vat:
+          type: number
+        total_vat_value:
+          type: number
+        emp_code:
+          type: string
+        emp_name:
+          type: string
+        balance:
+          type: number
+        address:
+          type: string
+          description: transport_name from ic_trans_shipment
+        telephone:
+          type: string
+        address_name:
+          type: string
+          description: transport_address from ic_trans_shipment
+        remark_5:
+          type: string
+        status:
+          type: string
+          enum: [pending, packing, payment, success, partial, cancel]
+
+    OrderDetailPaging:
+      type: object
+      properties:
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total_items:
+          type: integer
+        total_pages:
+          type: integer
+
+    OrderDetailLineItem:
+      type: object
+      properties:
+        item_code:
+          type: string
+        item_name:
+          type: string
+        qty:
+          type: number
+        unit_code:
+          type: string
+        price:
+          type: number
+        sum_amount:
+          type: number
+        item_type:
+          type: string
+        set_ref_line:
+          type: string
+        ref_guid:
+          type: string
+          nullable: true
+        wh_code:
+          type: string
+        shelf_code:
+          type: string
+        stand_value:
+          type: number
+        divide_value:
+          type: number
+        ratio:
+          type: number
+        sub_item:
+          type: array
+          description: Present only when item_type = "3"
+          items:
+            type: object
+
+    CustomerRecord:
+      type: object
+      properties:
+        code:
+          type: string
+        name:
+          type: string
+        address:
+          type: string
+        telephone:
+          type: string
+        tax_id:
+          type: string
+
+    EmployeeRecord:
+      type: object
+      properties:
+        code:
+          type: string
+        name:
+          type: string
+
+    CustomerCRMRecord:
+      type: object
+      properties:
+        code:
+          type: string
+        name:
+          type: string
+        address:
+          type: string
+        telephone:
+          type: string
+        logistic_area:
+          type: string
+        gps:
+          type: string
+          description: GPS coords stored in ar_customer.website field
+        group_main:
+          type: string
+
+    CustomerCRMPagination:
+      type: object
+      properties:
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+        current_page:
+          type: integer
+        total_page:
+          type: integer
+
+    CustomerCreditData:
+      type: object
+      properties:
+        code:
+          type: string
+        name:
+          type: string
+        credit_day:
+          type: integer
+          example: 30
+        credit_date:
+          type: string
+          format: date
+          description: Computed as NOW() + credit_day days
+
+    AdvancePayment:
+      type: object
+      properties:
+        doc_no:
+          type: string
+        doc_date:
+          type: string
+          format: date
+        total_amount:
+          type: number
+        used:
+          type: number
+        balance_amount:
+          type: number
+
+    DocListItem:
+      type: object
+      properties:
+        inquiry_type:
+          type: integer
+        trans_flag:
+          type: integer
+        last_status:
+          type: integer
+          description: 0 = active, 1 = cancelled
+        doc_no:
+          type: string
+        doc_date:
+          type: string
+          format: date
+        doc_time:
+          type: string
+        cust_code:
+          type: string
+        cust_name:
+          type: string
+        send_type:
+          type: integer
+        total_amount:
+          type: number
+        cn_total_amount:
+          type: number
+        emp_code:
+          type: string
+        emp_name:
+          type: string
+        remark:
+          type: string
+        ar_no:
+          type: string
+        total_discount:
+          type: number
+        balance:
+          type: number
+        discount_word:
+          type: string
+        status:
+          type: string
+          nullable: true
+
+    DocDetailLineItem:
+      type: object
+      properties:
+        item_code:
+          type: string
+        item_name:
+          type: string
+        unit_code:
+          type: string
+        wh_code:
+          type: string
+        shelf_code:
+          type: string
+        stand_value:
+          type: number
+        qty:
+          type: number
+        divide_value:
+          type: number
+        ratio:
+          type: number
+        price:
+          type: number
+        sum_amount:
+          type: number
+
+    CompanyProfile:
+      type: object
+      properties:
+        company_name:
+          type: string
+        address:
+          type: string
+        telephone_number:
+          type: string
+
+    ImageMeta:
+      type: object
+      properties:
+        image_id:
+          type: string
+          description: Same as item_code
+        guid_code:
+          type: string
+          format: uuid
+
+    BranchItem:
+      type: object
+      properties:
+        code:  { type: string, example: "BKK" }
+        name_1: { type: string, example: "สาขากรุงเทพ" }
+
+    WarehouseItem:
+      type: object
+      properties:
+        code:  { type: string, example: "WH01" }
+        name_1: { type: string, example: "คลังหลัก" }
+
+    ShelfItem:
+      type: object
+      properties:
+        whcode: { type: string, example: "WH01" }
+        code:   { type: string, example: "A01" }
+        name_1: { type: string, example: "ชั้น A01" }
+
+    POSItem:
+      type: object
+      properties:
+        pos_id:          { type: string, example: "MPOS01" }
+        doc_format_code: { type: string, example: "MINV" }
+        doc_format:      { type: string, example: "@-yyyy-####", description: "Pattern สำหรับ gen doc_no — @ = pos prefix, # = running digit" }
+        pos_ic_wht:      { type: string, example: "WH01", description: "Warehouse เริ่มต้นของ POS นี้" }
+        pos_ic_shelf:    { type: string, example: "A01",  description: "Shelf เริ่มต้นของ POS นี้" }
+        branch_code:     { type: string, example: "BKK" }
+
+    ErpOption:
+      type: object
+      properties:
+        vat_type:    { type: integer, example: 1, description: "0=แยกนอก, 1=รวมใน, 2=ยกเว้น, 3=ไม่กระทบ" }
+        vat_rate:    { type: number,  example: 7.0 }
+        discout_type: { type: integer, example: 0, description: "0=ลดก่อน VAT, 1=ลดหลัง VAT (ตก n ตามชื่อ column จริง)" }
+
+    LastDocNoData:
+      type: object
+      properties:
+        pos_id:       { type: string, example: "MPOS01" }
+        trans_flag:   { type: integer, example: 44 }
+        last_doc_no:  { type: string, example: "MPOS-2026-0042", description: "doc_no ล่าสุดใน ic_trans, '' ถ้าไม่มี" }
+        last_running: { type: integer, example: 42, description: "Running number ล่าสุด, 0 ถ้าไม่มี" }
+        doc_pattern:  { type: string, example: "MPOS-2026-####", description: "Pattern จริง (# = ตำแหน่ง running)" }
+
+    SaveTransItemInput:
+      type: object
+      required: [item_code, item_name, unit_code, qty, price, sum_amount, wh_code, shelf_code]
+      properties:
+        item_code:    { type: string, example: "ITM001" }
+        item_name:    { type: string, example: "น้ำดื่ม ABC" }
+        unit_code:    { type: string, example: "ขวด" }
+        barcode:      { type: string, default: "" }
+        qty:          { type: string, example: "10" }
+        price:        { type: string, example: "12.00" }
+        sum_amount:   { type: string, example: "120.00" }
+        wh_code:      { type: string, example: "WH01" }
+        shelf_code:   { type: string, example: "A01" }
+        stand_value:  { type: string, default: "1" }
+        divide_value: { type: string, default: "1" }
+        ratio:        { type: string, default: "1" }
+
+    PaymentDetailInput:
+      type: object
+      required: [pay_type, pay_amount]
+      properties:
+        pay_type:
+          type: string
+          enum: ["0", "21", "3"]
+          description: '"0"=เงินสด, "21"=บัตรเครดิต, อื่นๆ=wallet/โอน'
+          example: "0"
+        pay_amount:
+          type: string
+          example: "950.00"
+        trans_number:
+          type: string
+          default: ""
+          description: เลขอ้างอิงธุรกรรม
+        charge:
+          type: string
+          default: "0"
+          description: ค่าธรรมเนียมบัตร (สำหรับ pay_type 21)
+        no_approved:
+          type: string
+          description: รหัสอนุมัติบัตร (สำหรับ pay_type 21)
+
+    SaveTransRequest:
+      type: object
+      required: [doc_date, doc_time, pos_id, cust_code, total_value, items]
+      properties:
+        doc_date:            { type: string, format: date,  example: "2024-01-15" }
+        doc_time:            { type: string,                example: "09:00:00" }
+        doc_format_code:     { type: string, default: "MINV" }
+        cust_code:           { type: string, example: "C00001" }
+        branch_code:         { type: string, default: "" }
+        emp_code:            { type: string, example: "EMP001" }
+        pos_id:              { type: string, example: "MPOS01" }
+        shelf_code:          { type: string, example: "A01" }
+        remark:              { type: string, default: "" }
+        vat_type:            { type: integer, default: 1,   description: "0=แยกนอก, 1=รวมใน, 2/3=ยกเว้น" }
+        vat_rate:            { type: number,  default: 7.0, description: "ดึงจาก getErpOption แล้วส่งมา" }
+        discount_type:       { type: integer, default: 0,   description: "0=ลดก่อน VAT, 1=ลดหลัง VAT" }
+        discount_word:       { type: string,  default: "",  description: 'เช่น "5%", "5+3%", "100B", "" = ไม่ลด' }
+        total_value:         { type: string, example: "1000.00", description: "ยอดรวมก่อน discount (sum ของ items)" }
+        total_net_amount:    { type: string, default: "0",  description: "ยอดหลัง VAT + discount" }
+        total_credit_charge: { type: string, default: "0" }
+        cash_amount:         { type: string, default: "0",  description: "เงินสดที่รับมาจากลูกค้า (0 = ไม่ได้จ่ายเงินสด)" }
+        tranfer_amount:      { type: string, default: "0" }
+        card_amount:         { type: string, default: "0" }
+        wallet_amount:       { type: string, default: "0" }
+        rounded_amount:      { type: number, default: 0,    description: "ยอดปัดเศษ (+ = ปัดขึ้น, - = ปัดลง)" }
+        items:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/SaveTransItemInput' }
+        payment_detail:
+          type: array
+          items: { $ref: '#/components/schemas/PaymentDetailInput' }
+
+    SaveTransPromotionInput:
+      type: object
+      description: Promotion row saved to ic_trans_detail_promotion. Can use rows from processPromotion.promotion_product_rows.
+      properties:
+        promotion_code: { type: string, example: "PRO-BUY2DISC10" }
+        promotion_name: { type: string, example: "Buy 2 discount 10" }
+        item_name:      { type: string, example: "Buy 2 discount 10", description: "Alias for promotion_name" }
+        qty:            { type: number, example: 1 }
+        price:          { type: number, example: -10 }
+        sum_amount:     { type: number, example: -10 }
+        amount:         { type: number, example: -10, description: "Alias for sum_amount" }
+        line_number:    { type: integer, example: 2 }
+
+    SaveTransAndProRequest:
+      allOf:
+        - $ref: '#/components/schemas/SaveTransRequest'
+        - type: object
+          properties:
+            promotion_detail:
+              type: array
+              description: Promotion rows to insert into ic_trans_detail_promotion.
+              items: { $ref: '#/components/schemas/SaveTransPromotionInput' }
+            promotion_product_rows:
+              type: array
+              description: Alias accepted by API; pass processPromotion.promotion_product_rows directly.
+              items: { $ref: '#/components/schemas/SaveTransPromotionInput' }
+
+    SaveTransResponse:
+      type: object
+      properties:
+        success: { type: boolean }
+        doc_no:  { type: string, example: "MPOS-2026-0043" }
+        promotion_count: { type: integer, example: 1 }
+        msg:     { type: string, example: "success" }
+
+    PermissionItem:
+      type: object
+      properties:
+        key:
+          type: string
+          example: "purchase.pu.create"
+        label:
+          type: string
+          example: "ซื้อ/ตั้งหนี้ (PU): สร้างเอกสาร"
+
+    DocFormatItem:
+      type: object
+      properties:
+        code:
+          type: string
+          example: "PU"
+        name_1:
+          type: string
+          example: "ซื้อสินค้า/ตั้งหนี้"
+        format:
+          type: string
+          example: "@-YYMM####"
+        form_code:
+          type: string
+          example: "PUPOR1"
+
+    NextDocNoResponse:
+      type: object
+      properties:
+        success: { type: boolean }
+        doc_no: { type: string, example: "PU-26050018" }
+        doc_format_code: { type: string, example: "PU" }
+        doc_format_name: { type: string, example: "ซื้อเลี่ยงภาษี" }
+        doc_format: { type: string, example: "@-YYMM####" }
+        form_code: { type: string, example: "PUPOR1" }
+
+    BarcodeItem:
+      type: object
+      properties:
+        item_code: { type: string, example: "01-0004" }
+        item_name: { type: string, example: "ซีรีแล็ค โจ๊ก 200กรัม/ผัก 3 สี" }
+        barcode: { type: string, example: "9556001131751" }
+        unit_code: { type: string, example: "ชิ้น" }
+        price: { type: number, example: 100 }
+        stand_value: { type: number, example: 1 }
+        divide_value: { type: number, example: 1 }
+        ratio: { type: number, example: 1 }
+        stock_qty: { type: number, example: 0 }
+        tax_type: { type: integer, example: 0 }
+
+    PassBookItem:
+      type: object
+      properties:
+        code: { type: string, example: "KBANK01" }
+        bank_code: { type: string, example: "004" }
+        bank_name: { type: string, example: "ธนาคารกสิกรไทย" }
+        bank_branch: { type: string, example: "0001" }
+        branch_name: { type: string }
+        book_name: { type: string, example: "บัญชีรับโอน" }
+
+    PurchaseLatestItemPriceRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [item_code, unit_code]
+            properties:
+              item_code: { type: string, example: "01-0004" }
+              unit_code: { type: string, example: "ชิ้น" }
+              barcode:
+                type: string
+                description: Optional echo field only; latest PU price lookup uses item_code + unit_code.
+                example: "9556001131751"
+
+    PurchaseLatestItemPrice:
+      type: object
+      properties:
+        item_code: { type: string, example: "01-0004" }
+        unit_code: { type: string, example: "ชิ้น" }
+        barcode: { type: string, example: "9556001131751" }
+        price: { type: number, example: 500 }
+        price_doc_no: { type: string, example: "PU-26050017" }
+        price_doc_date: { type: string, format: date, example: "2026-05-12" }
+        price_unit_code: { type: string, example: "ชิ้น" }
+        price_barcode: { type: string, example: "9556001131751" }
+
+    PurchaseProductDetailItem:
+      type: object
+      description: PU-specific product detail; intentionally excludes sales-only promotion/stock-sale fields.
+      properties:
+        item_code: { type: string, example: "01-0004" }
+        item_name: { type: string, example: "ซีรีแล็ค โจ๊ก 200กรัม/ผัก 3 สี" }
+        unit_code: { type: string, example: "ชิ้น" }
+        barcode: { type: string, example: "9556001131751" }
+        stand_value: { type: number, example: 1 }
+        divide_value: { type: number, example: 1 }
+        ratio: { type: number, example: 1 }
+        tax_type: { type: integer, example: 0 }
+        price: { type: number, example: 500 }
+        last_purchase_doc_no: { type: string, example: "PU-26050017" }
+        last_purchase_doc_date: { type: string, format: date, example: "2026-05-12" }
+
+    SupplierListItem:
+      type: object
+      properties:
+        code: { type: string, example: "AP001" }
+        name: { type: string, example: "สด" }
+
+    SupplierDetail:
+      type: object
+      properties:
+        cust_code: { type: string, example: "AP001" }
+        cust_name: { type: string, example: "สด" }
+        address: { type: string }
+        telephone: { type: string }
+        tax_id: { type: string }
+        branch_code: { type: string }
+        branch_type: { type: string, example: "0" }
+
+    PODocWaitItem:
+      type: object
+      properties:
+        trans_type: { type: integer, example: 1 }
+        trans_flag: { type: integer, example: 6 }
+        doc_date: { type: string, format: date }
+        doc_time: { type: string }
+        doc_no: { type: string, example: "PO26020001" }
+        inquiry_type: { type: integer }
+        vat_type: { type: integer }
+        cust_code: { type: string, example: "AP001" }
+        cust_name: { type: string, example: "สด" }
+        vat_rate: { type: number, example: 7 }
+        user_request: { type: string }
+        doc_format_code: { type: string, example: "PO" }
+        creator_code: { type: string, example: "001" }
+        remark: { type: string }
+        total_qty: { type: number }
+        total_amount: { type: number }
+        pra_remark: { type: string }
+        pr_remark: { type: string }
+        pra_doc_list: { type: string }
+
+    PODocDetailItem:
+      type: object
+      properties:
+        item_code: { type: string, example: "05-0447" }
+        item_name: { type: string }
+        unit_code: { type: string, example: "ชิ้น" }
+        line_number: { type: integer }
+        po_qty: { type: number }
+        pu_qty: { type: number }
+        balance_qty: { type: number }
+        price: { type: number }
+        wh_code: { type: string }
+        shelf_code: { type: string }
+        barcode: { type: string }
+        stand_value: { type: number }
+        divide_value: { type: number }
+        ratio: { type: number }
+        tax_type: { type: integer }
+        maximum_qty: { type: number }
+        minimum_qty: { type: number }
+        updateable: { type: integer, description: "1 if this PO line has prior PU receive rows" }
+
+    PUDocRefInput:
+      type: object
+      required: [doc_no, doc_date]
+      properties:
+        doc_no: { type: string, example: "PO26020001" }
+        doc_date: { type: string, format: date, example: "2026-02-17" }
+
+    PUPaymentDetailInput:
+      type: object
+      description: Required only for cash PU when transfer_amount is greater than 0.
+      properties:
+        pass_book_code:
+          type: string
+          description: Stored as cb_trans_detail.trans_number.
+          example: "KBANK01"
+        bank_code: { type: string, example: "004" }
+        bank_branch: { type: string, example: "0001" }
+        pay_amount: { type: number, example: 500 }
+        transfer_date: { type: string, example: "2026-05-12" }
+
+    PUItemInput:
+      type: object
+      required: [item_code, unit_code, qty, price, wh_code, shelf_code]
+      properties:
+        doc_no:
+          type: string
+          description: Optional current PU doc_no echo; final doc_no is resolved by server on create.
+        ref_doc_no: { type: string, example: "PO26020001" }
+        ref_doc_date: { type: string, format: date, example: "2026-02-17" }
+        item_code: { type: string, example: "01-0004" }
+        item_name: { type: string }
+        unit_code: { type: string, example: "ชิ้น" }
+        qty:
+          type: number
+          description: PU allows receive quantity to exceed referenced PO balance.
+          example: 5
+        price: { type: number, example: 500 }
+        discount:
+          type: string
+          description: Supports SML-style line discounts such as "5%", "10", "@3".
+          example: "5%"
+        discount_amount: { type: number, example: 125 }
+        sum_amount:
+          type: number
+          description: Server recalculates from qty, price, and discount before save.
+          example: 2375
+        wh_code: { type: string, example: "MMA01" }
+        shelf_code: { type: string, example: "SH101" }
+        barcode: { type: string, example: "9556001131751" }
+        stand_value: { type: number, example: 1 }
+        divide_value: { type: number, example: 1 }
+        ratio: { type: number, example: 1 }
+        tax_type: { type: integer, example: 0 }
+
+    PUSaveRequest:
+      type: object
+      required: [doc_date, doc_time, doc_format_code, cust_code, emp_code, tax_doc_no, wh_from, location_from, items]
+      properties:
+        mode: { type: string, enum: [create, update], example: "create" }
+        doc_no:
+          type: string
+          description: Empty on create; required on update. Server resolves next doc_no again inside final transaction.
+          example: ""
+        doc_date: { type: string, format: date, example: "2026-05-12" }
+        doc_time: { type: string, example: "10:04" }
+        doc_format_code: { type: string, example: "PU" }
+        cust_code: { type: string, example: "AP001" }
+        ap_cust_code: { type: string, example: "AP001" }
+        ap_cust_name: { type: string }
+        branch_code: { type: string }
+        ap_branch_code: { type: string }
+        ap_tax_id: { type: string }
+        emp_code: { type: string, example: "001" }
+        sale_type:
+          type: integer
+          description: "0=เงินเชื่อ, 1/3=เงินสด"
+          example: 0
+        tax_type:
+          type: integer
+          description: "0=ภาษีแยกนอก, 1=ภาษีรวมใน, 2=ยกเว้น/ไม่คิดภาษีตาม config"
+          example: 1
+        vat_rate: { type: number, example: 7 }
+        tax_doc_no: { type: string, example: "PU-26050018" }
+        tax_doc_date: { type: string, format: date, example: "2026-05-12" }
+        doc_ref: { type: string }
+        doc_ref_date: { type: string, format: date, nullable: true }
+        wh_from: { type: string, example: "MMA01" }
+        location_from: { type: string, example: "SH101" }
+        remark: { type: string }
+        total_value: { type: number, example: 2500 }
+        total_before_vat: { type: number, example: 0 }
+        total_except_vat: { type: number, example: 2500 }
+        total_after_vat: { type: number, example: 0 }
+        total_vat_value: { type: number, example: 0 }
+        total_amount: { type: number, example: 2500 }
+        total_discount: { type: number, example: 0 }
+        rounded_amount: { type: number, example: 0 }
+        total_after_rounded: { type: number, example: 2500 }
+        cash_amount: { type: number, example: 0 }
+        transfer_amount: { type: number, example: 0 }
+        doc_list:
+          type: array
+          description: Empty array is allowed; PU can be saved without PO reference.
+          items: { $ref: '#/components/schemas/PUDocRefInput' }
+        payment_detail:
+          type: array
+          description: For cash PU, sum(pay_amount) must equal transfer_amount when transfer_amount > 0.
+          items: { $ref: '#/components/schemas/PUPaymentDetailInput' }
+        items:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/PUItemInput' }
+
+    PUSaveResponse:
+      type: object
+      properties:
+        success: { type: boolean }
+        msg: { type: string, example: "success" }
+        doc_no: { type: string, example: "PU-26050018" }
+        doc_format_code: { type: string, example: "PU" }
+        item_count: { type: integer, example: 2 }
+        po_ref_count: { type: integer, example: 1 }
+
+    PUSavePlan:
+      type: object
+      properties:
+        mode: { type: string, enum: [create, update] }
+        write_enabled: { type: boolean }
+        can_prepare_save: { type: boolean }
+        doc_no: { type: string }
+        doc_format_code: { type: string }
+        doc_format_name: { type: string }
+        form_code: { type: string }
+        supplier_code: { type: string }
+        sale_type: { type: integer }
+        tax_type: { type: integer }
+        counts:
+          type: object
+          properties:
+            items: { type: integer }
+            po_refs: { type: integer }
+            payment_detail: { type: integer }
+        po_refs:
+          type: array
+          items: { type: object }
+        errors:
+          type: array
+          items: { type: string }
+        warnings:
+          type: array
+          items: { type: string }
+        write_plan:
+          type: array
+          items:
+            type: object
+            properties:
+              table: { type: string }
+              action: { type: string }
+              rows: { type: integer }
+              scope: { type: string }
+
+    PUDocListItem:
+      type: object
+      properties:
+        trans_type: { type: integer }
+        trans_flag: { type: integer, example: 12 }
+        doc_date: { type: string, format: date }
+        doc_time: { type: string }
+        doc_no: { type: string, example: "PU-26050018" }
+        doc_ref: { type: string }
+        cust_code: { type: string, example: "AP001" }
+        cust_name: { type: string }
+        creator_code: { type: string, example: "001" }
+        remark: { type: string }
+        doc_format_code: { type: string, example: "PU" }
+        doc_format_name: { type: string }
+        form_code: { type: string, example: "PUPOR1" }
+        total_qty: { type: number }
+        total_amount: { type: number }
+        po_doc_list: { type: string, example: "PO26020001,PO25120073" }
+
+    PUDocDetailItem:
+      allOf:
+        - $ref: '#/components/schemas/PUItemInput'
+        - type: object
+          properties:
+            maximum_qty: { type: number }
+            minimum_qty: { type: number }
+
+    PUDocDetail:
+      type: object
+      properties:
+        doc_no: { type: string, example: "PU-26050018" }
+        doc_date: { type: string, format: date }
+        doc_time: { type: string }
+        doc_format_code: { type: string }
+        doc_format_name: { type: string }
+        form_code: { type: string }
+        cust_code: { type: string }
+        cust_name: { type: string }
+        emp_code: { type: string }
+        emp_name: { type: string }
+        tax_type: { type: integer }
+        sale_type: { type: integer }
+        tax_doc_no: { type: string }
+        tax_doc_date: { type: string, format: date }
+        doc_ref: { type: string }
+        doc_ref_date: { type: string, format: date }
+        wh_from: { type: string }
+        location_from: { type: string }
+        doc_success: { type: integer }
+        total_value: { type: number }
+        total_before_vat: { type: number }
+        total_except_vat: { type: number }
+        total_after_vat: { type: number }
+        total_vat_value: { type: number }
+        total_amount: { type: number }
+        total_discount: { type: number }
+        cash_amount: { type: number }
+        transfer_amount: { type: number }
+        total_after_rounded: { type: number }
+        rounded_amount: { type: number }
+        money_change: { type: number }
+        po_refs:
+          type: array
+          items: { $ref: '#/components/schemas/PUDocRefInput' }
+        po_doc_list: { type: string }
+        payment_detail:
+          type: array
+          items: { $ref: '#/components/schemas/PUPaymentDetailInput' }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/PUDocDetailItem' }
+
+    PrintFormOption:
+      type: object
+      properties:
+        formcode: { type: string, example: "PUPOR1" }
+        formname: { type: string, example: "ใบซื้อแสดงที่เก็บ" }
+        available: { type: boolean, example: true }
+        is_default: { type: boolean, example: true }
+
+    PrintFormOptions:
+      type: object
+      properties:
+        doc_no: { type: string, example: "PU-26050018" }
+        doc_format_code: { type: string, example: "PU" }
+        doc_format_name: { type: string }
+        form_code: { type: string, example: "PUPOR1,PUA4" }
+        forms:
+          type: array
+          items: { $ref: '#/components/schemas/PrintFormOption' }
+
+paths:
+
+  # ─── AUTH ────────────────────────────────────────────────────────────────────
+
+  /loginemp:
+    get:
+      tags: [Auth]
+      summary: Login พนักงาน
+      description: |
+        ตรวจสอบจาก erp_user (code case-insensitive, password case-sensitive)
+
+        **หมายเหตุ**: credential ผิด → HTTP 200 + `data: []` ไม่ใช่ 401
+      security: []
+      parameters:
+        - { name: user_code, in: query, required: true, schema: { type: string }, example: "ADMIN" }
+        - { name: password,  in: query, required: true, schema: { type: string }, example: "1234" }
+      responses:
+        '200':
+          description: Login สำเร็จ (data มี 1 element) หรือผิด (data = [])
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EmployeeUser'
+              examples:
+                success:
+                  value: { success: true, data: [{ user_code: "ADMIN", user_name: "ผู้ดูแลระบบ", permissions: ["sell.view", "purchase.pu.view"] }] }
+                failed:
+                  value: { success: true, data: [] }
+        '400':
+          description: Database error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /logincus:
+    get:
+      tags: [Auth]
+      summary: Login ลูกค้า
+      description: |
+        ตรวจสอบจาก ar_customer — รหัสผ่านเก็บใน field `country` (legacy Java design)
+
+        credential ผิด → HTTP 200 + `data: []`
+      security: []
+      parameters:
+        - { name: user_code, in: query, required: true, schema: { type: string }, example: "C00001" }
+        - { name: password,  in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Login สำเร็จหรือผิด (ดู data[])
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CustomerUser'
+        '400':
+          description: Database error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /getPermissionList:
+    get:
+      tags: [Auth]
+      summary: รายการ permission ทั้งหมดของ SML Staff
+      description: รวมสิทธิ์เมนูและสิทธิ์ action เช่น `purchase.pu.view`, `purchase.pu.create`, `purchase.pu.edit`, `purchase.pu.print`
+      responses:
+        '200':
+          description: Permission registry
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PermissionItem' }
+
+  /getEmployeePermissions:
+    get:
+      tags: [Auth]
+      summary: สิทธิ์ของพนักงาน
+      parameters:
+        - { name: user_code, in: query, required: true, schema: { type: string }, example: "001" }
+      responses:
+        '200':
+          description: Permission keys for employee
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { type: string }
+        '400':
+          description: user_code is required
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /setEmployeePermissions:
+    post:
+      tags: [Auth]
+      summary: บันทึกสิทธิ์พนักงาน
+      description: บันทึกลง `sml_staff_permission`; key ที่ไม่อยู่ใน registry จะถูก ignore.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_code, permissions]
+              properties:
+                user_code: { type: string, example: "001" }
+                permissions:
+                  type: array
+                  items: { type: string }
+                  example: ["purchase.pu.view", "purchase.pu.create"]
+      responses:
+        '200':
+          description: Saved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessOnly' }
+        '400':
+          description: Invalid payload
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  # ─── PRODUCT ─────────────────────────────────────────────────────────────────
+
+  /getCategoryList:
+    get:
+      tags: [Product]
+      summary: รายการหมวดหมู่สินค้า
+      responses:
+        '200':
+          description: ทุกหมวดหมู่จาก ic_category
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Category' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /getProductList:
+    get:
+      tags: [Product]
+      summary: รายการสินค้าพร้อม filter และ pagination
+      description: |
+        เฉพาะสินค้าที่ `item_pattern='[W]'`
+
+        `page` ใน response เป็น **0-based** (= floor(offset/limit))
+      parameters:
+        - { name: cust_code,     in: query, schema: { type: string },                                description: "รหัสลูกค้า — ใช้ตรวจ promotion/favorite" }
+        - { name: search,        in: query, schema: { type: string },                                description: "ค้นหาใน name_1, code, name_eng_2 (space = AND)" }
+        - { name: category,      in: query, schema: { type: string },                                description: "filter ด้วย item_category" }
+        - { name: offset,        in: query, schema: { type: integer, default: 0 },                   description: "จำนวน record ที่ข้าม" }
+        - { name: limit,         in: query, schema: { type: integer, default: 20 },                  description: "จำนวนต่อหน้า" }
+        - { name: premium,       in: query, schema: { type: string, enum: ["0","1"] },               description: '"1" = เฉพาะ premium' }
+        - { name: ispromotion,   in: query, schema: { type: string, enum: ["0","1"] },               description: '"1" = มีโปรโมชัน' }
+        - { name: isstock,       in: query, schema: { type: string, enum: ["0","1"] },               description: '"1" = สต็อก > minimum_qty' }
+        - { name: favorite,      in: query, schema: { type: string, enum: ["0","1"] },               description: '"1" = favorite ของลูกค้า' }
+        - { name: isproductset,  in: query, schema: { type: string, enum: ["0","1"] },               description: '"1" = เฉพาะชุด (item_type=3)' }
+      responses:
+        '200':
+          description: รายการสินค้า + pagination
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProductListItem' }
+                  pagination: { $ref: '#/components/schemas/ProductPagination' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /getProductDetail:
+    get:
+      tags: [Product]
+      summary: รายละเอียดสินค้า + ราคา + โปรโมชัน
+      description: |
+        หนึ่ง row ต่อ unit_code — **เฉพาะ row ที่ price ≠ "0"** ถูก return
+
+        ราคาคำนวณจาก getProductPriceLocalx() (7 cascading strategies)
+      parameters:
+        - { name: item_code, in: query, required: true,  schema: { type: string }, example: "ITM001" }
+        - { name: cust_code, in: query,                  schema: { type: string }, example: "C00001" }
+      responses:
+        '200':
+          description: รายละเอียดต่อ unit_code
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProductDetailItem' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /getProductSetDetail:
+    get:
+      tags: [Product]
+      summary: รายละเอียดสินค้าชุด (Set)
+      description: |
+        `price` = SUM(sum_amount) ของ component ทั้งหมด
+
+        `balance_qty` = MIN(TRUNC(component_stock / qty_per_set))
+      parameters:
+        - { name: item_code, in: query, required: true, schema: { type: string }, description: "รหัสสินค้าชุด", example: "SET001" }
+        - { name: cust_code, in: query,                 schema: { type: string } }
+      responses:
+        '200':
+          description: รายละเอียดสินค้าชุด
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProductDetailItem' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getProductSetItem:
+    get:
+      tags: [Product]
+      summary: รายการสินค้าย่อยในชุด
+      parameters:
+        - { name: item_code, in: query, required: true, schema: { type: string }, description: "รหัสสินค้าชุด", example: "SET001" }
+      responses:
+        '200':
+          description: Component list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProductSetSubItem' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getProductBalancePrice:
+    get:
+      tags: [Product]
+      summary: ยอดคงเหลือและราคาตาม barcode/unit
+      description: ใช้เมื่อ scan barcode — ดึงจาก ic_inventory_barcode
+      parameters:
+        - { name: item_code,  in: query, required: true, schema: { type: string }, example: "ITM001" }
+        - { name: unit_code,  in: query, required: true, schema: { type: string }, example: "ขวด" }
+        - { name: cust_code,  in: query,                 schema: { type: string }, example: "C00001" }
+      responses:
+        '200':
+          description: สต็อกและราคา
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProductDetailItem' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /getBarcodeItem:
+    get:
+      tags: [Product]
+      summary: ค้นหาสินค้าจากบาร์โค้ด
+      description: Used by sale and PU manual barcode flows. Returns an empty data array when barcode is not found.
+      parameters:
+        - { name: barcode, in: query, required: true, schema: { type: string }, example: "9556001131751" }
+        - { name: custcode, in: query, schema: { type: string }, description: "Reserved for price/customer-specific logic" }
+      responses:
+        '200':
+          description: Product detail rows for barcode
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/BarcodeItem' }
+        '400':
+          description: barcode is required
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getBarcodeItemSearch:
+    get:
+      tags: [Product]
+      summary: ค้นหาสินค้าจากรหัส ชื่อ หรือบาร์โค้ด
+      description: Search dialog endpoint used by sale and PU; empty search returns an empty data array.
+      parameters:
+        - { name: search, in: query, schema: { type: string }, example: "01" }
+        - { name: custcode, in: query, schema: { type: string }, description: "Reserved for price/customer-specific logic" }
+        - { name: limit, in: query, schema: { type: integer, default: 30, maximum: 100 } }
+      responses:
+        '200':
+          description: Matching products
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/BarcodeItem' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  # ─── CART ────────────────────────────────────────────────────────────────────
+
+  /getSaleDocFormatList:
+    get:
+      tags: [Cart]
+      summary: รายการรหัสเอกสารขาย
+      description: Fixed filter `erp_doc_format.screen_code = 'SI'`; used by basket/sale document format selection.
+      responses:
+        '200':
+          description: Sale document format list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/DocFormatItem' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /additemtocart:
+    post:
+      tags: [Cart]
+      summary: เพิ่มสินค้าลงตะกร้า
+      description: |
+        รับ **JSON array** โดยตรง (ไม่ใช่ object)
+
+        แต่ละ item → **DELETE เดิมก่อน แล้ว INSERT ใหม่** (key: item_code + unit_code + barcode + cust_code)
+
+        qty ที่ส่งมาจะ **แทนที่** ค่าเดิม ไม่ใช่บวกเพิ่ม
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/CartItemInput' }
+            example:
+              - cust_code: "C00001"
+                emp_code: "EMP001"
+                guid_code: "550e8400-e29b-41d4-a716-446655440000"
+                item_code: "ITM001"
+                item_name: "น้ำดื่ม ABC 600ml"
+                unit_code: "ขวด"
+                barcode: ""
+                qty: 6
+                price: 12.00
+                item_type: "0"
+                wh_code: "WH01"
+                shelf_code: "A01"
+                stand_value: 1
+                divide_value: 1
+                ratio: 1
+      responses:
+        '200':
+          description: เพิ่มสำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  msg: { type: string, example: "success" }
+        '400':
+          description: Body ไม่ใช่ JSON array หรือ database error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /getcartitemlist:
+    get:
+      tags: [Cart]
+      summary: รายการสินค้าในตะกร้า
+      description: "`balance_qty` จะเป็น 0 เสมอ — ใช้ `/validatecartstock` สำหรับสต็อกจริง"
+      parameters:
+        - { name: cust_code,  in: query, required: true, schema: { type: string },                example: "C00001" }
+        - { name: page,       in: query,                 schema: { type: integer, default: 1 },   description: "หน้าที่ (1-based)" }
+        - { name: page_size,  in: query,                 schema: { type: integer, default: 20 },  description: "ต่อหน้า (max 200)" }
+        - { name: search,     in: query,                 schema: { type: string },                description: "ค้นหา item_code หรือ item_name" }
+      responses:
+        '200':
+          description: รายการในตะกร้า
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/FlatPagination'
+                  - type: object
+                    properties:
+                      success: { type: boolean }
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/CartItem' }
+        '400':
+          description: cust_code required
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getCartSummary:
+    get:
+      tags: [Cart]
+      summary: สรุปยอดตะกร้า (ไม่คำนวณราคาใหม่)
+      description: |
+        คำนวณจาก qty × price ที่บันทึกไว้ใน DB โดยตรง — ไม่เรียก priceHelper
+
+        ใช้ `/getcartfinalsummary` ถ้าต้องการราคาที่ถูกต้อง (แต่ช้ากว่า)
+      parameters:
+        - { name: cust_code, in: query, required: true, schema: { type: string }, example: "C00001" }
+      responses:
+        '200':
+          description: สรุปยอด
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:    { type: boolean }
+                  total_price: { type: number, example: 1250.50 }
+                  total_qty:   { type: number, example: 18 }
+                  total_items: { type: integer, example: 3 }
+
+  /getcartitemstock:
+    post:
+      tags: [Cart]
+      summary: ตรวจสต็อกสินค้าหลายรายการ
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                items:
+                  type: array
+                  items: { $ref: '#/components/schemas/StockCheckInput' }
+            example:
+              items:
+                - { item_code: "ITM001", unit_code: "ขวด" }
+                - { item_code: "ITM002", unit_code: "แพ็ค" }
+      responses:
+        '200':
+          description: ยอดสต็อกต่อ item/unit
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/StockResult' }
+        '400':
+          description: Parse error (plain text หรือ JSON string)
+
+  /getcartorder:
+    get:
+      tags: [Cart]
+      summary: รายการตะกร้าพร้อม tax_type และ price_confirm
+      description: |
+        เหมือน getcartitemlist แต่ join กับ ic_inventory เพื่อดึง `tax_type`
+
+        `price_confirm` = "0" ถ้า item_type ≠ "3" — ใช้ `/getcartorderprice` สำหรับราคาจริง
+      parameters:
+        - { name: cust_code,  in: query, required: true, schema: { type: string },               example: "C00001" }
+        - { name: page,       in: query,                 schema: { type: integer, default: 1 } }
+        - { name: page_size,  in: query,                 schema: { type: integer, default: 20 } }
+      responses:
+        '200':
+          description: รายการตะกร้า
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/FlatPagination'
+                  - type: object
+                    properties:
+                      success: { type: boolean }
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/CartOrderItem' }
+
+  /getcartorderprice:
+    post:
+      tags: [Cart]
+      summary: คำนวณราคาจริงของสินค้าในตะกร้า
+      description: |
+        เรียก getProductPriceLocalx() ต่อรายการ
+
+        item_type = "3" (Set) → ใช้ `price` ที่ส่งมาโดยตรง
+
+        ถ้า priceHelper fail → item นั้น return `success: false` (request ทั้งหมดไม่ fail)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cust_code, items]
+              properties:
+                cust_code: { type: string, example: "C00001" }
+                items:
+                  type: array
+                  items: { $ref: '#/components/schemas/CartOrderPriceInput' }
+      responses:
+        '200':
+          description: ราคาจริงต่อรายการ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/CartOrderPriceResult' }
+        '400':
+          description: Parse error
+
+  /processPromotion:
+    post:
+      tags: [Promotion]
+      summary: Calculate sales promotions from active ic_promotion_formula rows
+      description: Ports InventoryPromotionProcess from the C# POS flow. The endpoint reads promotion formulas from the database and applies them to the submitted sale items.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PromotionProcessRequest' }
+      responses:
+        '200':
+          description: Promotion calculation result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PromotionProcessResult' }
+                  promotion_discount_amount: { type: number }
+                  promotion_pass_amount: { type: number }
+                  sale_item_result:
+                    type: array
+                    items:
+                      type: object
+        '400':
+          description: Invalid request or calculation error
+
+  /getcartfinalsummary:
+    get:
+      tags: [Cart]
+      summary: สรุปยอดรวมหลังคำนวณราคาจริง
+      description: |
+        Loop ทุก item แล้วเรียก getProductPriceLocalx() — **ช้าถ้าตะกร้ามีหลาย item**
+
+        ต่างจาก `getCartSummary`: ได้ราคาที่ถูกต้อง แต่ใช้เวลามากกว่า
+      parameters:
+        - { name: cust_code, in: query, required: true, schema: { type: string }, example: "C00001" }
+      responses:
+        '200':
+          description: สรุปยอด
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      total_items: { type: integer }
+                      total_qty:   { type: number }
+                      total_price: { type: number }
+
+  /validatecartstock:
+    get:
+      tags: [Cart]
+      summary: ตรวจสอบสต็อกก่อนสั่งซื้อ
+      description: รองรับทั้งสินค้าปกติและสินค้าชุด (Set) — ใช้ก่อน `/sendorder` เสมอ
+      parameters:
+        - { name: cust_code, in: query, required: true, schema: { type: string }, example: "C00001" }
+      responses:
+        '200':
+          description: ผลการตรวจสต็อก
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:      { type: boolean }
+                  is_valid:     { type: boolean, description: "true = ทุกรายการพอ" }
+                  stock_issues:
+                    type: array
+                    items: { $ref: '#/components/schemas/StockIssue' }
+              examples:
+                valid:
+                  value: { success: true, is_valid: true, stock_issues: [] }
+                invalid:
+                  value:
+                    success: true
+                    is_valid: false
+                    stock_issues:
+                      - { item_code: "ITM001", item_name: "น้ำดื่ม ABC", qty_in_cart: 100, balance_qty: 50, issue_type: "exceeding" }
+        '400':
+          description: cust_code required
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /deleteItem:
+    get:
+      tags: [Cart]
+      summary: ลบสินค้ารายการเดียวออกจากตะกร้า
+      description: ลบด้วย guid_code + cust_code — ถ้าไม่พบ record ก็ return success:true
+      parameters:
+        - { name: guid_code,  in: query, required: true, schema: { type: string, format: uuid }, example: "550e8400-e29b-41d4-a716-446655440000" }
+        - { name: cust_code,  in: query, required: true, schema: { type: string },               example: "C00001" }
+      responses:
+        '200':
+          description: ลบสำเร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessOnly' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /deleteAllItems:
+    get:
+      tags: [Cart]
+      summary: ล้างตะกร้าทั้งหมด
+      parameters:
+        - { name: cust_code, in: query, required: true, schema: { type: string }, example: "C00001" }
+      responses:
+        '200':
+          description: ล้างสำเร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessOnly' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  # ─── ORDER ───────────────────────────────────────────────────────────────────
+
+  /sendorder:
+    post:
+      tags: [Order]
+      summary: สร้างออเดอร์ใหม่ (QT)
+      description: |
+        Insert header → ic_trans (trans_flag=30, doc_format_code='QT')
+        Insert detail → ic_trans_detail
+
+        รองรับ item_type "0" (ปกติ) และ "3" (ชุด + sub_item)
+
+        - VAT rate = **7%** เสมอ — server คำนวณ total_before_vat/total_vat_value เอง
+        - `doc_no` ควรมี **"MQT"** เพราะ getOrderHistory filter ด้วย `LIKE '%MQT%'`
+        - ทุก insert อยู่ใน **single transaction** — sub_item fail → rollback ทั้งออเดอร์
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendOrderRequest' }
+      responses:
+        '200':
+          description: สร้างสำเร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessOnly' }
+        '400':
+          description: Error (plain text)
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /pay:
+    post:
+      tags: [Order]
+      summary: บันทึกการชำระเงิน
+      description: |
+        DELETE records เดิมแล้ว INSERT ใหม่ (idempotent)
+
+        ถ้า doc_detail ว่างเปล่า → return `success: false` ทันที
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PayRequest' }
+      responses:
+        '200':
+          description: ผลการบันทึก
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  msg: { type: string, example: "success" }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /cancelOrder:
+    post:
+      tags: [Order]
+      summary: ยกเลิกออเดอร์ (SOC)
+      description: |
+        สร้าง SOC (trans_flag=31) อ้างอิง QT แล้ว update QT.last_status=1
+
+        ผลลัพธ์ที่เป็นไปได้ใน `msg`:
+        - `success` — สำเร็จ
+        - `duplicate_doc_no` — doc_no นี้มีอยู่แล้ว
+        - `ref_doc_not_found` — ไม่พบ QT
+        - `already_cancelled` — QT ถูกยกเลิกแล้ว
+        - `ref_doc_has_no_detail` — QT ไม่มี detail lines
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelOrderRequest' }
+      responses:
+        '200':
+          description: ผลการยกเลิก
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CancelOrderResponse' }
+        '400':
+          description: Missing required fields (plain text)
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /getOrderHistory:
+    get:
+      tags: [Order]
+      summary: ประวัติออเดอร์ของลูกค้า
+      description: |
+        เฉพาะ QT ที่ doc_no มี 'MQT' — max 40 รายการล่าสุด
+
+        **Status logic**:
+        - `partial` filter ใน app layer (status=success AND balance>0)
+        - `success` filter ใน app layer (success AND balance=0)
+        - อื่นๆ filter ใน SQL
+      parameters:
+        - { name: cust_code, in: query, required: true, schema: { type: string }, example: "C00001" }
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, packing, payment, success, partial, cancel]
+          description: Filter by order status (optional)
+      responses:
+        '200':
+          description: ประวัติออเดอร์
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/OrderHistoryItem' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /getOrderHeader:
+    get:
+      tags: [Order]
+      summary: ข้อมูล header ของออเดอร์เดี่ยว
+      parameters:
+        - { name: cust_code, in: query, required: true, schema: { type: string }, example: "C00001" }
+        - { name: doc_no,    in: query, required: true, schema: { type: string }, example: "MQT2401150001" }
+      responses:
+        '200':
+          description: Header หรือ `data:null` ถ้าไม่พบ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    nullable: true
+                    allOf:
+                      - $ref: '#/components/schemas/OrderHeader'
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /getOrderDetail:
+    get:
+      tags: [Order]
+      summary: รายการสินค้าในออเดอร์ (paginated)
+      description: |
+        สินค้าชุด (item_type="3") จะมี `sub_item` array
+
+        `q` ค้นทั้ง parent และ sub_item ของ Set
+      parameters:
+        - { name: cust_code,  in: query, required: true, schema: { type: string },                        example: "C00001" }
+        - { name: doc_no,     in: query, required: true, schema: { type: string },                        example: "MQT2401150001" }
+        - { name: page,       in: query,                 schema: { type: integer, default: 1 } }
+        - { name: page_size,  in: query,                 schema: { type: integer, default: 20, minimum: 1, maximum: 100 } }
+        - { name: q,          in: query,                 schema: { type: string },                        description: "ค้นหา item_code หรือ item_name" }
+      responses:
+        '200':
+          description: รายการสินค้า
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  paging: { $ref: '#/components/schemas/OrderDetailPaging' }
+                  data:
+                    type: object
+                    properties:
+                      doc_no: { type: string }
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/OrderDetailLineItem' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  # ─── CUSTOMER ────────────────────────────────────────────────────────────────
+
+  /getCustomerList:
+    get:
+      tags: [Customer]
+      summary: รายชื่อลูกค้า (max 50)
+      description: Dropdown/search — hard limit 50
+      parameters:
+        - { name: search, in: query, schema: { type: string }, description: "ILIKE ค้นหา code หรือ name_1" }
+      responses:
+        '200':
+          description: รายชื่อลูกค้า
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/CustomerRecord' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /getEmployeeList:
+    get:
+      tags: [Customer]
+      summary: รายชื่อพนักงาน (max 50)
+      description: เฉพาะ erp_user ที่ name_2='o'
+      parameters:
+        - { name: search, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: รายชื่อพนักงาน
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/EmployeeRecord' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /getCustomerCRM:
+    get:
+      tags: [Customer]
+      summary: รายชื่อลูกค้า CRM (paginated)
+      description: พร้อม logistic_area, GPS (จาก website field), group_main
+      parameters:
+        - { name: search, in: query, schema: { type: string } }
+        - { name: limit,  in: query, schema: { type: integer, default: 50 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: รายชื่อลูกค้า + pagination
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/CustomerCRMRecord' }
+                  pagination: { $ref: '#/components/schemas/CustomerCRMPagination' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /getEmployeeCRM:
+    get:
+      tags: [Customer]
+      summary: รายชื่อพนักงาน (paginated)
+      parameters:
+        - { name: search, in: query, schema: { type: string } }
+        - { name: limit,  in: query, schema: { type: integer, default: 50 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: รายชื่อพนักงาน
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/EmployeeRecord' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  # ─── FINANCIAL ───────────────────────────────────────────────────────────────
+
+  /getCustomerCredit:
+    get:
+      tags: [Financial]
+      summary: ข้อมูลเครดิตของลูกค้า
+      description: credit_date = NOW() + credit_day วัน (คำนวณใน DB)
+      parameters:
+        - { name: cust_code, in: query, required: true, schema: { type: string }, example: "C00001" }
+      responses:
+        '200':
+          description: ข้อมูลเครดิต หรือ `{}` ถ้าไม่พบลูกค้า
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    oneOf:
+                      - $ref: '#/components/schemas/CustomerCreditData'
+                      - type: object
+                        description: Empty object when not found
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /getAdvancePayment:
+    get:
+      tags: [Financial]
+      summary: ประวัติมัดจำ/เงินล่วงหน้า
+      description: |
+        trans_flag IN (40, 9040) — max 20 รายการล่าสุด
+
+        ถ้า last_status=1 → ยอดทั้งหมดแสดงเป็น 0
+      parameters:
+        - { name: cust_code, in: query, required: true, schema: { type: string }, example: "C00001" }
+      responses:
+        '200':
+          description: รายการมัดจำ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/AdvancePayment' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /getTotalBalance:
+    get:
+      tags: [Financial]
+      summary: ยอดหนี้คงค้างรวม
+      description: Invoice (44) + DN (46,93,99,95,101) - CN (48,97,103) - การชำระ ณ date(NOW())
+      parameters:
+        - { name: cust_code, in: query, required: true, schema: { type: string }, example: "C00001" }
+      responses:
+        '200':
+          description: ยอดหนี้รวม
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:       { type: boolean }
+                  total_balance: { type: number, example: 15840.50 }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  # ─── DOCUMENT ────────────────────────────────────────────────────────────────
+
+  /getDocList:
+    get:
+      tags: [Document]
+      summary: รายการเอกสาร (Invoice/CN/มัดจำ)
+      description: |
+        trans_flag: 40=มัดจำ, 44=Invoice, 46=ใบแจ้งหนี้, 48=CN
+
+        ถ้าไม่ระบุ trans_flag → ดึง IN (40,44,48,46) ทั้งหมด
+      parameters:
+        - { name: cust_code,   in: query, required: true, schema: { type: string },                              example: "C00001" }
+        - { name: trans_flag,  in: query,                 schema: { type: integer, enum: [40,44,46,48] },        description: "Filter ตามประเภทเอกสาร" }
+      responses:
+        '200':
+          description: รายการเอกสาร
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/DocListItem' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /getDocDetail:
+    get:
+      tags: [Document]
+      summary: รายละเอียดเอกสาร + รายการสินค้า
+      parameters:
+        - { name: cust_code, in: query, required: true, schema: { type: string }, example: "C00001" }
+        - { name: doc_no,    in: query, required: true, schema: { type: string }, example: "INV2401150001" }
+      responses:
+        '200':
+          description: รายละเอียด หรือ `data:{}` ถ้าไม่พบ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      remark_5:     { type: string }
+                      doc_no:       { type: string }
+                      doc_date:     { type: string, format: date }
+                      doc_time:     { type: string }
+                      cust_code:    { type: string }
+                      send_type:    { type: integer }
+                      total_amount: { type: number }
+                      emp_code:     { type: string }
+                      emp_name:     { type: string }
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/DocDetailLineItem' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /getCompanyProfile:
+    get:
+      tags: [Document]
+      summary: ข้อมูลบริษัท
+      description: ดึงจาก erp_company_profile (row แรก) — `data` เป็น array แต่มีแค่ 1 element
+      responses:
+        '200':
+          description: ข้อมูลบริษัท
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    maxItems: 1
+                    items: { $ref: '#/components/schemas/CompanyProfile' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  # ─── FAVORITES ───────────────────────────────────────────────────────────────
+
+  /setfav:
+    get:
+      tags: [Favorites]
+      summary: ตั้งค่า/ยกเลิกสินค้าโปรด
+      description: |
+        DELETE + INSERT เสมอ — `status="0"` ยังมี row ใน DB แต่ status = 0
+      parameters:
+        - { name: cust_code,  in: query, required: true, schema: { type: string },               example: "C00001" }
+        - { name: item_code,  in: query, required: true, schema: { type: string },               example: "ITM001" }
+        - { name: status,     in: query, required: true, schema: { type: string, enum: ["0","1"] }, description: '"1"=favorite, "0"=ยกเลิก' }
+      responses:
+        '200':
+          description: ตั้งค่าสำเร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessOnly' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  # ─── IMAGES ──────────────────────────────────────────────────────────────────
+
+  /getImageList:
+    get:
+      tags: [Images]
+      summary: รายการ image metadata ของสินค้า
+      description: ดึงจาก demo_images database — เรียงตาม image_order ASC
+      security: []
+      parameters:
+        - { name: item_code, in: query, required: true, schema: { type: string }, example: "ITM001" }
+      responses:
+        '200':
+          description: รายการ guid ของรูปภาพ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ImageMeta' }
+        '400':
+          description: Error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /images:
+    get:
+      tags: [Images]
+      summary: ดาวน์โหลดภาพตาม item_code
+      description: |
+        ส่งคืน binary PNG ของรูปแรกของสินค้า
+
+        รองรับ ETag caching — ส่ง `If-None-Match` เพื่อรับ 304
+        Cache-Control: `public, max-age=604800` (7 วัน)
+      security: []
+      parameters:
+        - { name: item_code,      in: query,  required: true, schema: { type: string },         example: "ITM001" }
+        - { name: If-None-Match,  in: header,                 schema: { type: string },         description: "ETag จาก request ก่อนหน้า" }
+      responses:
+        '200':
+          description: PNG image binary
+          headers:
+            ETag:
+              schema: { type: string }
+              example: '"d41d8cd98f00b204e9800998ecf8427e"'
+            Cache-Control:
+              schema: { type: string }
+              example: "public, max-age=604800"
+            Content-Length:
+              schema: { type: integer }
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+        '304':
+          description: Not Modified — client cache ยังใช้ได้
+          headers:
+            ETag:
+              schema: { type: string }
+            Cache-Control:
+              schema: { type: string }
+        '400':
+          description: item_code ไม่ได้ส่งมา
+          content:
+            text/plain:
+              schema: { type: string }
+              example: "ERROR: item_code is required"
+        '404':
+          description: ไม่พบรูปภาพ
+          content:
+            text/plain:
+              schema: { type: string }
+              example: "ERROR: image not found"
+
+  /imagesguid:
+    get:
+      tags: [Images]
+      summary: ดาวน์โหลดภาพตาม guid_code
+      description: |
+        ใช้สำหรับรูปที่ 2, 3... ของสินค้า (ได้ guid จาก `/getImageList`)
+
+        **ต่างจาก /images**: ถ้าไม่พบ guid → HTTP 200 + **empty buffer (0 bytes)** ไม่ใช่ 404
+
+        ตรวจ `Content-Length: 0` ใน client เพื่อรู้ว่ารูปไม่มี
+      security: []
+      parameters:
+        - { name: guid_code,      in: query,  required: true, schema: { type: string, format: uuid }, example: "550e8400-e29b-41d4-a716-446655440000" }
+        - { name: If-None-Match,  in: header,                 schema: { type: string } }
+      responses:
+        '200':
+          description: |
+            PNG image binary — หรือ empty buffer (Content-Length=0) ถ้าไม่พบ
+          headers:
+            ETag:
+              schema: { type: string }
+              description: ไม่มีถ้า empty buffer
+            Cache-Control:
+              schema: { type: string }
+            Content-Length:
+              schema: { type: integer }
+              description: 0 ถ้าไม่พบรูป
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+        '304':
+          description: Not Modified
+          headers:
+            ETag:
+              schema: { type: string }
+            Cache-Control:
+              schema: { type: string }
+
+  # ─── POS ─────────────────────────────────────────────────────────────────────
+
+  /getBranchList:
+    get:
+      tags: [POS]
+      summary: รายการสาขา
+      responses:
+        '200':
+          description: ทุกสาขาจาก erp_branch_list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/BranchItem' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessOnly' }
+
+  # ─── PURCHASE / PU ──────────────────────────────────────────────────────────
+
+  /getDocFormatList:
+    get:
+      tags: [Purchase]
+      summary: รายการรหัสเอกสารตาม screen_code
+      parameters:
+        - { name: screen_code, in: query, required: true, schema: { type: string }, example: "PU" }
+      responses:
+        '200':
+          description: Document format list from erp_doc_format
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/DocFormatItem' }
+        '400':
+          description: screen_code is required
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getPurchaseDocFormatList:
+    get:
+      tags: [Purchase]
+      summary: รายการรหัสเอกสารซื้อ/ตั้งหนี้
+      description: Fixed filter `erp_doc_format.screen_code = 'PU'`.
+      responses:
+        '200':
+          description: PU document format list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/DocFormatItem' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getNextPurchaseDocNo:
+    get:
+      tags: [Purchase]
+      summary: เลขที่เอกสารถัดไปของ PU
+      description: Resolves pattern from `erp_doc_format` screen `PU`; final save resolves again inside transaction.
+      parameters:
+        - { name: doc_format_code, in: query, schema: { type: string }, example: "PU" }
+        - { name: doc_date, in: query, schema: { type: string, format: date }, example: "2026-05-12" }
+      responses:
+        '200':
+          description: Next document number
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NextDocNoResponse' }
+        '400':
+          description: Invalid format or running overflow
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getVatRate:
+    get:
+      tags: [Purchase]
+      summary: อัตรา VAT เริ่มต้น
+      description: Reads `erp_option.vat_rate`, falling back to 7.
+      responses:
+        '200':
+          description: VAT rate
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  vat_rate: { type: number, example: 7 }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getPurchaseLatestItemPrices:
+    post:
+      tags: [Purchase]
+      summary: ราคาซื้อล่าสุดของสินค้า
+      description: Latest PU price is looked up by `item_code + unit_code`; barcode is echoed only for client mapping.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PurchaseLatestItemPriceRequest' }
+      responses:
+        '200':
+          description: Latest purchase price per requested item/unit
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PurchaseLatestItemPrice' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getPurchaseProductDetail:
+    get:
+      tags: [Purchase]
+      summary: รายละเอียดสินค้าเฉพาะหน้าซื้อ/ตั้งหนี้
+      description: Returns unit/barcode rows and latest PU price. Does not include sales-only promotion/stock-sale fields.
+      parameters:
+        - { name: item_code, in: query, required: true, schema: { type: string }, example: "01-0004" }
+      responses:
+        '200':
+          description: PU product detail rows per unit
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PurchaseProductDetailItem' }
+        '400':
+          description: item_code is required
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getSupplierList:
+    get:
+      tags: [Purchase]
+      summary: ค้นหาเจ้าหนี้
+      parameters:
+        - { name: search, in: query, schema: { type: string }, description: "ค้นหา code/name_1; max 50 rows" }
+      responses:
+        '200':
+          description: Supplier list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/SupplierListItem' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getSupplierDetail:
+    get:
+      tags: [Purchase]
+      summary: รายละเอียดเจ้าหนี้
+      parameters:
+        - { name: cust_code, in: query, required: true, schema: { type: string }, example: "AP001" }
+      responses:
+        '200':
+          description: Supplier detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/SupplierDetail' }
+        '400':
+          description: cust_code is required
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '404':
+          description: supplier not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getPODocWait:
+    get:
+      tags: [Purchase]
+      summary: รายการ PO ที่รอรับเข้า PU
+      description: Returns open PO documents (`trans_flag=6`, `doc_success=0`). Search cancels date filtering.
+      parameters:
+        - { name: search, in: query, schema: { type: string }, description: "ค้น doc_no, cust_code, user_request" }
+        - { name: fromdate, in: query, schema: { type: string, format: date }, example: "2026-05-01" }
+        - { name: todate, in: query, schema: { type: string, format: date }, example: "2026-05-12" }
+        - { name: approve_only, in: query, schema: { type: string, enum: ["", "1"] }, description: '"1" = เฉพาะ approve_status=1' }
+      responses:
+        '200':
+          description: Waiting PO list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PODocWaitItem' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getDocPoDetail:
+    get:
+      tags: [Purchase]
+      summary: รายละเอียด PO สำหรับอ้างอิงเข้า PU
+      parameters:
+        - { name: doc_no, in: query, required: true, schema: { type: string }, example: "PO26020001" }
+      responses:
+        '200':
+          description: PO header plus items and balance_qty
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    allOf:
+                      - type: object
+                        properties:
+                          doc_no: { type: string }
+                          doc_date: { type: string, format: date }
+                          cust_code: { type: string }
+                          cust_name: { type: string }
+                          approve_status: { type: integer }
+                          doc_success: { type: integer }
+                      - type: object
+                        properties:
+                          items:
+                            type: array
+                            items: { $ref: '#/components/schemas/PODocDetailItem' }
+        '400':
+          description: doc_no is required
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '404':
+          description: document not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getPUDocList:
+    get:
+      tags: [Purchase]
+      summary: รายการเอกสาร PU
+      description: Search cancels date filtering; max 100 latest rows.
+      parameters:
+        - { name: search, in: query, schema: { type: string }, description: "ค้น doc_no, cust_code, user_request" }
+        - { name: fromdate, in: query, schema: { type: string, format: date }, example: "2026-05-01" }
+        - { name: todate, in: query, schema: { type: string, format: date }, example: "2026-05-12" }
+      responses:
+        '200':
+          description: PU list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PUDocListItem' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getPUDocDetail:
+    get:
+      tags: [Purchase]
+      summary: รายละเอียดเอกสาร PU สำหรับดู/แก้ไข
+      parameters:
+        - { name: doc_no, in: query, required: true, schema: { type: string }, example: "PU-26050018" }
+      responses:
+        '200':
+          description: PU header, references, payment detail, and items
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/PUDocDetail' }
+        '400':
+          description: doc_no is required
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '404':
+          description: document not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /createPUDoc:
+    post:
+      tags: [Purchase]
+      summary: สร้างเอกสาร PU
+      description: |
+        Creates PU (`trans_flag=12`) and resolves `doc_no` inside the final transaction.
+
+        Permission required: `purchase.pu.create`.
+
+        Cash PU (`sale_type` 1 or 3) requires `cash_amount + transfer_amount >= total_after_rounded`.
+        If `transfer_amount > 0`, `payment_detail` is required and sum of `pay_amount` must equal `transfer_amount`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PUSaveRequest' }
+      responses:
+        '200':
+          description: Saved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PUSaveResponse' }
+        '400':
+          description: Validation failed or save error
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: false }
+                  msg: { type: string, example: "PU save validation failed" }
+                  data: { $ref: '#/components/schemas/PUSavePlan' }
+        '403':
+          description: Permission denied
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /updatePUDoc:
+    post:
+      tags: [Purchase]
+      summary: แก้ไขเอกสาร PU
+      description: |
+        Updates PU (`trans_flag=12`) by rebuilding details, PO references, cashbook rows, process, and logs.
+
+        Permission required: `purchase.pu.edit`. `doc_format_code` cannot be changed after create.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PUSaveRequest' }
+      responses:
+        '200':
+          description: Saved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PUSaveResponse' }
+        '400':
+          description: Validation failed or save error
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: false }
+                  msg: { type: string, example: "PU save validation failed" }
+                  data: { $ref: '#/components/schemas/PUSavePlan' }
+        '403':
+          description: Permission denied
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getPurchasePrintForms:
+    get:
+      tags: [Purchase, Print]
+      summary: รายการฟอร์มพิมพ์ของเอกสาร PU
+      description: Reads form codes from `erp_doc_format.form_code` and checks availability in `formdesign`.
+      parameters:
+        - { name: doc_no, in: query, required: true, schema: { type: string }, example: "PU-26050018" }
+      responses:
+        '200':
+          description: Print form options
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/PrintFormOptions' }
+        '400':
+          description: doc_no is required
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '404':
+          description: document not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  # ─── PRINT ──────────────────────────────────────────────────────────────────
+
+  /getSalePrintForms:
+    get:
+      tags: [Print]
+      summary: รายการฟอร์มพิมพ์ของเอกสารขาย
+      parameters:
+        - { name: doc_no, in: query, required: true, schema: { type: string }, example: "MPOS-2026-0001" }
+      responses:
+        '200':
+          description: Print form options
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/PrintFormOptions' }
+        '400':
+          description: doc_no is required
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '404':
+          description: document not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /sale-print/render:
+    get:
+      tags: [Print]
+      summary: Render ฟอร์มพิมพ์ขายเป็น HTML
+      description: |
+        Returns browser-printable HTML. `formcodes` can contain comma-separated codes.
+
+        If `formcodes` is omitted, the first available form is used. If `log_print` is omitted,
+        print logging follows `auto_print` (`auto_print=0` previews without logging by default).
+      security: []
+      parameters:
+        - { name: doc_no, in: query, required: true, schema: { type: string }, example: "MPOS-2026-0001" }
+        - { name: formcodes, in: query, schema: { type: string }, example: "UBK-IV-001" }
+        - { name: auto_print, in: query, schema: { type: string, enum: ["0", "1"], default: "1" }, description: '"1" injects window.print behavior in HTML' }
+        - { name: log_print, in: query, schema: { type: string, enum: ["0", "1"] }, description: "Explicit print log override; use 0 for preview" }
+        - { name: user_code, in: query, schema: { type: string }, example: "001" }
+      responses:
+        '200':
+          description: Rendered HTML
+          headers:
+            Cache-Control:
+              schema: { type: string, example: "no-store" }
+          content:
+            text/html:
+              schema: { type: string }
+        '400':
+          description: doc_no is required
+          content:
+            text/plain:
+              schema: { type: string }
+        '404':
+          description: document or print form not found
+          content:
+            text/plain:
+              schema: { type: string }
+        '500':
+          description: Render error
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /purchase-print/render:
+    get:
+      tags: [Purchase, Print]
+      summary: Render ฟอร์มพิมพ์ PU เป็น HTML
+      description: |
+        Returns browser-printable HTML using the shared sale print renderer.
+
+        If `formcodes` is omitted, the first available PU form is used. If `log_print` is omitted,
+        print logging follows `auto_print` (`auto_print=0` previews without logging by default).
+      security: []
+      parameters:
+        - { name: doc_no, in: query, required: true, schema: { type: string }, example: "PU-26050018" }
+        - { name: formcodes, in: query, schema: { type: string }, example: "PUPOR1" }
+        - { name: auto_print, in: query, schema: { type: string, enum: ["0", "1"], default: "1" }, description: '"1" injects window.print behavior in HTML' }
+        - { name: log_print, in: query, schema: { type: string, enum: ["0", "1"] }, description: "Explicit print log override; use 0 for preview" }
+        - { name: user_code, in: query, schema: { type: string }, example: "001" }
+      responses:
+        '200':
+          description: Rendered HTML
+          headers:
+            Cache-Control:
+              schema: { type: string, example: "no-store" }
+          content:
+            text/html:
+              schema: { type: string }
+        '400':
+          description: doc_no is required
+          content:
+            text/plain:
+              schema: { type: string }
+        '404':
+          description: document or print form not found
+          content:
+            text/plain:
+              schema: { type: string }
+        '500':
+          description: Render error
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /getWarehouseList:
+    get:
+      tags: [POS]
+      summary: รายการคลังสินค้า
+      responses:
+        '200':
+          description: ทุกคลังจาก ic_warehouse
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/WarehouseItem' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessOnly' }
+
+  /getShelfList:
+    get:
+      tags: [POS]
+      summary: รายการที่เก็บสินค้า
+      parameters:
+        - name: wh_code
+          in: query
+          required: false
+          schema: { type: string }
+          example: "WH01"
+          description: ถ้าไม่ระบุ → คืนทุก shelf
+      responses:
+        '200':
+          description: รายการ shelf (กรอง wh_code ถ้าระบุ)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ShelfItem' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessOnly' }
+
+  /getPOSList:
+    get:
+      tags: [POS]
+      summary: รายการเครื่อง POS
+      responses:
+        '200':
+          description: ทุกเครื่อง POS จาก pos_id table
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/POSItem' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessOnly' }
+
+  /getErpOption:
+    get:
+      tags: [POS]
+      summary: ข้อมูล config ประเภทภาษี
+      description: |
+        ดึงจาก erp_option (LIMIT 1) — frontend ใช้ค่านี้เพื่อส่งใน saveTrans
+
+        **หมายเหตุ**: field `discout_type` ตกตัว n ตามชื่อ column จริงใน DB
+      responses:
+        '200':
+          description: config ภาษี
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:    { $ref: '#/components/schemas/ErpOption' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessOnly' }
+
+  /getLastDocNo:
+    get:
+      tags: [POS]
+      summary: Last running number ของ POS
+      description: |
+        ดึง doc_pattern จาก pos_id table + หา running ล่าสุดจาก ic_trans
+
+        Frontend ใช้ข้อมูลนี้เพื่อแสดง doc_no ที่จะถูก generate ใน /saveTrans
+      parameters:
+        - name: pos_id
+          in: query
+          required: true
+          schema: { type: string }
+          example: "MPOS01"
+        - name: trans_flag
+          in: query
+          required: false
+          schema: { type: integer, default: 44 }
+          description: ประเภทเอกสาร (default=44 Invoice)
+      responses:
+        '200':
+          description: Last running number + doc_pattern
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:    { $ref: '#/components/schemas/LastDocNoData' }
+        '400':
+          description: pos_id ไม่ส่งมา หรือไม่พบใน DB
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  msg:     { type: string }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessOnly' }
+
+  /getPassBookList:
+    get:
+      tags: [POS]
+      summary: รายการสมุดบัญชีสำหรับรับโอน
+      description: ใช้ในขั้นชำระเงินของขายและ PU เงินสดกรณีมียอดโอน
+      responses:
+        '200':
+          description: Pass book list from erp_pass_book
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PassBookItem' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getCreditTypeList:
+    get:
+      tags: [POS]
+      summary: รายการประเภทบัตรเครดิต
+      responses:
+        '200':
+          description: Credit type list from erp_credit_type
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        code: { type: string }
+                        name_1: { type: string }
+                        charge_rate: { type: number }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /saveTrans:
+    post:
+      tags: [POS]
+      summary: บันทึก Invoice จาก POS
+      description: |
+        สร้าง Invoice (trans_flag=44) แบบ POS:
+
+        - **doc_no**: Server generate อัตโนมัติจาก `pos_id.doc_format` + running max จาก ic_trans
+        - **VAT**: Server คำนวณจาก `vat_type`, `vat_rate`, `discount_type`, `discount_word` ที่ client ส่งมา
+        - **Cart**: ลบ `staff_cart_order` ของ cust_code นี้หลัง commit สำเร็จ
+        - **discount_word format**: `"5%"` = 5%, `"5+3%"` = stacked, `"100B"` = ลด 100 บาท, `""` = ไม่ลด
+        - Tables: ic_trans + cb_trans + ic_trans_detail + cb_trans_detail (ทั้งหมดใน 1 transaction)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SaveTransRequest' }
+            example:
+              doc_date: "2024-01-15"
+              doc_time: "09:30:00"
+              doc_format_code: "MINV"
+              cust_code: "C00001"
+              emp_code: "EMP001"
+              pos_id: "MPOS01"
+              shelf_code: "A01"
+              vat_type: 1
+              vat_rate: 7.0
+              discount_type: 0
+              discount_word: ""
+              total_value: "1200.00"
+              total_net_amount: "1200.00"
+              total_credit_charge: "0"
+              cash_amount: "1200.00"
+              tranfer_amount: "0"
+              card_amount: "0"
+              wallet_amount: "0"
+              rounded_amount: 0
+              items:
+                - item_code: "ITM001"
+                  item_name: "น้ำดื่ม ABC 600ml"
+                  unit_code: "ขวด"
+                  barcode: "8850999000001"
+                  qty: "100"
+                  price: "12.00"
+                  sum_amount: "1200.00"
+                  wh_code: "WH01"
+                  shelf_code: "A01"
+                  stand_value: "1"
+                  divide_value: "1"
+                  ratio: "1"
+              payment_detail:
+                - pay_type: "0"
+                  pay_amount: "1200.00"
+                  trans_number: ""
+                  charge: "0"
+      responses:
+        '200':
+          description: บันทึกสำเร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SaveTransResponse' }
+        '400':
+          description: Validation error (pos_id ว่าง, items ว่าง, pos_id ไม่พบ)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  msg:     { type: string }
+        '409':
+          description: Running number overflow (doc_no เต็มแล้ว)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  msg:     { type: string, example: "ERR_DOC_RUNNING_OVERFLOW: ..." }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  msg:     { type: string }
+
+  /savetransandpro:
+    post:
+      tags: [POS]
+      summary: Save POS invoice and promotion detail
+      description: |
+        Same behavior as `/saveTrans`, plus optional promotion rows.
+
+        When `promotion_detail` or `promotion_product_rows` has rows, the API inserts them into
+        `ic_trans_detail_promotion` with `doc_no`, `doc_date`, `trans_flag=44`,
+        `promotion_code`, `promotion_name`, `qty`, `price`, `sum_amount`, and `line_number`.
+
+        Normal sale items still save to `ic_trans_detail`; promotion rows do not replace normal items.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SaveTransAndProRequest' }
+            example:
+              doc_date: "2026-05-13"
+              doc_time: "14:30:00"
+              doc_format_code: "SI"
+              form_code: ""
+              cust_code: "AR0269"
+              branch_code: ""
+              emp_code: "SALE01"
+              creator_code: "SALE01"
+              pos_id: "POS001"
+              shelf_code: "A01"
+              remark: ""
+              inquiry_type: 1
+              vat_type: 1
+              vat_rate: 7
+              discount_type: 0
+              discount_word: ""
+              total_value: "200.00"
+              total_before_vat: "177.57"
+              total_vat_value: "12.43"
+              total_after_vat: "190.00"
+              total_amount: "190.00"
+              total_net_amount: "190.00"
+              total_discount: "10.00"
+              total_credit_charge: "0"
+              cash_amount: "190.00"
+              tranfer_amount: "0"
+              card_amount: "0"
+              wallet_amount: "0"
+              rounded_amount: 0
+              total_income_amount: 0
+              total_except_vat: 0
+              items:
+                - item_code: "ITM001"
+                  item_name: "Sample item"
+                  unit_code: "PCS"
+                  barcode: "885000000001"
+                  qty: "2"
+                  price: "100.00"
+                  sum_amount: "200.00"
+                  wh_code: "WH01"
+                  shelf_code: "A01"
+                  stand_value: "1"
+                  divide_value: "1"
+                  ratio: "1"
+                  tax_type: 0
+                  discount: ""
+                  discount_amount: "0"
+              payment_detail:
+                - pay_type: "0"
+                  pay_amount: "190.00"
+                  trans_number: ""
+                  charge: "0"
+              promotion_detail:
+                - promotion_code: "PRO-BUY2DISC10"
+                  promotion_name: "Buy 2 discount 10"
+                  qty: 1
+                  price: -10
+                  sum_amount: -10
+                  line_number: 1
+      responses:
+        '200':
+          description: Saved successfully
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SaveTransResponse' }
+              example:
+                success: true
+                doc_no: "SI2605130001"
+                doc_format_code: "SI"
+                form_code: ""
+                promotion_count: 1
+                msg: "success"
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '409':
+          description: Running number overflow
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponseLower' }
+
+  /getDocSaleHistory:
+    get:
+      tags: [POS]
+      summary: ประวัติการขาย POS
+      description: |
+        ดึงรายการ Invoice (trans_flag=44) ของ pos_id ที่ระบุ
+
+        **Search logic** (ลอกจาก Java):
+        - ถ้ามี `search` → **ยกเลิก** date filter แล้วค้นใน doc_no / cust_code / cust_name แทน
+        - ถ้าไม่มี `search` + มี `from_date` + `to_date` → filter ตาม date range
+      parameters:
+        - { name: pos_id,     in: query, required: true,  schema: { type: string },         example: "MPOS01" }
+        - { name: search,     in: query,                  schema: { type: string },         description: "ค้นใน doc_no, cust_code, cust_name — ถ้ามีค่า จะยกเลิก date filter" }
+        - { name: from_date,  in: query,                  schema: { type: string, format: date }, example: "2024-01-01" }
+        - { name: to_date,    in: query,                  schema: { type: string, format: date }, example: "2024-01-31" }
+      responses:
+        '200':
+          description: รายการประวัติการขาย
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        doc_no:              { type: string }
+                        doc_date:            { type: string, format: date }
+                        doc_time:            { type: string }
+                        cust_code:           { type: string }
+                        cust_name:           { type: string }
+                        total_amount:        { type: string }
+                        cash_amount:         { type: string }
+                        tranfer_amount:      { type: string }
+                        card_amount:         { type: string }
+                        wallet_amount:       { type: string }
+                        total_credit_charge: { type: string }
+                        total_net_amount:    { type: string }
+                        total_amount_pay:    { type: string }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessOnly' }
+
+  /getDocSaleHistoryDetail:
+    get:
+      tags: [POS]
+      summary: รายการสินค้าใน Invoice
+      parameters:
+        - { name: doc_no, in: query, required: true, schema: { type: string }, example: "MPOS-2026-0001" }
+      responses:
+        '200':
+          description: รายการสินค้าจาก ic_trans_detail (trans_flag=44)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        item_code:    { type: string }
+                        item_name:    { type: string }
+                        unit_code:    { type: string }
+                        qty:          { type: number }
+                        price:        { type: number }
+                        wh_code:      { type: string }
+                        shelf_code:   { type: string }
+                        stand_value:  { type: number }
+                        divide_value: { type: number }
+                        ratio:        { type: number }
+        '400':
+          description: doc_no ไม่ส่งมา
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessOnly' }
+        '500':
+          description: DB error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessOnly' }

@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run dev)",
+      "Bash(npm run start)",
+      "Bash(npm install)",
+      "Bash(npm install *)",
+      "Bash(npm run lint)",
+      "Bash(npm test)",
+      "Bash(npm run test:*)",
+      "Bash(node src/index.js)",
+      "Bash(git status)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git add *)",
+      "Bash(git commit*)",
+      "Bash(git branch*)",
+      "Bash(git checkout *)",
+      "Bash(git pull)",
+      "Bash(git stash*)"
+    ],
+    "deny": [
+      "Bash(git push --force*)",
+      "Bash(git reset --hard*)",
+      "Bash(rm -rf *)",
+      "Bash(DROP TABLE*)",
+      "Bash(DROP DATABASE*)",
+      "Bash(psql * -c \"DROP*\")"
+    ]
+  },
+  "model": "claude-sonnet-4-6",
+  "cleanupPeriodDays": 30,
+  "includeCoAuthoredBy": true
+}

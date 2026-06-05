@@ -1,0 +1,38 @@
+# dependencies
+node_modules/
+
+# environment variables
+.env
+.env.*
+!.env.example
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# coverage and reports
+coverage/
+.nyc_output/
+
+# build output
+dist/
+build/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Claude local overrides (personal/machine-specific)
+CLAUDE.local.md
+.claude/settings.local.json

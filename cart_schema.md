@@ -1,0 +1,21 @@
+CREATE TABLE public.staff_cart_order ( 
+    roworder serial, 
+    cust_code character varying(255), 
+    guid_code character varying(255), 
+    item_code character varying(255), 
+    unit_code character varying(255), 
+    item_type numeric DEFAULT 0, 
+    qty numeric DEFAULT 0, 
+    create_datetime timestamp without time zone DEFAULT now(), 
+    price numeric DEFAULT 0, 
+    wh_code character varying(255), 
+    shelf_code character varying(255), 
+    creator_code character varying(255), 
+    barcode character varying(255), 
+    item_name character varying(255), 
+    stand_value numeric DEFAULT 1, 
+    divide_value numeric DEFAULT 1, 
+    ratio numeric DEFAULT 1, 
+    remark character varying(255), 
+    CONSTRAINT staff_cart_order_pk PRIMARY KEY (roworder) 
+    )

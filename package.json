@@ -1,0 +1,24 @@
+{
+  "name": "marketplace-webservice-express",
+  "version": "1.0.0",
+  "description": "Express.js clone of MarketPlaceWebService (Java/JAX-RS)",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "js-yaml": "^4.1.1",
+    "pg": "^8.12.0",
+    "qrcode": "^1.5.4",
+    "sharp": "^0.33.4",
+    "swagger-ui-express": "^5.0.1",
+    "xml2js": "^0.6.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}
