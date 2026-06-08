@@ -66,7 +66,15 @@ async function resolveDocFormat(client, screenCode, docFormatCode = '') {
   return docFormat;
 }
 
-async function resolveDocNoFromPattern(client, pattern, transFlag) {
+function resolveDocumentTable(tableName) {
+  const table = String(tableName || 'ic_trans').trim();
+  if (!['ic_trans', 'ap_ar_trans'].includes(table)) {
+    throw new Error(`unsupported document table: ${table}`);
+  }
+  return table;
+}
+
+async function resolveDocNoFromPattern(client, pattern, transFlag, tableName = 'ic_trans') {
   const firstHash = pattern.indexOf('#');
   if (firstHash < 0) return pattern;
 
@@ -74,9 +82,10 @@ async function resolveDocNoFromPattern(client, pattern, transFlag) {
   while (firstHash + runLen < pattern.length && pattern[firstHash + runLen] === '#') runLen += 1;
 
   const likePattern = pattern.replace(/#/g, '_');
+  const table = resolveDocumentTable(tableName);
   const result = await client.query(
     `SELECT doc_no
-     FROM ic_trans
+     FROM ${table}
      WHERE trans_flag = $1
        AND char_length(doc_no) = $2
        AND doc_no LIKE $3`,
@@ -99,10 +108,15 @@ async function resolveDocNoFromPattern(client, pattern, transFlag) {
   return pattern.slice(0, firstHash) + String(nextRunning).padStart(runLen, '0') + pattern.slice(firstHash + runLen);
 }
 
-async function resolveDocumentNo(client, { screenCode, docFormatCode = '', transFlag, docDate = '' }) {
+async function resolveDocumentNo(client, { screenCode, docFormatCode = '', transFlag, docDate = '', tableName = 'ic_trans' }) {
   const docFormat = await resolveDocFormat(client, screenCode, docFormatCode);
   const pattern = buildDocPattern(docFormat.format, docFormat.code, docDate);
-  const docNo = await resolveDocNoFromPattern(client, pattern, transFlag);
+  const table = resolveDocumentTable(tableName);
+  await client.query(
+    'SELECT pg_advisory_xact_lock(hashtext($1))',
+    [`${table}|${screenCode}|${docFormat.code}|${transFlag}|${pattern}`],
+  );
+  const docNo = await resolveDocNoFromPattern(client, pattern, transFlag, table);
   return {
     doc_no: docNo,
     doc_format_code: docFormat.code,
@@ -115,6 +129,7 @@ async function resolveDocumentNo(client, { screenCode, docFormatCode = '', trans
 module.exports = {
   buildDocPattern,
   resolveDocFormat,
+  resolveDocumentTable,
   resolveDocNoFromPattern,
   resolveDocumentNo,
 };

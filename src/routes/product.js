@@ -6,6 +6,7 @@ const { randomInt, randomUUID } = require("crypto");
 
 const PRODUCT_CODE_PATTERN = /^[A-Z0-9_-]+$/;
 const EAN13_INTERNAL_PREFIX = "20";
+const ADJUST_STOCK_SQL_DEBUG = String(process.env.DEBUG_ADJUST_STOCK_SQL || "").trim() === "1";
 
 function normalizeStockLevelQty(value) {
   const num = Number(String(value ?? 0).replace(/,/g, ""));
@@ -935,13 +936,58 @@ router.get("/getProductByBarcodeDetail", async (req, res) => {
 router.post("/adjustStock", async (req, res) => {
   const { item_code = "", item_name = "", unit_code = "", barcode = "", wh_code = "", shelf_code = "", branch_code = "", emp_code = "", creator_code = "", qty } = req.body;
   const resp = { success: false };
+  const check_qty = Number(qty);
+  let lastSqlContext = null;
+
+  const compactSql = (sql) => String(sql || "").replace(/\s+/g, " ").trim();
+  const logSqlStart = (ctx) => {
+    if (!ADJUST_STOCK_SQL_DEBUG) return;
+    console.log(`[adjustStock][${ctx.label}] SQL: ${ctx.sql}`);
+    console.log(`[adjustStock][${ctx.label}] params: ${JSON.stringify(ctx.params)}`);
+  };
+  const logSqlDone = (ctx, rowCount) => {
+    if (!ADJUST_STOCK_SQL_DEBUG) return;
+    console.log(`[adjustStock][${ctx.label}] done in ${Date.now() - ctx.startedAt} ms, rowCount=${rowCount}`);
+  };
+
+  const runQuery = async (label, sql, params = []) => {
+    const ctx = { label, sql: compactSql(sql), params, startedAt: Date.now() };
+    lastSqlContext = ctx;
+    logSqlStart(ctx);
+    try {
+      const rs = await query(sql, params);
+      logSqlDone(ctx, rs.rowCount ?? rs.rows?.length ?? 0);
+      return rs;
+    } catch (ex) {
+      ex.adjustStockSqlContext = ctx;
+      throw ex;
+    }
+  };
+
+  const runTxQuery = async (client, label, sql, params = []) => {
+    const ctx = { label, sql: compactSql(sql), params, startedAt: Date.now() };
+    lastSqlContext = ctx;
+    logSqlStart(ctx);
+    try {
+      const rs = await client.query(sql, params);
+      logSqlDone(ctx, rs.rowCount ?? rs.rows?.length ?? 0);
+      return rs;
+    } catch (ex) {
+      ex.adjustStockSqlContext = ctx;
+      throw ex;
+    }
+  };
 
   if (!item_code || qty === undefined || qty === null) {
     return res.status(400).json({ ERROR: "item_code and qty are required" });
   }
+  if (!Number.isFinite(check_qty) || check_qty < 0) {
+    return res.status(400).json({ ERROR: "qty must be a valid non-negative number" });
+  }
 
   try {
     const now = new Date();
+    let balanceSyncWarning = "";
     const doc_date = now.toISOString().slice(0, 10);
     const doc_time = now.toTimeString().slice(0, 5);
 
@@ -950,25 +996,42 @@ router.post("/adjustStock", async (req, res) => {
     const dd = String(now.getDate()).padStart(2, "0");
     const mm = String(now.getMonth() + 1).padStart(2, "0");
     const prefix = `MSTC${yyyy}${dd}${mm}-`;
-    const lastRes = await query(`SELECT doc_no FROM ic_trans WHERE doc_no LIKE $1 ORDER BY doc_no DESC LIMIT 1`, [`${prefix}%`]);
+    const lastRes = await runQuery("load-last-stock-count-doc", `SELECT doc_no FROM ic_trans WHERE doc_no LIKE $1 ORDER BY doc_no DESC LIMIT 1`, [`${prefix}%`]);
     const lastRunning = lastRes.rows.length > 0 ? parseInt(lastRes.rows[0].doc_no.slice(-4), 10) : 0;
     const doc_no = `${prefix}${String(lastRunning + 1).padStart(4, "0")}`;
 
     // generate doc_no_adj รูปแบบ ISYYYYMMDD-#### running 4 หลัก
     const adjPrefix = `IS${yyyy}${mm}${dd}-`;
-    const lastAdjRes = await query(`SELECT doc_no FROM ic_trans WHERE doc_no LIKE $1 ORDER BY doc_no DESC LIMIT 1`, [`${adjPrefix}%`]);
+    const lastAdjRes = await runQuery("load-last-adjust-doc", `SELECT doc_no FROM ic_trans WHERE doc_no LIKE $1 ORDER BY doc_no DESC LIMIT 1`, [`${adjPrefix}%`]);
     const lastAdjRunning = lastAdjRes.rows.length > 0 ? parseInt(lastAdjRes.rows[0].doc_no.slice(-4), 10) : 0;
     const doc_no_adj = `${adjPrefix}${String(lastAdjRunning + 1).padStart(4, "0")}`;
 
     // ดึง ratio, stand_value, divide_value จาก ic_unit_use
-    const unitRes = await query(`SELECT ratio, stand_value, divide_value FROM ic_unit_use WHERE ic_code = $1 AND code = $2 LIMIT 1`, [item_code, unit_code]);
+    const unitRes = await runQuery(`load-unit-use`, `SELECT ratio, stand_value, divide_value FROM ic_unit_use WHERE ic_code = $1 AND code = $2 LIMIT 1`, [item_code, unit_code]);
     const unitRow = unitRes.rows[0] || {};
-    const ratio = Number(unitRow.ratio ?? 1);
-    const stand_value = Number(unitRow.stand_value ?? 1);
-    const divide_value = Number(unitRow.divide_value ?? 1);
+    if (!unitRes.rows.length) {
+      return res.status(400).json({ ERROR: `unit setup not found for item_code=${item_code}, unit_code=${unit_code}` });
+    }
+    const stand_value = Number(unitRow.stand_value);
+    const divide_value = Number(unitRow.divide_value);
+    const ratioFromRow = Number(unitRow.ratio);
+    if (!Number.isFinite(stand_value) || !Number.isFinite(divide_value) || stand_value <= 0 || divide_value <= 0) {
+      return res.status(400).json({
+        ERROR: "invalid unit setup: stand_value and divide_value must be > 0",
+        unit: { item_code, unit_code, stand_value: unitRow.stand_value, divide_value: unitRow.divide_value, ratio: unitRow.ratio },
+      });
+    }
+    const ratio = Number.isFinite(ratioFromRow) && ratioFromRow > 0 ? ratioFromRow : stand_value / divide_value;
+    if (!Number.isFinite(ratio) || ratio <= 0) {
+      return res.status(400).json({
+        ERROR: "invalid unit setup: ratio must be > 0",
+        unit: { item_code, unit_code, stand_value: unitRow.stand_value, divide_value: unitRow.divide_value, ratio: unitRow.ratio },
+      });
+    }
 
     // คำนวณยอดคงเหลือปัจจุบัน (base units) เพื่อหา diff
-    const balRes = await query(
+    const balRes = await runQuery(
+      "load-current-balance",
       `SELECT COALESCE(SUM(balance_qty), 0) AS sum_balance_qty
        FROM sml_ic_function_stock_balance_warehouse_location('NOW()', $1, $2, $3)`,
       [item_code, wh_code, shelf_code],
@@ -976,13 +1039,14 @@ router.post("/adjustStock", async (req, res) => {
   
     const sum_balance_qty = Number(balRes.rows[0]?.sum_balance_qty ?? 0);
 
-    const balance_in_unit = Math.floor(sum_balance_qty / Math.max(1, ratio));
-    const check_qty = Number(qty);
+      const balance_in_unit = Math.floor(sum_balance_qty / ratio);
     const diff_qty = check_qty - balance_in_unit;
 
     await withTransaction(async (client) => {
       // 1. ic_trans_detail_temp (log scan)
-      await client.query(
+        await runTxQuery(
+          client,
+          "insert-ic_trans_detail_temp",
         `INSERT INTO ic_trans_detail_temp
           (doc_no, doc_date, trans_flag, item_code, item_name, unit_code, barcode,
            wh_code, shelf_code, doc_time, user_code, qty)
@@ -991,20 +1055,26 @@ router.post("/adjustStock", async (req, res) => {
       );
 
       // 2. ic_trans header (76 = ตรวจนับ)
-      await client.query(
+        await runTxQuery(
+          client,
+          "insert-ic_trans-76-header",
         `INSERT INTO ic_trans
           (trans_flag, trans_type, doc_no, doc_date, doc_time, doc_format_code,
            remark, branch_code, wh_from, location_from)
          VALUES (76, 3, $1, $2, $3, 'CO', 'ปรับปรุงสต๊อกไม่ตรง', $4, $5, $6)`,
         [doc_no, doc_date, doc_time, branch_code, wh_code, shelf_code],
       );
-      await client.query(
+        await runTxQuery(
+          client,
+          "update-ic_trans-76-creator",
         `UPDATE ic_trans SET creator_code = $1 WHERE doc_no = $2 AND trans_flag = 76`,
         [creator_code, doc_no],
       );
 
       // 3. ic_trans_detail (76)
-      const detailRes = await client.query(
+        const detailRes = await runTxQuery(
+          client,
+          "insert-ic_trans_detail-76",
         `INSERT INTO ic_trans_detail
           (trans_flag, trans_type, calc_flag, doc_no, doc_date, doc_time,
            doc_date_calc, doc_time_calc, last_status, line_number,
@@ -1024,26 +1094,34 @@ router.post("/adjustStock", async (req, res) => {
         const adj_calc_flag = diff_qty > 0 ? 1 : -1;
         const adj_qty = Math.abs(diff_qty);
 
-        await client.query(
+        await runTxQuery(
+          client,
+          "insert-ic_trans-adjust-header",
           `INSERT INTO ic_trans
             (trans_flag, trans_type, doc_no, doc_date, doc_time, doc_format_code,
              branch_code, wh_from, location_from,doc_ref)
            VALUES ($1, 3, $2, $3, $4, 'IS', $5, $6, $7, $8)`,
           [adj_flag, doc_no_adj, doc_date, doc_time, branch_code, wh_code, shelf_code, doc_no],
         );
-        await client.query(
+        await runTxQuery(
+          client,
+          "update-ic_trans-adjust-creator",
           `UPDATE ic_trans SET creator_code = $1 WHERE doc_no = $2 AND trans_flag = $3`,
           [creator_code, doc_no_adj, adj_flag],
         );
 
-        await client.query(
+        await runTxQuery(
+          client,
+          "insert-ap_ar_trans_detail",
           `INSERT INTO ap_ar_trans_detail (
             trans_type,trans_flag,doc_date,doc_no,billing_no,calc_flag)
             VALUES (2, $1, $2, $3, $4, $5)`,
           [adj_flag, doc_date, doc_no_adj, doc_no, adj_calc_flag],
         );
 
-        const adjRes = await client.query(
+        const adjRes = await runTxQuery(
+          client,
+          "insert-ic_trans_detail-adjust",
           `INSERT INTO ic_trans_detail
             (trans_flag, trans_type, calc_flag, doc_no, doc_date, doc_time,
              doc_date_calc, doc_time_calc, last_status, line_number,
@@ -1060,20 +1138,38 @@ router.post("/adjustStock", async (req, res) => {
 
       // 5. process queue
       const docNos = diff_qty !== 0 ? [doc_no, doc_no_adj] : [doc_no];
-      await client.query(
+      await runTxQuery(
+        client,
+        "insert-process-queue",
         `INSERT INTO process (process_name, wherein)
          SELECT 'IC', item_code FROM ic_trans_detail WHERE doc_no = ANY($1::text[]) and trans_flag = '76' `,
         [docNos],
       );
 
       // 6. อัปเดต balance_qty ใน ic_inventory จากยอดจริงหลังปรับ
-      const newBalRes = await client.query(
-        `SELECT COALESCE(SUM(balance_qty), 0) AS new_balance
-         FROM sml_ic_function_stock_balance_warehouse_location('NOW()', $1, '', '')`,
-        [item_code],
-      );
-      const new_balance = Number(newBalRes.rows[0].new_balance);
-      await client.query(`UPDATE ic_inventory SET balance_qty = $1 WHERE code = $2`, [new_balance, item_code]);
+      try {
+        const newBalRes = await runTxQuery(
+          client,
+          "load-new-item-balance",
+          `SELECT COALESCE(SUM(balance_qty), 0) AS new_balance
+           FROM sml_ic_function_stock_balance_warehouse_location('NOW()', $1, '', '')`,
+          [item_code],
+        );
+        const new_balance = Number(newBalRes.rows[0].new_balance);
+        if (Number.isFinite(new_balance)) {
+          await runTxQuery(client, "update-ic_inventory-balance", `UPDATE ic_inventory SET balance_qty = $1 WHERE code = $2`, [new_balance, item_code]);
+        }
+      } catch (balanceEx) {
+        const ctx = balanceEx.adjustStockSqlContext || lastSqlContext;
+        balanceSyncWarning = "balance sync skipped due to stock-balance function error";
+        if (ctx) {
+          console.error(`[adjustStock][${ctx.label}] non-critical sync error:`, balanceEx.message);
+          console.error(`[adjustStock][${ctx.label}] SQL: ${ctx.sql}`);
+          console.error(`[adjustStock][${ctx.label}] params: ${JSON.stringify(ctx.params)}`);
+        } else {
+          console.error("[adjustStock] non-critical balance sync error:", balanceEx.message);
+        }
+      }
     });
 
     resp.success = true;
@@ -1081,10 +1177,28 @@ router.post("/adjustStock", async (req, res) => {
     resp.balance_qty = balance_in_unit;
     resp.check_qty = check_qty;
     resp.diff_qty = diff_qty;
+    if (balanceSyncWarning) {
+      resp.warning = balanceSyncWarning;
+    }
     return res.json(resp);
   } catch (ex) {
-    console.error("adjustStock error:", ex.message);
-    return res.status(500).json({ ERROR: ex.message });
+    const sqlCtx = ex.adjustStockSqlContext || lastSqlContext;
+    if (sqlCtx) {
+      console.error(`[adjustStock][${sqlCtx.label}] error:`, ex.message);
+      console.error(`[adjustStock][${sqlCtx.label}] SQL: ${sqlCtx.sql}`);
+      console.error(`[adjustStock][${sqlCtx.label}] params: ${JSON.stringify(sqlCtx.params)}`);
+    } else {
+      console.error("adjustStock error:", ex.message);
+    }
+    const errorResponse = { ERROR: ex.message };
+    if (ADJUST_STOCK_SQL_DEBUG && sqlCtx) {
+      errorResponse.query_debug = {
+        label: sqlCtx.label,
+        sql: sqlCtx.sql,
+        params: sqlCtx.params,
+      };
+    }
+    return res.status(500).json(errorResponse);
   }
 });
 

@@ -26,6 +26,8 @@ const purchaseRoutes = require('./routes/purchase');
 const purchasePrintRoutes = require('./routes/purchasePrint');
 const promotionRoutes = require('./routes/promotion');
 const salesReturnRoutes = require('./routes/salesReturn');
+const advancePaymentRoutes = require('./routes/advancePayment');
+const arBillingRoutes = require('./routes/arBilling');
 
 const app = express();
 const PORT = process.env.PORT || 47300;
@@ -70,6 +72,8 @@ app.use('/service/v1', purchaseRoutes);
 app.use('/service/v1', purchasePrintRoutes);
 app.use('/service/v1', promotionRoutes);
 app.use('/service/v1', salesReturnRoutes);
+app.use('/service/v1', advancePaymentRoutes);
+app.use('/service/v1', arBillingRoutes);
 
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
