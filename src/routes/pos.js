@@ -4,8 +4,88 @@ const crypto = require('crypto');
 const { query, withTransaction } = require('../db');
 const { calcDiscount, calcVat } = require('../utils/vatHelper');
 const { validateSaleItemsStock } = require('../utils/cartStockValidator');
+const { getEmployeePermissions } = require('../utils/permissions');
 
 const uuidv4 = () => crypto.randomUUID();
+const SOLD_OUT_PURCHASE_INFO_PERMISSION = 'sold_out.purchase_info.view';
+
+function activeProductCondition(alias = 'd') {
+  return `COALESCE(${alias}.is_hold_sale,0) <> 1 AND COALESCE(${alias}.is_hold_purchase,0) <> 1`;
+}
+
+function toNumber(value, fallback = 0) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
+function roundMoney(value) {
+  return Math.round(toNumber(value) * 100) / 100;
+}
+
+function normalizeSaleDepositPayments(payments) {
+  return (Array.isArray(payments) ? payments : [])
+    .map((row) => {
+      const docType = parseInt(row?.doc_type || row?.pay_type || 0, 10);
+      return {
+        doc_type: docType,
+        trans_number: String(row?.trans_number || row?.doc_no || '').trim(),
+        amount: roundMoney(row?.pay_amount ?? row?.amount),
+        remark: String(row?.remark || '').trim(),
+      };
+    })
+    .filter((row) => (row.doc_type === 5 || row.doc_type === 6) && row.amount > 0);
+}
+
+async function querySaleAdvanceDepositBalances(queryFn, custCode, docNos = []) {
+  const params = [custCode];
+  let docFilter = '';
+  if (docNos.length > 0) {
+    params.push(docNos);
+    docFilter = `AND h.doc_no = ANY($${params.length}::text[])`;
+  }
+
+  const result = await queryFn(
+    `SELECT x.doc_no, x.doc_date, x.doc_time, x.cust_code, x.trans_flag,
+            CASE WHEN x.trans_flag IN (110,9110) THEN 6 ELSE 5 END AS doc_type,
+            CASE WHEN x.trans_flag IN (110,9110) THEN 'deposit' ELSE 'advance' END AS payment_kind,
+            CASE WHEN x.trans_flag IN (110,9110) THEN 'เงินมัดจำ' ELSE 'เงินล่วงหน้า' END AS type_label,
+            COALESCE(x.remark,'') AS remark,
+            COALESCE(x.total_amount,0) AS total_amount,
+            COALESCE(x.used_amount,0) AS used_amount,
+            GREATEST(ROUND(COALESCE(x.total_amount,0) - COALESCE(x.used_amount,0), 2), 0) AS balance_amount
+     FROM (
+       SELECT h.doc_no, h.doc_date, h.doc_time, h.cust_code, h.trans_flag, h.remark,
+              COALESCE(h.total_amount,0) AS total_amount,
+              COALESCE((
+                SELECT SUM(COALESCE(r.total_amount,0))
+                FROM ic_trans r
+                WHERE COALESCE(r.last_status,0) = 0
+                  AND r.doc_ref = h.doc_no
+                  AND (
+                    (h.trans_flag IN (40,9040) AND r.trans_flag = 42)
+                    OR (h.trans_flag IN (110,9110) AND r.trans_flag = 112)
+                  )
+              ),0)
+              + COALESCE((
+                SELECT SUM(COALESCE(d.amount,0))
+                FROM cb_trans_detail d
+                WHERE COALESCE(d.last_status,0) = 0
+                  AND d.trans_number = h.doc_no
+                  AND d.doc_type = CASE WHEN h.trans_flag IN (110,9110) THEN 6 ELSE 5 END
+              ),0) AS used_amount
+       FROM ic_trans h
+       WHERE h.trans_flag IN (40,9040,110,9110)
+         AND h.cust_code = $1
+         AND COALESCE(h.last_status,0) = 0
+         AND COALESCE(h.is_doc_copy,0) <> 1
+         ${docFilter}
+     ) x
+     WHERE GREATEST(ROUND(COALESCE(x.total_amount,0) - COALESCE(x.used_amount,0), 2), 0) > 0
+     ORDER BY x.doc_date DESC, x.doc_no DESC`,
+    params
+  );
+  return result.rows;
+}
 
 // ── helper: buildDocPattern ────────────────────────────────────────────────
 // แปลง doc_format จาก pos_id table เป็น pattern จริง
@@ -271,21 +351,65 @@ router.get('/getDashboardTopProducts', async (req, res) => {
 // ── GET /service/v1/getDashboardSoldOut ───────────────────────────────────
 // สินค้าขายหมด: รายการที่ขายในวันที่เลือก ยอดคงเหลือ (net) - ตะกร้า <= 0
 router.get('/getDashboardSoldOut', async (req, res) => {
-  const { date = '', from_date = '', to_date = '' } = req.query;
+  const { date = '', from_date = '', to_date = '', user_code = '' } = req.query;
   const today = new Date().toISOString().slice(0, 10);
   const targetFromDate = from_date || date || today;
   const targetToDate = to_date || date || targetFromDate;
   try {
+    const userCode = String(user_code || '').trim();
+    let canViewPurchaseInfo = false;
+    if (userCode) {
+      const permissions = await getEmployeePermissions(query, userCode);
+      canViewPurchaseInfo = permissions.includes(SOLD_OUT_PURCHASE_INFO_PERMISSION);
+    }
+
+    const purchaseInfoSelect = canViewPurchaseInfo
+      ? `,
+         COALESCE(last_pu.price, 0)::numeric                               AS last_purchase_price,
+         COALESCE(last_pu.doc_no, '')                                       AS last_purchase_doc_no,
+         COALESCE(last_pu.doc_date::text, '')                               AS last_purchase_doc_date,
+         COALESCE(last_pu.supplier_code, '')                                AS last_purchase_supplier_code,
+         COALESCE(last_pu.supplier_name, '')                                AS last_purchase_supplier_name`
+      : '';
+
+    const purchaseInfoJoin = canViewPurchaseInfo
+      ? `LEFT JOIN LATERAL (
+           SELECT
+             d.price,
+             d.doc_no,
+             d.doc_date,
+             t.cust_code AS supplier_code,
+             ap.name_1 AS supplier_name
+           FROM ic_trans_detail d
+           JOIN ic_trans t
+             ON t.doc_no = d.doc_no
+            AND t.trans_flag = d.trans_flag
+           LEFT JOIN ap_supplier ap
+             ON ap.code = t.cust_code
+           WHERE d.trans_flag = 12
+             AND COALESCE(t.last_status, 0) = 0
+             AND d.item_code = st.item_code
+           ORDER BY
+             d.doc_date DESC,
+             d.doc_no DESC,
+             COALESCE(t.doc_time, '') DESC,
+             d.line_number DESC
+           LIMIT 1
+         ) last_pu ON true`
+      : '';
+
     const result = await query(
       `WITH sold_today AS (
          SELECT DISTINCT d.item_code
          FROM ic_trans_detail d
          JOIN ic_trans t ON t.doc_no = d.doc_no AND t.trans_flag = 44
          LEFT JOIN ic_inventory inv_sold ON inv_sold.code = d.item_code
+         LEFT JOIN ic_inventory_detail inv_sold_detail ON inv_sold_detail.ic_code = d.item_code
          WHERE d.trans_flag = 44
            AND t.doc_date BETWEEN LEAST($1::date, $2::date) AND GREATEST($1::date, $2::date)
            AND t.last_status = 0
            AND COALESCE(inv_sold.item_type, 0) NOT IN (1, 3)
+           AND ${activeProductCondition('inv_sold_detail')}
        ),
        item_code_list AS (
          SELECT string_agg(item_code, ',') AS codes
@@ -323,11 +447,13 @@ router.get('/getDashboardSoldOut', async (req, res) => {
          (COALESCE(stk.sum_balance_qty, 0) - COALESCE(crt.cart_qty_std, 0))::numeric AS remaining_qty,
          COALESCE(inv.unit_standard, '')                                        AS unit_code,
          COALESCE(un.name_1, inv.unit_standard, '')                            AS unit_name
+         ${purchaseInfoSelect}
        FROM sold_today st
        LEFT JOIN ic_inventory inv ON inv.code = st.item_code
        LEFT JOIN stock stk        ON stk.ic_code = st.item_code
        LEFT JOIN cart crt         ON crt.item_code = st.item_code
        LEFT JOIN ic_unit un       ON un.code = inv.unit_standard
+       ${purchaseInfoJoin}
        WHERE (COALESCE(stk.sum_balance_qty, 0) - COALESCE(crt.cart_qty_std, 0)) <= 0
        ORDER BY remaining_qty ASC`,
       [targetFromDate, targetToDate]
@@ -485,6 +611,24 @@ router.get('/getCreditTypeList', async (req, res) => {
   }
 });
 
+router.get('/getSaleAdvanceDepositBalance', async (req, res) => {
+  const custCode = String(req.query.cust_code || '').trim();
+  if (!custCode) return res.json({ success: true, data: { balance_amount: 0, rows: [] } });
+  try {
+    const rows = await querySaleAdvanceDepositBalances(query, custCode);
+    const total = rows.reduce((sum, row) => sum + toNumber(row.balance_amount), 0);
+    return res.json({
+      success: true,
+      data: {
+        balance_amount: roundMoney(total),
+        rows,
+      },
+    });
+  } catch (ex) {
+    return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
 function getPromotionRows(obj) {
   const rows = obj.promotion_detail
     ?? obj.promotion_details
@@ -563,6 +707,8 @@ async function handleSaveTrans(req, res, options = {}) {
 
     const items = Array.isArray(obj.items) ? obj.items : [];
     const payments = Array.isArray(obj.payment_detail) ? obj.payment_detail : [];
+    const depositPayments = normalizeSaleDepositPayments(payments);
+    const deposit_amount_dbl = roundMoney(depositPayments.reduce((sum, row) => sum + row.amount, 0));
     const promotionRows = savePromotionDetails ? getPromotionRows(obj) : [];
     const tiger_pending = obj.tiger_pending === true || obj.tiger_pending === '1' || obj.tiger_pending === 1;
     const tiger_order_id = String(obj.tiger_order_id || '').trim();
@@ -583,6 +729,9 @@ async function handleSaveTrans(req, res, options = {}) {
     if (!pos_id) return res.status(400).json({ success: false, msg: 'pos_id is required' });
     if (items.length === 0) return res.status(400).json({ success: false, msg: 'items is empty' });
     if (tiger_pending && !tiger_order_id) return res.status(400).json({ success: false, msg: 'tiger_order_id is required' });
+    if (roundMoney(obj.deposit_amount) > 0 && depositPayments.length === 0) {
+      return res.status(400).json({ success: false, msg: 'advance/deposit payment_detail is required' });
+    }
 
     // ── ค่า VAT/discount: ใช้ค่าที่ frontend คำนวณมาแล้ว (มี breakdown vat/no-vat ถูกต้อง)
     //    ถ้าไม่ได้ส่งมา (backwards compat) → fallback คำนวณเองด้วย calcVat
@@ -607,14 +756,20 @@ async function handleSaveTrans(req, res, options = {}) {
     //   total_net_amount  = ยอดสุทธิ (ไม่บวกปัดเศษ)
     //   cash_amount_raw   = เงินสดที่ลูกค้าจ่ายจริง
     //   rounded_amount    = ปัดเศษ (frontend ส่งมา; เก็บลง total_income_amount เช่นกัน)
-    //   money_change      = (เงินสด + ปัดเศษ) − ยอดสุทธิ
-    const cash_amount_in_db = cash_amount_raw;
-    const total_amount_pay = total_net_amount_dbl;
+    //   total_amount_pay  = cash + transfer + card + wallet + deposit + rounding/income
+    //   money_change      = total_amount_pay − ยอดสุทธิ (ถ้ามี)
     const card_with_charge = card_amount_dbl + total_credit_charge_dbl;
     const total_income_amount = total_income_amount_dbl || rounded_amount_dbl;
-    const money_change = cash_amount_raw > 0
-      ? Math.max(0, cash_amount_raw + rounded_amount_dbl - total_net_amount_dbl)
-      : 0;
+    const cash_amount_in_db = cash_amount_raw;
+    const total_amount_pay = roundMoney(
+      cash_amount_in_db
+      + tranfer_amount_dbl
+      + card_with_charge
+      + wallet_amount_dbl
+      + total_income_amount
+      + deposit_amount_dbl
+    );
+    const money_change = Math.max(0, roundMoney(total_amount_pay - total_net_amount_dbl));
 
     let doc_no;
     let promotion_count = 0;
@@ -650,6 +805,28 @@ async function handleSaveTrans(req, res, options = {}) {
       form_code = form_code || saleDoc.form_code;
       const customerCredit = await resolveCustomerCredit(client, cust_code, doc_date, inquiry_type);
 
+      if (depositPayments.length > 0) {
+        const depositTotals = new Map();
+        for (const row of depositPayments) {
+          if (!row.trans_number) throw new Error('advance/deposit document number is required');
+          const key = `${row.doc_type}:${row.trans_number}`;
+          depositTotals.set(key, {
+            doc_type: row.doc_type,
+            trans_number: row.trans_number,
+            amount: roundMoney((depositTotals.get(key)?.amount || 0) + row.amount),
+          });
+        }
+
+        const depositNos = [...new Set([...depositTotals.values()].map((row) => row.trans_number))];
+        const balanceRows = await querySaleAdvanceDepositBalances(client.query.bind(client), cust_code, depositNos);
+        const balanceMap = new Map(balanceRows.map((row) => [`${Number(row.doc_type)}:${row.doc_no}`, roundMoney(row.balance_amount)]));
+        for (const row of depositTotals.values()) {
+          const balance = balanceMap.get(`${row.doc_type}:${row.trans_number}`);
+          if (balance === undefined) throw new Error(`advance/deposit not found: ${row.trans_number}`);
+          if (row.amount > balance + 0.01) throw new Error(`advance/deposit exceeds balance: ${row.trans_number}`);
+        }
+      }
+
       // 2. INSERT ic_trans
       await client.query(
         `INSERT INTO ic_trans (
@@ -679,14 +856,14 @@ async function handleSaveTrans(req, res, options = {}) {
           trans_type,trans_flag,doc_no,doc_date,doc_time,ap_ar_code,pay_type,doc_format_code,
           total_amount,total_net_amount,cash_amount,tranfer_amount,card_amount,
           total_amount_pay,total_credit_charge,wallet_amount,total_income_amount,
-          pay_cash_amount,money_change
-        ) VALUES (2,44,$1,$2::date,$3,$4,1,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+          deposit_amount,pay_cash_amount,money_change
+        ) VALUES (2,44,$1,$2::date,$3,$4,1,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
         [
           doc_no, doc_date, doc_time, cust_code, doc_format_code,
           total_amount, total_net_amount_dbl,
           cash_amount_in_db, tranfer_amount_dbl, card_with_charge,
           total_amount_pay, total_credit_charge_dbl, wallet_amount_dbl,
-          total_income_amount, cash_amount_raw, money_change,
+          total_income_amount, deposit_amount_dbl, cash_amount_raw, money_change,
         ]
       );
 
@@ -968,8 +1145,21 @@ async function handleSaveTrans(req, res, options = {}) {
         const pay_amount = parseFloat(p.pay_amount || 0);
         const trans_number = p.trans_number || '';
         const charge = parseFloat(p.charge || 0);
+        const detail_doc_type = parseInt(p.doc_type || p.pay_type || 0, 10);
 
-        if (pay_type === '0') {
+        if ((detail_doc_type === 5 || detail_doc_type === 6) && pay_amount > 0) {
+          await client.query(
+            `INSERT INTO cb_trans_detail (
+              trans_type,trans_flag,doc_no,doc_date,doc_time,trans_number,
+              amount,sum_amount,doc_type,ap_ar_code,ap_ar_type,remark
+            ) VALUES (2,$1,$2,$3::date,$4,$5,$6,$6,$7,$8,1,$9)`,
+            [
+              44, doc_no, doc_date, doc_time, trans_number,
+              pay_amount, detail_doc_type, cust_code,
+              p.remark || '',
+            ]
+          );
+        } else if (pay_type === '0') {
           // โอน
           const pb_bank_code = p.bank_code || 'KBANK';
           const pb_bank_branch = p.bank_branch || 'KBANK2';
@@ -1054,6 +1244,9 @@ async function handleSaveTrans(req, res, options = {}) {
     if (msg.includes('running overflow')) {
       return res.status(409).json({ success: false, msg: 'ERR_DOC_RUNNING_OVERFLOW: ' + msg });
     }
+    if (msg.includes('advance/deposit')) {
+      return res.status(400).json({ success: false, msg });
+    }
     return res.status(500).json({ success: false, msg });
   }
 }
@@ -1106,7 +1299,7 @@ router.get('/getDocSaleHistory', async (req, res) => {
         COALESCE(ict.send_sms,0) AS send_sms,
         COALESCE(ict.remark_3,'') AS tiger_order_id,
         COALESCE(ict.remark_5,'') AS tiger_status_note,
-        cb.cash_amount, cb.tranfer_amount, cb.card_amount, cb.wallet_amount,
+        cb.cash_amount, cb.tranfer_amount, cb.card_amount, cb.wallet_amount, cb.deposit_amount,
         cb.total_credit_charge, cb.total_net_amount, cb.total_amount_pay
       FROM ic_trans ict
       LEFT JOIN ar_customer ar ON ar.code = ict.cust_code
@@ -1117,6 +1310,88 @@ router.get('/getDocSaleHistory', async (req, res) => {
         ${saleKindWhere}
         ${whereExtra}
       ORDER BY ict.create_datetime DESC
+    `;
+
+    const result = await query(sql, params);
+    return res.json({ success: true, data: result.rows });
+  } catch (ex) {
+    return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
+// ── GET /service/v1/getProductSaleHistory ───────────────────────────────────
+// ประวัติขายระดับเอกสาร: ค้นด้วยสินค้า / ลูกค้า / เลขที่เอกสาร และรวมขายสด+ขายเชื่อ
+router.get('/getProductSaleHistory', async (req, res) => {
+  const { search = '', from_date = '', to_date = '' } = req.query;
+  try {
+    const params = [];
+    let whereExtra = '';
+
+    if (search.trim()) {
+      const like = `%${search.trim()}%`;
+      params.push(like, like, like, like, like);
+      const n = params.length;
+      whereExtra = `
+        AND (
+          t.doc_no ILIKE $${n - 4}
+          OR t.cust_code ILIKE $${n - 3}
+          OR ar.name_1 ILIKE $${n - 2}
+          OR EXISTS (
+            SELECT 1
+            FROM ic_trans_detail d
+            LEFT JOIN ic_inventory_detail item_detail ON item_detail.ic_code = d.item_code
+            WHERE d.doc_no = t.doc_no
+              AND d.trans_flag = t.trans_flag
+              AND (COALESCE(d.set_ref_line,'') = '' OR COALESCE(d.item_type,0) = 3)
+              AND ${activeProductCondition('item_detail')}
+              AND (d.item_code ILIKE $${n - 1} OR d.item_name ILIKE $${n})
+          )
+        )`;
+    } else if (from_date.trim() && to_date.trim()) {
+      params.push(from_date.trim(), to_date.trim());
+      whereExtra = ` AND t.doc_date BETWEEN $${params.length - 1}::date AND $${params.length}::date`;
+    }
+
+    const sql = `
+      SELECT
+        t.doc_no,
+        t.doc_date,
+        t.doc_time,
+        t.inquiry_type,
+        COALESCE(t.total_amount,0) AS total_amount,
+        t.cust_code,
+        COALESCE(t.doc_format_code,'') AS doc_format_code,
+        COALESCE(df.name_1,'') AS doc_format_name,
+        COALESCE(df.form_code,'') AS form_code,
+        COALESCE(ar.name_1, '') AS cust_name,
+        COALESCE(t.send_sms,0) AS send_sms,
+        COALESCE(t.remark_3,'') AS tiger_order_id,
+        COALESCE(t.remark_5,'') AS tiger_status_note,
+        cb.cash_amount,
+        cb.tranfer_amount,
+        cb.card_amount,
+        cb.wallet_amount,
+        cb.deposit_amount,
+        cb.total_credit_charge,
+        cb.total_net_amount,
+        cb.total_amount_pay
+      FROM ic_trans t
+      LEFT JOIN ar_customer ar ON ar.code = t.cust_code
+      LEFT JOIN cb_trans cb ON cb.doc_no = t.doc_no AND cb.trans_flag = 44
+      LEFT JOIN erp_doc_format df ON df.screen_code = 'SI' AND df.code = t.doc_format_code
+      WHERE t.trans_flag = 44
+        AND COALESCE(t.last_status,0) = 0
+        AND EXISTS (
+          SELECT 1
+          FROM ic_trans_detail d
+          LEFT JOIN ic_inventory_detail item_detail ON item_detail.ic_code = d.item_code
+          WHERE d.doc_no = t.doc_no
+            AND d.trans_flag = t.trans_flag
+            AND (COALESCE(d.set_ref_line,'') = '' OR COALESCE(d.item_type,0) = 3)
+            AND ${activeProductCondition('item_detail')}
+        )
+        ${whereExtra}
+      ORDER BY t.create_datetime DESC
     `;
 
     const result = await query(sql, params);
@@ -1146,6 +1421,7 @@ router.get('/getDocSaleHistoryDetail', async (req, res) => {
             COALESCE(cb.cash_amount, 0) AS cash_amount,
             COALESCE(cb.tranfer_amount, 0) AS tranfer_amount,
             COALESCE(cb.card_amount, 0) AS card_amount,
+            COALESCE(cb.deposit_amount, 0) AS deposit_amount,
             COALESCE(cb.total_credit_charge, 0) AS total_credit_charge,
             COALESCE(cb.money_change, 0) AS money_change
          FROM ic_trans t

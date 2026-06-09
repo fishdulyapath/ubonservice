@@ -8,6 +8,10 @@ const PRODUCT_CODE_PATTERN = /^[A-Z0-9_-]+$/;
 const EAN13_INTERNAL_PREFIX = "20";
 const ADJUST_STOCK_SQL_DEBUG = String(process.env.DEBUG_ADJUST_STOCK_SQL || "").trim() === "1";
 
+function activeProductCondition(alias = "d") {
+  return `COALESCE(${alias}.is_hold_sale,0) <> 1 AND COALESCE(${alias}.is_hold_purchase,0) <> 1`;
+}
+
 function normalizeStockLevelQty(value) {
   const num = Number(String(value ?? 0).replace(/,/g, ""));
   return Number.isFinite(num) && num > 0 ? num : 0;
@@ -94,7 +98,7 @@ router.get("/getProductList", async (req, res) => {
       searchWhere = ` AND (${parts.join(" OR ")}) `;
     }
 
-    let whereFinal = searchWhere;
+    let whereFinal = `${searchWhere} AND ${activeProductCondition("c")}`;
 
     if (strCategory && strCategory.trim()) {
       whereFinal += ` AND b.item_category='${strCategory.replace(/'/g, "''")}'`;
@@ -197,7 +201,7 @@ router.get("/getProductBarcodeSearch", async (req, res) => {
 
   try {
     const params = [];
-    const whereParts = [];
+    const whereParts = [activeProductCondition("d")];
     const keywords = String(strSearch || "")
       .trim()
       .split(/\s+/)
@@ -340,6 +344,7 @@ router.get("/getProductDetail", async (req, res) => {
       LEFT JOIN ic_inventory b ON a.ic_code=b.code
       LEFT JOIN ic_inventory_detail c ON a.ic_code=c.ic_code
       WHERE a.ic_code IN ('${strItemCode.replace(/'/g, "''")}')
+        AND ${activeProductCondition("c")}
       ORDER BY a.ic_code, ratio
     `;
 
@@ -520,6 +525,7 @@ router.get("/getProductSetDetail", async (req, res) => {
       LEFT JOIN set_price sp ON i.code = sp.ic_set_code
       LEFT JOIN ar_item_by_customer f ON f.ic_code = i.code AND f.ar_code = '${strCustCode.replace(/'/g, "''")}'
       WHERE i.code = '${strItemCode.replace(/'/g, "''")}'
+        AND ${activeProductCondition("d")}
       ORDER BY u.ratio
     `;
 
@@ -586,8 +592,10 @@ router.get("/getProductSetItem", async (req, res) => {
              s.line_number, s.roworder
       FROM set_detail s
       LEFT JOIN ic_inventory i ON s.ic_code = i.code
+      LEFT JOIN ic_inventory_detail d ON d.ic_code = s.ic_code
       LEFT JOIN balance_stock b ON s.ic_code = b.ic_code
       LEFT JOIN ic_unit_use icu ON icu.ic_code = s.ic_code AND icu.code = s.unit_code
+      WHERE ${activeProductCondition("d")}
       ORDER BY COALESCE(s.line_number, s.roworder, 0), COALESCE(s.roworder, 0), s.ic_code
     `;
 
@@ -653,6 +661,7 @@ router.get("/getProductBalancePrice", async (req, res) => {
       LEFT JOIN ic_inventory_detail c ON a.ic_code=c.ic_code
       LEFT JOIN ic_unit_use icu ON icu.code = a.unit_code AND icu.ic_code = a.ic_code
       WHERE a.ic_code = '${strItemCode.replace(/'/g, "''")}' AND a.unit_code = '${strUnit.replace(/'/g, "''")}'
+        AND ${activeProductCondition("c")}
     `;
 
     const result = await query(sql, []);
@@ -795,6 +804,7 @@ router.get("/getProductByBarcode", async (req, res) => {
 
   try {
     const holdWhere = [
+      activeProductCondition("d"),
       strExcludeHoldSale === "1" ? "COALESCE(d.is_hold_sale,0) <> 1" : "",
       strExcludeHoldPurchase === "1" ? "COALESCE(d.is_hold_purchase,0) <> 1" : "",
     ].filter(Boolean).join(" AND ");
@@ -869,6 +879,7 @@ router.get("/getProductByBarcodeDetail", async (req, res) => {
          JOIN ic_inventory i ON i.code = b.ic_code
          LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
          WHERE b.barcode = $1
+           AND ${activeProductCondition("d")}
          LIMIT 1
        ),
        resolved AS (
@@ -1303,7 +1314,7 @@ router.get("/getProductManageList", async (req, res) => {
   const orderBy = `${sortCol} ${sortDir}`;
 
   const whereParams = [];
-  const whereParts = [];
+  const whereParts = [activeProductCondition("d")];
   const addParam = (value) => {
     whereParams.push(value);
     return `$${whereParams.length}`;
@@ -1338,7 +1349,7 @@ router.get("/getProductManageList", async (req, res) => {
     const offsetParam = `$${whereParams.length + 1}`;
     const limitParam = `$${whereParams.length + 2}`;
     const [countRes, dataRes] = await Promise.all([
-      query(`SELECT COUNT(*) AS cnt FROM ic_inventory i${whereSql}`, whereParams),
+      query(`SELECT COUNT(*) AS cnt FROM ic_inventory i LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code${whereSql}`, whereParams),
       query(
         `SELECT i.code, COALESCE(i.name_1,'') AS name_1, COALESCE(i.name_eng_1,'') AS name_eng_1,` +
           ` COALESCE(i.unit_standard,'') AS unit_standard,` +
@@ -1387,6 +1398,7 @@ router.get("/getPurchaseStockReorderList", async (req, res) => {
   const whereParams = [];
   const whereParts = [
     "COALESCE(i.item_type,0) NOT IN (1,3)",
+    activeProductCondition("d"),
   ];
   const addParam = (value) => {
     whereParams.push(value);
@@ -1660,7 +1672,7 @@ router.get("/getProductItemDetail", async (req, res) => {
         ` COALESCE(d.maximum_qty,0) AS maximum_qty` +
         ` FROM ic_inventory i` +
         ` LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code` +
-        ` WHERE i.code = $1`,
+        ` WHERE i.code = $1 AND ${activeProductCondition("d")}`,
       [code],
     );
     if (!result.rows.length) return res.status(400).json({ success: false, message: "ไม่พบสินค้า" });

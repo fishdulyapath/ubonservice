@@ -1141,8 +1141,11 @@ router.get('/getPurchaseProductDetail', async (req, res) => {
                  ELSE 1 END AS ratio,
             COALESCE(i.tax_type,0) AS tax_type
          FROM ic_inventory i
+         LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
          LEFT JOIN ic_unit_use u ON u.ic_code = i.code
          WHERE i.code = $1
+           AND COALESCE(d.is_hold_sale,0) <> 1
+           AND COALESCE(d.is_hold_purchase,0) <> 1
        )
        SELECT DISTINCT ON (u.item_code, u.unit_code)
           u.item_code,

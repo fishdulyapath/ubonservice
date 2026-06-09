@@ -22,6 +22,10 @@ function pctChange(curr, prev) {
   return ((c - p) / p) * 100;
 }
 
+function activeProductCondition(alias = 'd') {
+  return `COALESCE(${alias}.is_hold_sale,0) <> 1 AND COALESCE(${alias}.is_hold_purchase,0) <> 1`;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /service/v1/getBarcodeItem
 // ค้นหาสินค้าจาก barcode → return รายละเอียดเต็ม (price, unit, stock)
@@ -32,7 +36,7 @@ router.get('/getBarcodeItem', async (req, res) => {
     return res.status(400).json({ success: false, msg: 'barcode is required' });
   }
   try {
-    const holdWhere = exclude_hold_purchase === '1' ? 'AND COALESCE(d.is_hold_purchase,0) <> 1' : '';
+    const holdWhere = `AND ${activeProductCondition('d')}`;
     // Resolve item ผ่าน ic_inventory_barcode → ic_inventory
     const result = await query(
       `SELECT
@@ -108,7 +112,7 @@ router.get('/getBarcodeItemSearch', async (req, res) => {
        LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
        LEFT JOIN ic_unit_use u ON u.ic_code = i.code AND u.code = i.unit_standard
        WHERE
-         (${exclude_hold_purchase === '1' ? 'COALESCE(d.is_hold_purchase,0) <> 1 AND' : ''}
+         (${activeProductCondition('d')} AND
            (UPPER(i.code) LIKE $1
            OR UPPER(i.name_1) LIKE $1
            OR EXISTS (
