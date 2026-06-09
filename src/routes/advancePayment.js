@@ -3,6 +3,7 @@ const router = express.Router();
 const { withTransaction, query } = require('../db');
 const { resolveDocumentNo } = require('../utils/docFormat');
 const { getEmployeePermissions } = require('../utils/permissions');
+const { renderSalePrintHtml } = require('../utils/salePrintRenderer');
 
 const TRANS_TYPE = 2;
 const TRANS_FLAG = 40;
@@ -52,6 +53,36 @@ function addDays(dateText, days) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
 
+function splitFormCodes(value) {
+  return String(value || '')
+    .split(',')
+    .map((code) => code.trim())
+    .filter(Boolean);
+}
+
+function uniqueCodes(codes) {
+  const seen = new Set();
+  return codes.filter((code) => {
+    const key = code.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function lowerCodes(codes) {
+  return codes.map((code) => code.toLowerCase());
+}
+
+function asAmountText(value) {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num) || Math.abs(num) < 0.005) return '';
+  return num.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
 function normalizePayload(body) {
   let payload = body || {};
   if (typeof payload === 'string') payload = JSON.parse(payload);
@@ -75,8 +106,22 @@ function normalizePayments(value) {
   const transfer = Array.isArray(source.transfer) ? source.transfer : [];
   const card = Array.isArray(source.card) ? source.card : [];
   const cheque = Array.isArray(source.cheque) ? source.cheque : [];
+  const tiger = Array.isArray(source.tiger) ? source.tiger : [];
+  const tigerRows = tiger
+    .map((row) => ({
+      tiger_order_id: safeText(row?.tiger_order_id),
+      amount: roundMoney(row?.amount ?? row?.pay_amount),
+      ref1: safeText(row?.ref1),
+      ref2: safeText(row?.ref2),
+    }))
+    .filter((row) => row.amount > 0);
+  const tigerAmount = source.tiger_amount === undefined
+    ? roundMoney(tigerRows.reduce((sum, row) => sum + row.amount, 0))
+    : roundMoney(source.tiger_amount);
   return {
     cash_amount: roundMoney(source.cash_amount),
+    tiger_amount: tigerAmount,
+    tiger: tigerRows,
     petty_cash_amount: roundMoney(source.petty_cash_amount),
     discount_amount: roundMoney(source.discount_amount),
     total_income_amount: roundMoney(source.total_income_amount),
@@ -167,6 +212,211 @@ async function getPassBook(client, code) {
     [code],
   );
   return result.rows[0] || null;
+}
+
+async function loadPaymentRowsForPrint(docNo) {
+  const tableRes = await query(
+    `SELECT
+        to_regclass('public.cb_trans') AS cb_table,
+        to_regclass('public.cb_trans_detail') AS cb_detail_table`
+  );
+  if (!tableRes.rows[0]?.cb_table) return [];
+
+  const cbRes = await query(
+    `SELECT
+        COALESCE(cash_amount,0) AS cash_amount,
+        COALESCE(tranfer_amount,0) AS tranfer_amount,
+        COALESCE(card_amount,0) AS card_amount
+     FROM cb_trans
+     WHERE doc_no = $1 AND trans_flag = $2
+     LIMIT 1`,
+    [docNo, TRANS_FLAG],
+  );
+
+  const labels = [];
+  const amounts = [];
+  const cashAmount = asAmountText(cbRes.rows[0]?.cash_amount);
+  if (cashAmount) {
+    labels.push('เงินสด');
+    amounts.push(cashAmount);
+  }
+
+  if (tableRes.rows[0]?.cb_detail_table) {
+    const detailRes = await query(
+      `SELECT doc_type, COALESCE(trans_number,'') AS trans_number, COALESCE(amount,0) AS amount
+       FROM cb_trans_detail
+       WHERE doc_no = $1 AND trans_flag = $2
+       ORDER BY roworder`,
+      [docNo, TRANS_FLAG],
+    );
+
+    for (const row of detailRes.rows) {
+      const amount = asAmountText(row.amount);
+      if (!amount) continue;
+      const docType = Number(row.doc_type || 0);
+      let label = String(row.trans_number || '').trim();
+      if (docType === 1) label = label ? `เงินโอน ~ ${label}` : 'เงินโอน';
+      else if (docType === 3) label = label ? `บัตรเครดิต ~ ${label}` : 'บัตรเครดิต';
+      else if (docType === 2) label = label ? `เช็ค ~ ${label}` : 'เช็ค';
+      labels.push(label || 'ชำระเงิน');
+      amounts.push(amount);
+    }
+  }
+
+  return labels.length
+    ? [{ trans_number: labels.join('\n'), amount: amounts.join('\n') }]
+    : [];
+}
+
+async function loadAdvancePaymentPrintDocument(docNo) {
+  const [headerRes, companyRes, detailsRes, payments] = await Promise.all([
+    query(
+      `SELECT t.*,
+          COALESCE(df.name_1,'') AS doc_format_name,
+          COALESCE(df.form_code,'') AS form_code,
+          COALESCE(ar.name_1,'') AS name_1,
+          COALESCE(ar.address,'') AS address,
+          COALESCE(ar.telephone,'') AS telephone,
+          COALESCE(ar.fax,'') AS fax,
+          COALESCE(cd.tax_id,'') AS tax_id,
+          COALESCE(u.name_1, t.creator_code, '') AS sale_name
+       FROM ic_trans t
+       LEFT JOIN erp_doc_format df ON df.screen_code = $2 AND df.code = t.doc_format_code
+       LEFT JOIN ar_customer ar ON ar.code = t.cust_code
+       LEFT JOIN ar_customer_detail cd ON cd.ar_code = t.cust_code
+       LEFT JOIN erp_user u ON UPPER(u.code) = UPPER(t.creator_code)
+       WHERE t.trans_flag = $3 AND t.doc_no = $1
+       LIMIT 1`,
+      [docNo, SCREEN_CODE, TRANS_FLAG],
+    ),
+    query('SELECT * FROM erp_company_profile ORDER BY roworder LIMIT 1'),
+    query(
+      `SELECT
+          line_number,
+          remark,
+          remark AS item_name,
+          remark AS item_code,
+          '' AS unit_code,
+          '' AS unit_name,
+          1 AS qty,
+          sum_debt_amount AS price,
+          sum_debt_amount AS sum_amount,
+          sum_debt_amount AS amount,
+          sum_debt_amount
+       FROM ap_ar_trans_detail
+       WHERE trans_flag = $2 AND doc_no = $1
+       ORDER BY line_number, roworder`,
+      [docNo, TRANS_FLAG],
+    ),
+    loadPaymentRowsForPrint(docNo),
+  ]);
+
+  const header = headerRes.rows[0];
+  if (!header) return null;
+  const company = companyRes.rows[0] || {};
+  company.tax_text = company.tax_number ? `หมายเลขประจำตัวผู้เสียภาษี ${company.tax_number}` : '';
+  company.telephone_text = company.telephone_number ? `โทร. ${company.telephone_number}` : '';
+
+  return {
+    header,
+    company,
+    details: detailsRes.rows || [],
+    payments,
+  };
+}
+
+async function loadPrintFormOptions(docNo) {
+  const docRes = await query(
+    `SELECT t.doc_no, COALESCE(t.doc_format_code,'') AS doc_format_code,
+        COALESCE(df.name_1,'') AS doc_format_name,
+        COALESCE(df.form_code,'') AS form_code
+     FROM ic_trans t
+     LEFT JOIN erp_doc_format df ON df.screen_code = $2 AND df.code = t.doc_format_code
+     WHERE t.trans_flag = $3 AND t.doc_no = $1
+     LIMIT 1`,
+    [docNo, SCREEN_CODE, TRANS_FLAG],
+  );
+
+  const doc = docRes.rows[0];
+  if (!doc) return null;
+
+  const codes = uniqueCodes(splitFormCodes(doc.form_code));
+  let formRows = [];
+  if (codes.length) {
+    const result = await query(
+      `SELECT formcode, formname
+       FROM formdesign
+       WHERE lower(formcode) = ANY($1::text[])`,
+      [lowerCodes(codes)],
+    );
+    formRows = result.rows;
+  }
+
+  const byCode = new Map(formRows.map((row) => [String(row.formcode || '').toLowerCase(), row]));
+  const forms = codes.map((code, index) => {
+    const row = byCode.get(code.toLowerCase());
+    return {
+      formcode: row?.formcode || code,
+      formname: row?.formname || code,
+      available: !!row,
+      is_default: index === 0,
+    };
+  });
+
+  return {
+    doc_no: doc.doc_no,
+    doc_format_code: doc.doc_format_code,
+    doc_format_name: doc.doc_format_name,
+    form_code: doc.form_code,
+    forms,
+  };
+}
+
+async function loadFormDesignRows(formCodes) {
+  if (!formCodes.length) return [];
+  const result = await query(
+    `SELECT formcode, formname, formdesigntext, formbackground
+     FROM formdesign
+     WHERE lower(formcode) = ANY($1::text[])`,
+    [lowerCodes(formCodes)],
+  );
+  const byCode = new Map(result.rows.map((row) => [String(row.formcode || '').toLowerCase(), row]));
+  return formCodes.map((code) => byCode.get(code.toLowerCase())).filter(Boolean);
+}
+
+function shouldLogPrint(logPrint, autoPrint) {
+  if (logPrint !== undefined) {
+    const value = String(logPrint).trim().toLowerCase();
+    return value !== '0' && value !== 'false' && value !== 'no';
+  }
+  return String(autoPrint) !== '0';
+}
+
+async function getPrintCount(docNo) {
+  const result = await query(
+    `SELECT COUNT(*)::int AS print_count
+     FROM erp_print_logs
+     WHERE trans_flag = $2 AND doc_no = $1`,
+    [docNo, TRANS_FLAG],
+  );
+  return Number(result.rows[0]?.print_count || 0);
+}
+
+async function createPrintLog(docNo, userCode) {
+  return withTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO erp_print_logs (doc_no, trans_flag, user_code, print_datetime)
+       VALUES ($1, $2, $3, NOW())`,
+      [docNo, TRANS_FLAG, String(userCode || 'WEB').trim() || 'WEB'],
+    );
+    const result = await client.query(
+      `SELECT COUNT(*)::int AS print_count
+       FROM erp_print_logs
+       WHERE trans_flag = $2 AND doc_no = $1`,
+      [docNo, TRANS_FLAG],
+    );
+    return Number(result.rows[0]?.print_count || 0);
+  });
 }
 
 async function updateAdvanceStatuses(client, docNos = []) {
@@ -315,6 +565,64 @@ router.get('/advance-payment/detail', async (req, res) => {
   }
 });
 
+router.get('/advance-payment/print-forms', async (req, res) => {
+  const docNo = safeText(req.query.doc_no);
+  if (!docNo) return res.status(400).json({ success: false, msg: 'doc_no is required' });
+  try {
+    await assertPermission(query, req.query.user_code || req.query.emp_code, ADVANCE_PAYMENT_VIEW_PERMISSION);
+    const options = await loadPrintFormOptions(docNo);
+    if (!options) return res.status(404).json({ success: false, msg: 'document not found' });
+    return res.json({ success: true, data: options });
+  } catch (ex) {
+    if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
+    return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
+router.get('/advance-payment/print/render', async (req, res) => {
+  const { doc_no = '', formcodes = '', auto_print = '1', log_print, user_code = '' } = req.query;
+  const docNo = safeText(doc_no);
+  if (!docNo) return res.status(400).type('text/plain').send('doc_no is required');
+
+  try {
+    await assertPermission(query, user_code || req.query.emp_code, ADVANCE_PAYMENT_VIEW_PERMISSION);
+    const [options, printData] = await Promise.all([
+      loadPrintFormOptions(docNo),
+      loadAdvancePaymentPrintDocument(docNo),
+    ]);
+
+    if (!options || !printData) return res.status(404).type('text/plain').send('document not found');
+
+    const availableCodes = options.forms.filter((form) => form.available).map((form) => form.formcode);
+    const requestedCodes = uniqueCodes(splitFormCodes(formcodes));
+    const selectedCodes = requestedCodes.length
+      ? requestedCodes.filter((code) => availableCodes.some((available) => available.toLowerCase() === code.toLowerCase()))
+      : availableCodes.slice(0, 1);
+
+    if (!selectedCodes.length) return res.status(404).type('text/plain').send('print form not found');
+
+    const formRows = await loadFormDesignRows(selectedCodes);
+    if (!formRows.length) return res.status(404).type('text/plain').send('print form not found');
+
+    const logThisPrint = req.method !== 'HEAD' && shouldLogPrint(log_print, auto_print);
+    const printCount = logThisPrint
+      ? await createPrintLog(docNo, user_code || printData.header.creator_code)
+      : await getPrintCount(docNo);
+    printData.header.print_count = printCount;
+
+    const html = renderSalePrintHtml({
+      formRows,
+      data: printData,
+      autoPrint: String(auto_print) !== '0',
+    });
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(200).type('html').send(html);
+  } catch (ex) {
+    if (isPermissionError(ex)) return res.status(403).type('text/plain').send(ex.message);
+    return res.status(500).type('text/plain').send(ex.message);
+  }
+});
+
 router.post('/advance-payment/save', async (req, res) => {
   try {
     const payload = normalizePayload(req.body);
@@ -325,8 +633,12 @@ router.post('/advance-payment/save', async (req, res) => {
     const payments = normalizePayments(payload.payments);
     const vatType = toInt(payload.vat_type, 0);
     const vatRate = toNumber(payload.vat_rate, 0);
-    const depositDay = toInt(payload.deposit_day, 0);
-    const depositDate = normalizeDate(payload.deposit_date, addDays(docDate, depositDay));
+    const hasDepositDay = payload.deposit_day !== undefined
+      && payload.deposit_day !== null
+      && safeText(payload.deposit_day) !== ''
+      && toInt(payload.deposit_day, 0) > 0;
+    const depositDay = hasDepositDay ? toInt(payload.deposit_day, 0) : 0;
+    const depositDate = hasDepositDay ? normalizeDate(payload.deposit_date, addDays(docDate, depositDay)) : null;
     const requestUserCode = safeText(payload.emp_code) || safeText(payload.creator_code);
     const creatorCode = requestUserCode || 'smlstaff';
     const branchCode = safeText(payload.branch_code);
@@ -341,9 +653,10 @@ router.post('/advance-payment/save', async (req, res) => {
     const cardAmount = roundMoney(payments.card.reduce((sum, row) => sum + row.amount + row.charge, 0));
     const cardCharge = roundMoney(payments.card.reduce((sum, row) => sum + row.charge, 0));
     const chequeAmount = roundMoney(payments.cheque.reduce((sum, row) => sum + row.amount, 0));
+    const cashAmount = roundMoney(payments.cash_amount + payments.tiger_amount);
     const totalNetAmount = roundMoney(totals.total_amount + cardCharge);
     const totalPaid = roundMoney(
-      payments.cash_amount
+      cashAmount
       + payments.petty_cash_amount
       + transferAmount
       + cardAmount
@@ -423,7 +736,7 @@ router.post('/advance-payment/save', async (req, res) => {
         [
           TRANS_TYPE, TRANS_FLAG, savedDocNo, docDate, docTime, custCode,
           savedDocFormatCode, totals.total_amount, totalNetAmount,
-          payments.cash_amount, chequeAmount, transferAmount, cardAmount,
+          cashAmount, chequeAmount, transferAmount, cardAmount,
           totalNetAmount, payments.total_income_amount, payments.petty_cash_amount,
           payments.discount_amount, cardCharge, remark,
         ],
