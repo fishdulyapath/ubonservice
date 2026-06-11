@@ -1300,7 +1300,10 @@ router.get('/getDocSaleHistory', async (req, res) => {
         COALESCE(ict.remark_3,'') AS tiger_order_id,
         COALESCE(ict.remark_5,'') AS tiger_status_note,
         cb.cash_amount, cb.tranfer_amount, cb.card_amount, cb.wallet_amount, cb.deposit_amount,
-        cb.total_credit_charge, cb.total_net_amount, cb.total_amount_pay
+        cb.total_credit_charge,
+        COALESCE(NULLIF(cb.total_net_amount,0), ict.total_amount, 0) AS total_net_amount,
+        cb.total_net_amount AS payment_net_amount,
+        cb.total_amount_pay
       FROM ic_trans ict
       LEFT JOIN ar_customer ar ON ar.code = ict.cust_code
       LEFT JOIN cb_trans cb ON cb.doc_no = ict.doc_no AND cb.trans_flag = 44
@@ -1373,7 +1376,8 @@ router.get('/getProductSaleHistory', async (req, res) => {
         cb.wallet_amount,
         cb.deposit_amount,
         cb.total_credit_charge,
-        cb.total_net_amount,
+        COALESCE(NULLIF(cb.total_net_amount,0), t.total_amount, 0) AS total_net_amount,
+        cb.total_net_amount AS payment_net_amount,
         cb.total_amount_pay
       FROM ic_trans t
       LEFT JOIN ar_customer ar ON ar.code = t.cust_code
@@ -1417,7 +1421,8 @@ router.get('/getDocSaleHistoryDetail', async (req, res) => {
             COALESCE(t.send_sms,0) AS send_sms,
             COALESCE(t.remark_3,'') AS tiger_order_id,
             COALESCE(t.remark_5,'') AS tiger_status_note,
-            COALESCE(cb.total_net_amount, t.total_amount) AS total_net_amount,
+            COALESCE(NULLIF(cb.total_net_amount,0), t.total_amount, 0) AS total_net_amount,
+            cb.total_net_amount AS payment_net_amount,
             COALESCE(cb.cash_amount, 0) AS cash_amount,
             COALESCE(cb.tranfer_amount, 0) AS tranfer_amount,
             COALESCE(cb.card_amount, 0) AS card_amount,
@@ -1432,6 +1437,11 @@ router.get('/getDocSaleHistoryDetail', async (req, res) => {
       ),
       query(
         `SELECT item_code, item_name, unit_code, qty, price, sum_amount,
+          COALESCE(price_exclude_vat, price, 0) AS price_exclude_vat,
+          COALESCE(sum_amount_exclude_vat, sum_amount, 0) AS sum_amount_exclude_vat,
+          COALESCE(total_vat_value,0) AS total_vat_value,
+          COALESCE(item_type,0) AS item_type,
+          COALESCE(set_ref_line,'') AS set_ref_line,
           COALESCE(discount,'') AS discount, COALESCE(discount_amount,0) AS discount_amount
          FROM ic_trans_detail
          WHERE trans_flag = 44 AND doc_no = $1

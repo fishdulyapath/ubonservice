@@ -3,6 +3,7 @@ const router = express.Router();
 const { withTransaction, query } = require('../db');
 const { resolveDocumentNo } = require('../utils/docFormat');
 const { getEmployeePermissions } = require('../utils/permissions');
+const { renderSalePrintHtml } = require('../utils/salePrintRenderer');
 
 const TRANS_TYPE = 2;
 const TRANS_FLAG = 239;
@@ -96,6 +97,27 @@ function normalizeDetails(value) {
     .filter((row) => row.source_billing_no && row.billing_no && row.bill_type && row.sum_pay_money > 0);
 }
 
+function splitFormCodes(value) {
+  return String(value || '')
+    .split(',')
+    .map((code) => code.trim())
+    .filter(Boolean);
+}
+
+function uniqueCodes(codes) {
+  const seen = new Set();
+  return codes.filter((code) => {
+    const key = code.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function lowerCodes(codes) {
+  return codes.map((code) => code.toLowerCase());
+}
+
 function normalizePayments(value) {
   const source = value && typeof value === 'object' ? value : {};
   const transfer = Array.isArray(source.transfer) ? source.transfer : [];
@@ -182,6 +204,243 @@ function normalizeVatSaleRows(value) {
       };
     })
     .filter((row) => row.vat_number && (row.base_caltax_amount !== 0 || row.amount !== 0 || row.except_tax_amount !== 0));
+}
+
+function asAmountText(value) {
+  const amount = roundMoney(value);
+  return Math.abs(amount) > 0.0001 ? amount.toFixed(2) : '';
+}
+
+function paymentLabel(row) {
+  const docType = toInt(row?.doc_type);
+  const ref = safeText(row?.trans_number);
+  const map = {
+    1: 'Transfer',
+    2: 'Cheque',
+    3: 'Credit card',
+    4: 'Petty cash',
+    5: 'Advance/deposit',
+    9: 'Coupon',
+    11: 'Other expense',
+    12: 'Other income',
+    19: 'Foreign currency',
+    21: 'Wallet',
+  };
+  const label = map[docType] || 'Payment';
+  return ref ? `${label} - ${ref}` : label;
+}
+
+async function loadPaymentRowsForPrint(docNo) {
+  const cbRes = await query(
+    `SELECT
+        COALESCE(cash_amount,0) AS cash_amount,
+        COALESCE(petty_cash_amount,0) AS petty_cash_amount,
+        COALESCE(discount_amount,0) AS discount_amount,
+        COALESCE(total_income_amount,0) AS total_income_amount
+     FROM cb_trans
+     WHERE doc_no = $1 AND trans_flag = $2
+     LIMIT 1`,
+    [docNo, TRANS_FLAG],
+  );
+
+  const labels = [];
+  const amounts = [];
+  const addPayment = (label, amount) => {
+    const text = asAmountText(amount);
+    if (!text) return;
+    labels.push(label);
+    amounts.push(text);
+  };
+
+  addPayment('Cash', cbRes.rows[0]?.cash_amount);
+  addPayment('Petty cash', cbRes.rows[0]?.petty_cash_amount);
+  addPayment('Discount', cbRes.rows[0]?.discount_amount);
+  addPayment('Round/income', cbRes.rows[0]?.total_income_amount);
+
+  const detailRes = await query(
+    `SELECT doc_type, COALESCE(trans_number,'') AS trans_number,
+            COALESCE(amount,0) AS amount, COALESCE(charge,0) AS charge
+     FROM cb_trans_detail
+     WHERE doc_no = $1 AND trans_flag = $2
+     ORDER BY roworder`,
+    [docNo, TRANS_FLAG],
+  );
+
+  for (const row of detailRes.rows) {
+    addPayment(paymentLabel(row), roundMoney(toNumber(row.amount) + toNumber(row.charge)));
+  }
+
+  return labels.length ? [{ trans_number: labels.join('\n'), amount: amounts.join('\n') }] : [];
+}
+
+async function loadArDebtPaymentPrintDocument(docNo) {
+  const [headerRes, companyRes, detailsRes, payments] = await Promise.all([
+    query(
+      `SELECT t.*,
+          COALESCE(t.total_net_value,0) AS total_value,
+          COALESCE(t.total_net_value,0) AS total_amount,
+          COALESCE(t.total_net_value,0) AS total_net_amount,
+          COALESCE(t.total_net_value,0) AS total_after_discount,
+          COALESCE(df.name_1,'') AS doc_format_name,
+          COALESCE(df.form_code,'') AS form_code,
+          COALESCE(ar.name_1,'') AS name_1,
+          COALESCE(ar.address,'') AS address,
+          COALESCE(ar.telephone,'') AS telephone,
+          COALESCE(ar.fax,'') AS fax,
+          COALESCE(cd.tax_id,'') AS tax_id,
+          COALESCE(u.name_1, t.creator_code, '') AS sale_name
+       FROM ap_ar_trans t
+       LEFT JOIN erp_doc_format df ON df.screen_code = $2 AND df.code = t.doc_format_code
+       LEFT JOIN ar_customer ar ON ar.code = t.cust_code
+       LEFT JOIN ar_customer_detail cd ON cd.ar_code = t.cust_code
+       LEFT JOIN erp_user u ON UPPER(u.code) = UPPER(t.creator_code)
+       WHERE t.trans_flag = $3 AND t.doc_no = $1
+       LIMIT 1`,
+      [docNo, SCREEN_CODE, TRANS_FLAG],
+    ),
+    query('SELECT * FROM erp_company_profile ORDER BY roworder LIMIT 1'),
+    query(
+      `SELECT
+          line_number,
+          doc_ref AS item_code,
+          CONCAT_WS(' / ', NULLIF(doc_ref,''), NULLIF(billing_no,'')) AS item_name,
+          bill_type_name,
+          '' AS unit_code,
+          '' AS unit_name,
+          1 AS qty,
+          sum_pay_money AS price,
+          sum_pay_money AS sum_amount,
+          sum_pay_money AS amount,
+          sum_pay_money AS sum_debt_amount,
+          balance_ref,
+          billing_date,
+          due_date,
+          remark
+       FROM (
+         SELECT d.*, CASE d.bill_type
+                    WHEN 44 THEN 'Credit sale'
+                    WHEN 46 THEN 'Debit note'
+                    WHEN 48 THEN 'Credit note'
+                    WHEN 93 THEN 'Opening debt'
+                    WHEN 95 THEN 'Opening debit note'
+                    WHEN 97 THEN 'Opening credit note'
+                    ELSE d.bill_type::text
+                  END AS bill_type_name
+         FROM ap_ar_trans_detail d
+         WHERE d.trans_flag = $2 AND d.doc_no = $1
+       ) x
+       ORDER BY line_number, roworder`,
+      [docNo, TRANS_FLAG],
+    ),
+    loadPaymentRowsForPrint(docNo),
+  ]);
+
+  const header = headerRes.rows[0];
+  if (!header) return null;
+  const company = companyRes.rows[0] || {};
+  company.tax_text = company.tax_number ? `Tax ID ${company.tax_number}` : '';
+  company.telephone_text = company.telephone_number ? `Tel. ${company.telephone_number}` : '';
+
+  return {
+    header,
+    company,
+    details: detailsRes.rows || [],
+    payments,
+  };
+}
+
+async function loadPrintFormOptions(docNo) {
+  const docRes = await query(
+    `SELECT t.doc_no, COALESCE(t.doc_format_code,'') AS doc_format_code,
+        COALESCE(df.name_1,'') AS doc_format_name,
+        COALESCE(df.form_code,'') AS form_code
+     FROM ap_ar_trans t
+     LEFT JOIN erp_doc_format df ON df.screen_code = $2 AND df.code = t.doc_format_code
+     WHERE t.trans_flag = $3 AND t.doc_no = $1
+     LIMIT 1`,
+    [docNo, SCREEN_CODE, TRANS_FLAG],
+  );
+
+  const doc = docRes.rows[0];
+  if (!doc) return null;
+
+  const codes = uniqueCodes(splitFormCodes(doc.form_code));
+  let formRows = [];
+  if (codes.length) {
+    const result = await query(
+      `SELECT formcode, formname
+       FROM formdesign
+       WHERE lower(formcode) = ANY($1::text[])`,
+      [lowerCodes(codes)],
+    );
+    formRows = result.rows;
+  }
+
+  const byCode = new Map(formRows.map((row) => [String(row.formcode || '').toLowerCase(), row]));
+  const forms = codes.map((code, index) => {
+    const row = byCode.get(code.toLowerCase());
+    return {
+      formcode: row?.formcode || code,
+      formname: row?.formname || code,
+      available: !!row,
+      is_default: index === 0,
+    };
+  });
+
+  return {
+    doc_no: doc.doc_no,
+    doc_format_code: doc.doc_format_code,
+    doc_format_name: doc.doc_format_name,
+    form_code: doc.form_code,
+    forms,
+  };
+}
+
+async function loadFormDesignRows(formCodes) {
+  if (!formCodes.length) return [];
+  const result = await query(
+    `SELECT formcode, formname, formdesigntext, formbackground
+     FROM formdesign
+     WHERE lower(formcode) = ANY($1::text[])`,
+    [lowerCodes(formCodes)],
+  );
+  const byCode = new Map(result.rows.map((row) => [String(row.formcode || '').toLowerCase(), row]));
+  return formCodes.map((code) => byCode.get(code.toLowerCase())).filter(Boolean);
+}
+
+function shouldLogPrint(logPrint, autoPrint) {
+  if (logPrint !== undefined) {
+    const value = String(logPrint).trim().toLowerCase();
+    return value !== '0' && value !== 'false' && value !== 'no';
+  }
+  return String(autoPrint) !== '0';
+}
+
+async function getPrintCount(docNo) {
+  const result = await query(
+    `SELECT COUNT(*)::int AS print_count
+     FROM erp_print_logs
+     WHERE trans_flag = $2 AND doc_no = $1`,
+    [docNo, TRANS_FLAG],
+  );
+  return Number(result.rows[0]?.print_count || 0);
+}
+
+async function createPrintLog(docNo, userCode) {
+  return withTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO erp_print_logs (doc_no, trans_flag, user_code, print_datetime)
+       VALUES ($1, $2, $3, NOW())`,
+      [docNo, TRANS_FLAG, String(userCode || 'WEB').trim() || 'WEB'],
+    );
+    const result = await client.query(
+      `SELECT COUNT(*)::int AS print_count
+       FROM erp_print_logs
+       WHERE trans_flag = $2 AND doc_no = $1`,
+      [docNo, TRANS_FLAG],
+    );
+    return Number(result.rows[0]?.print_count || 0);
+  });
 }
 
 function isPermissionError(ex) {
@@ -390,6 +649,31 @@ router.get('/ar-debt-payment/next-doc-no', async (req, res) => {
       })
     );
     return res.json({ success: true, ...result });
+  } catch (ex) {
+    if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
+    return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
+router.get('/ar-debt-payment/sales-users', async (req, res) => {
+  const search = safeText(req.query.search);
+  const params = [];
+  let where = '1=1';
+  if (search) {
+    params.push(`%${search}%`);
+    where += ` AND (code ILIKE $${params.length} OR COALESCE(name_1,'') ILIKE $${params.length})`;
+  }
+  try {
+    await assertPermission(query, req.query.user_code || req.query.emp_code, VIEW_PERMISSION);
+    const result = await query(
+      `SELECT code, COALESCE(name_1,'') AS name_1
+       FROM erp_user
+       WHERE ${where}
+       ORDER BY code
+       LIMIT 50`,
+      params,
+    );
+    return res.json({ success: true, data: result.rows });
   } catch (ex) {
     if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
     return res.status(500).json({ success: false, msg: ex.message });
@@ -732,6 +1016,64 @@ router.get('/ar-debt-payment/detail', async (req, res) => {
   }
 });
 
+router.get('/ar-debt-payment/print-forms', async (req, res) => {
+  const docNo = safeText(req.query.doc_no);
+  if (!docNo) return res.status(400).json({ success: false, msg: 'doc_no is required' });
+  try {
+    await assertPermission(query, req.query.user_code || req.query.emp_code, VIEW_PERMISSION);
+    const options = await loadPrintFormOptions(docNo);
+    if (!options) return res.status(404).json({ success: false, msg: 'document not found' });
+    return res.json({ success: true, data: options });
+  } catch (ex) {
+    if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
+    return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
+router.get('/ar-debt-payment/print/render', async (req, res) => {
+  const { doc_no = '', formcodes = '', auto_print = '1', log_print, user_code = '' } = req.query;
+  const docNo = safeText(doc_no);
+  if (!docNo) return res.status(400).type('text/plain').send('doc_no is required');
+
+  try {
+    await assertPermission(query, user_code || req.query.emp_code, VIEW_PERMISSION);
+    const [options, printData] = await Promise.all([
+      loadPrintFormOptions(docNo),
+      loadArDebtPaymentPrintDocument(docNo),
+    ]);
+
+    if (!options || !printData) return res.status(404).type('text/plain').send('document not found');
+
+    const availableCodes = options.forms.filter((form) => form.available).map((form) => form.formcode);
+    const requestedCodes = uniqueCodes(splitFormCodes(formcodes));
+    const selectedCodes = requestedCodes.length
+      ? requestedCodes.filter((code) => availableCodes.some((available) => available.toLowerCase() === code.toLowerCase()))
+      : availableCodes.slice(0, 1);
+
+    if (!selectedCodes.length) return res.status(404).type('text/plain').send('print form not found');
+
+    const formRows = await loadFormDesignRows(selectedCodes);
+    if (!formRows.length) return res.status(404).type('text/plain').send('print form not found');
+
+    const logThisPrint = req.method !== 'HEAD' && shouldLogPrint(log_print, auto_print);
+    const printCount = logThisPrint
+      ? await createPrintLog(docNo, user_code || printData.header.creator_code)
+      : await getPrintCount(docNo);
+    printData.header.print_count = printCount;
+
+    const html = renderSalePrintHtml({
+      formRows,
+      data: printData,
+      autoPrint: String(auto_print) !== '0',
+    });
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(200).type('html').send(html);
+  } catch (ex) {
+    if (isPermissionError(ex)) return res.status(403).type('text/plain').send(ex.message);
+    return res.status(500).type('text/plain').send(ex.message);
+  }
+});
+
 router.post('/ar-debt-payment/save', async (req, res) => {
   try {
     const payload = normalizePayload(req.body);
@@ -824,11 +1166,17 @@ router.post('/ar-debt-payment/save', async (req, res) => {
         [BILLING_TRANS_FLAG, sourceBillingNos, TRANS_FLAG, custCode],
       );
       const validMap = new Map(validation.rows.map((row) => [`${row.source_billing_no}|${row.billing_no}|${row.bill_type}`, row]));
+      const detailTotals = new Map();
       for (const row of details) {
-        const original = validMap.get(`${row.source_billing_no}|${row.billing_no}|${row.bill_type}`);
+        const key = `${row.source_billing_no}|${row.billing_no}|${row.bill_type}`;
+        detailTotals.set(key, roundMoney((detailTotals.get(key) || 0) + row.sum_pay_money));
+      }
+      for (const row of details) {
+        const key = `${row.source_billing_no}|${row.billing_no}|${row.bill_type}`;
+        const original = validMap.get(key);
         if (!original) throw new Error(`billing detail not found: ${row.source_billing_no}/${row.billing_no}`);
         const balance = roundMoney(original.balance_ref);
-        if (row.sum_pay_money > balance + 0.01) {
+        if ((detailTotals.get(key) || 0) > balance + 0.01) {
           throw new Error(`sum_pay_money exceeds balance: ${row.billing_no}`);
         }
       }
@@ -951,7 +1299,7 @@ router.post('/ar-debt-payment/save', async (req, res) => {
           chequeAmount, transferAmount, cardAmount, totalPaid,
           payments.total_income_amount, payments.petty_cash_amount,
           payments.discount_amount, couponAmount, depositAmount,
-          expenseOtherAmount, incomeOtherAmount, cardCharge, remark,
+          incomeOtherAmount, expenseOtherAmount, cardCharge, remark,
         ],
       );
 
@@ -963,7 +1311,7 @@ router.post('/ar-debt-payment/save', async (req, res) => {
             trans_type, trans_flag, doc_no, doc_date, doc_time, trans_number,
             bank_code, bank_branch, amount, sum_amount, doc_type, ap_ar_code,
             trans_number_type, ap_ar_type, last_status
-          ) VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8,$9,0,1,'',0,0,0)`,
+          ) VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$9,1,'',0,0,0)`,
           [
             TRANS_TYPE, TRANS_FLAG, savedDocNo, docDate, docTime,
             passBook.code, passBook.bank_code || row.bank_code, passBook.bank_branch || row.bank_branch,

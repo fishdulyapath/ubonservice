@@ -13,14 +13,25 @@ router.get('/getDocList', async (req, res) => {
 
     const sql = `
       WITH SUM_CN AS (
-        SELECT b.ref_doc_no AS ref_doc_no,
-          SUM(a.total_amount) AS cn_total_amount,
-          SUM(a.total_except_vat) AS cn_total_except_vat,
-          SUM(a.total_after_vat) AS cn_total_after_vat,
-          SUM(a.total_vat_value) AS cn_total_vat_value
-        FROM ic_trans a
-        LEFT JOIN ic_trans_detail b ON a.doc_no = b.doc_no
-        GROUP BY b.ref_doc_no
+        SELECT ref_doc_no,
+          SUM(total_amount) AS cn_total_amount,
+          SUM(total_except_vat) AS cn_total_except_vat,
+          SUM(total_after_vat) AS cn_total_after_vat,
+          SUM(total_vat_value) AS cn_total_vat_value
+        FROM (
+          SELECT DISTINCT
+            b.ref_doc_no,
+            a.doc_no,
+            COALESCE(a.total_amount,0) AS total_amount,
+            COALESCE(a.total_except_vat,0) AS total_except_vat,
+            COALESCE(a.total_after_vat,0) AS total_after_vat,
+            COALESCE(a.total_vat_value,0) AS total_vat_value
+          FROM ic_trans a
+          JOIN ic_trans_detail b ON a.doc_no = b.doc_no
+          WHERE COALESCE(a.last_status,0) = 0
+            AND COALESCE(b.ref_doc_no,'') <> ''
+        ) AS cn
+        GROUP BY ref_doc_no
       )
       SELECT
         ic.inquiry_type, ic.last_status, ic.trans_flag, ic.send_type,

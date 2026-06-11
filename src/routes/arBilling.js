@@ -3,6 +3,7 @@ const router = express.Router();
 const { withTransaction, query } = require('../db');
 const { resolveDocumentNo } = require('../utils/docFormat');
 const { getEmployeePermissions } = require('../utils/permissions');
+const { renderSalePrintHtml } = require('../utils/salePrintRenderer');
 
 const TRANS_TYPE = 2;
 const TRANS_FLAG = 235;
@@ -89,6 +90,247 @@ function normalizeDetails(value) {
       remark: safeText(row?.remark),
     }))
     .filter((row) => row.billing_no && row.bill_type && row.sum_pay_money > 0);
+}
+
+function splitFormCodes(value) {
+  return String(value || '')
+    .split(',')
+    .map((code) => code.trim())
+    .filter(Boolean);
+}
+
+function uniqueCodes(codes) {
+  const seen = new Set();
+  return codes.filter((code) => {
+    const key = code.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function lowerCodes(codes) {
+  return codes.map((code) => code.toLowerCase());
+}
+
+async function loadArBillingPrintDocument(docNo) {
+  const [headerRes, companyRes, detailsRes] = await Promise.all([
+    query(
+      `SELECT t.*,
+          COALESCE(NULLIF(t.total_net_value,0), ds.bill_total, 0) AS total_value,
+          COALESCE(NULLIF(t.total_net_value,0), ds.bill_total, 0) AS total_amount,
+          COALESCE(NULLIF(t.total_net_value,0), ds.bill_total, 0) AS total_net_value,
+          COALESCE(NULLIF(t.total_net_value,0), ds.bill_total, 0) AS total_net_amount,
+          COALESCE(NULLIF(t.total_net_value,0), ds.bill_total, 0) AS total_after_discount,
+          COALESCE(NULLIF(t.total_pay_money,0), ds.bill_total, 0) AS total_pay_money,
+          COALESCE(NULLIF(t.total_debt_value,0), ds.debt_total, 0) AS total_debt_value,
+          COALESCE(NULLIF(t.total_debt_value,0), ds.debt_total, 0) AS total_debt_amount,
+          COALESCE(ds.bill_total,0) AS sum_pay_money,
+          COALESCE(ds.bill_total,0) AS bill_total,
+          COALESCE(ds.debt_total,0) AS debt_total,
+          COALESCE(ds.balance_total,0) AS balance_total,
+          COALESCE(ds.bill_count,0) AS bill_count,
+          COALESCE(ds.bill_count,0) AS total_bill_count,
+          COALESCE(ds.bill_count,0) AS detail_count,
+          COALESCE(ds.bill_count,0) AS doc_count,
+          COALESCE(ds.bill_count,0) AS count_bill,
+          COALESCE(df.name_1,'') AS doc_format_name,
+          COALESCE(df.form_code,'') AS form_code,
+          COALESCE(ar.name_1,'') AS name_1,
+          COALESCE(ar.name_1,'') AS cust_name,
+          COALESCE(ar.name_1,'') AS ar_name,
+          COALESCE(ar.name_1,'') AS customer_name,
+          COALESCE(ar.address,'') AS address,
+          COALESCE(ar.address,'') AS cust_address,
+          COALESCE(ar.address,'') AS ar_address,
+          COALESCE(ar.address,'') AS customer_address,
+          COALESCE(ar.telephone,'') AS telephone,
+          COALESCE(ar.telephone,'') AS phone,
+          COALESCE(ar.telephone,'') AS cust_telephone,
+          COALESCE(ar.fax,'') AS fax,
+          COALESCE(ar.fax,'') AS cust_fax,
+          COALESCE(cd.tax_id,'') AS tax_id,
+          COALESCE(u.name_1, t.sale_code, t.creator_code, '') AS sale_name
+       FROM ap_ar_trans t
+       LEFT JOIN (
+         SELECT doc_no,
+                COUNT(*)::int AS bill_count,
+                COALESCE(SUM(sum_pay_money),0) AS bill_total,
+                COALESCE(SUM(sum_debt_amount),0) AS debt_total,
+                COALESCE(SUM(balance_ref),0) AS balance_total
+         FROM ap_ar_trans_detail
+         WHERE trans_flag = $3
+         GROUP BY doc_no
+       ) ds ON ds.doc_no = t.doc_no
+       LEFT JOIN erp_doc_format df ON df.screen_code = $2 AND df.code = t.doc_format_code
+       LEFT JOIN ar_customer ar ON ar.code = t.cust_code
+       LEFT JOIN ar_customer_detail cd ON cd.ar_code = t.cust_code
+       LEFT JOIN erp_user u ON UPPER(u.code) = UPPER(COALESCE(NULLIF(t.sale_code,''), t.creator_code))
+       WHERE t.trans_flag = $3 AND t.doc_no = $1
+       LIMIT 1`,
+      [docNo, SCREEN_CODE, TRANS_FLAG],
+    ),
+    query('SELECT * FROM erp_company_profile ORDER BY roworder LIMIT 1'),
+    query(
+      `SELECT
+          line_number,
+          billing_no,
+          billing_no AS doc_no,
+          billing_no AS item_code,
+          billing_no AS item_name,
+          billing_date AS doc_date,
+          bill_type,
+          bill_type_name,
+          bill_type_name AS doc_type_name,
+          bill_type_name AS trans_flag_name,
+          ref_doc_no,
+          ref_doc_no AS doc_ref,
+          ref_doc_date,
+          ref_doc_date AS doc_ref_date,
+          '' AS unit_code,
+          '' AS unit_name,
+          1 AS qty,
+          sum_debt_amount AS price,
+          sum_debt_amount AS sum_amount,
+          sum_debt_amount AS amount,
+          sum_debt_amount,
+          sum_debt_amount AS debt_amount,
+          sum_debt_amount AS total_amount,
+          sum_debt_amount AS total_value,
+          balance_ref,
+          balance_ref AS balance_amount,
+          balance_ref AS ar_balance,
+          sum_pay_money,
+          sum_pay_money AS pay_amount,
+          sum_pay_money AS final_amount,
+          sum_pay_money AS net_amount,
+          billing_date,
+          due_date,
+          remark
+       FROM (
+         SELECT d.*, CASE d.bill_type
+                    WHEN 44 THEN 'ขายเชื่อ'
+                    WHEN 46 THEN 'เพิ่มหนี้'
+                    WHEN 48 THEN 'ลดหนี้'
+                    WHEN 93 THEN 'ตั้งหนี้ยกมา'
+                    WHEN 95 THEN 'เพิ่มหนี้ยกมา'
+                    WHEN 97 THEN 'ลดหนี้ยกมา'
+                    ELSE d.bill_type::text
+                  END AS bill_type_name
+         FROM ap_ar_trans_detail d
+         WHERE d.trans_flag = $2 AND d.doc_no = $1
+       ) x
+       ORDER BY line_number, roworder`,
+      [docNo, TRANS_FLAG],
+    ),
+  ]);
+
+  const header = headerRes.rows[0];
+  if (!header) return null;
+  const company = companyRes.rows[0] || {};
+  company.tax_text = company.tax_number ? `หมายเลขประจำตัวผู้เสียภาษี ${company.tax_number}` : '';
+  company.telephone_text = company.telephone_number ? `โทร. ${company.telephone_number}` : '';
+
+  return {
+    header,
+    company,
+    details: detailsRes.rows || [],
+    payments: [],
+  };
+}
+
+async function loadPrintFormOptions(docNo) {
+  const docRes = await query(
+    `SELECT t.doc_no, COALESCE(t.doc_format_code,'') AS doc_format_code,
+        COALESCE(df.name_1,'') AS doc_format_name,
+        COALESCE(df.form_code,'') AS form_code
+     FROM ap_ar_trans t
+     LEFT JOIN erp_doc_format df ON df.screen_code = $2 AND df.code = t.doc_format_code
+     WHERE t.trans_flag = $3 AND t.doc_no = $1
+     LIMIT 1`,
+    [docNo, SCREEN_CODE, TRANS_FLAG],
+  );
+
+  const doc = docRes.rows[0];
+  if (!doc) return null;
+
+  const codes = uniqueCodes(splitFormCodes(doc.form_code));
+  let formRows = [];
+  if (codes.length) {
+    const result = await query(
+      `SELECT formcode, formname
+       FROM formdesign
+       WHERE lower(formcode) = ANY($1::text[])`,
+      [lowerCodes(codes)],
+    );
+    formRows = result.rows;
+  }
+
+  const byCode = new Map(formRows.map((row) => [String(row.formcode || '').toLowerCase(), row]));
+  const forms = codes.map((code, index) => {
+    const row = byCode.get(code.toLowerCase());
+    return {
+      formcode: row?.formcode || code,
+      formname: row?.formname || code,
+      available: !!row,
+      is_default: index === 0,
+    };
+  });
+
+  return {
+    doc_no: doc.doc_no,
+    doc_format_code: doc.doc_format_code,
+    doc_format_name: doc.doc_format_name,
+    form_code: doc.form_code,
+    forms,
+  };
+}
+
+async function loadFormDesignRows(formCodes) {
+  if (!formCodes.length) return [];
+  const result = await query(
+    `SELECT formcode, formname, formdesigntext, formbackground
+     FROM formdesign
+     WHERE lower(formcode) = ANY($1::text[])`,
+    [lowerCodes(formCodes)],
+  );
+  const byCode = new Map(result.rows.map((row) => [String(row.formcode || '').toLowerCase(), row]));
+  return formCodes.map((code) => byCode.get(code.toLowerCase())).filter(Boolean);
+}
+
+function shouldLogPrint(logPrint, autoPrint) {
+  if (logPrint !== undefined) {
+    const value = String(logPrint).trim().toLowerCase();
+    return value !== '0' && value !== 'false' && value !== 'no';
+  }
+  return String(autoPrint) !== '0';
+}
+
+async function getPrintCount(docNo) {
+  const result = await query(
+    `SELECT COUNT(*)::int AS print_count
+     FROM erp_print_logs
+     WHERE trans_flag = $2 AND doc_no = $1`,
+    [docNo, TRANS_FLAG],
+  );
+  return Number(result.rows[0]?.print_count || 0);
+}
+
+async function createPrintLog(docNo, userCode) {
+  return withTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO erp_print_logs (doc_no, trans_flag, user_code, print_datetime)
+       VALUES ($1, $2, $3, NOW())`,
+      [docNo, TRANS_FLAG, String(userCode || 'WEB').trim() || 'WEB'],
+    );
+    const result = await client.query(
+      `SELECT COUNT(*)::int AS print_count
+       FROM erp_print_logs
+       WHERE trans_flag = $2 AND doc_no = $1`,
+      [docNo, TRANS_FLAG],
+    );
+    return Number(result.rows[0]?.print_count || 0);
+  });
 }
 
 function isPermissionError(ex) {
@@ -215,6 +457,31 @@ router.get('/ar-billing/next-doc-no', async (req, res) => {
       })
     );
     return res.json({ success: true, ...result });
+  } catch (ex) {
+    if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
+    return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
+router.get('/ar-billing/sales-users', async (req, res) => {
+  const search = safeText(req.query.search);
+  const params = [];
+  let where = '1=1';
+  if (search) {
+    params.push(`%${search}%`);
+    where += ` AND (code ILIKE $${params.length} OR COALESCE(name_1,'') ILIKE $${params.length})`;
+  }
+  try {
+    await assertPermission(query, req.query.user_code || req.query.emp_code, AR_BILLING_VIEW_PERMISSION);
+    const result = await query(
+      `SELECT code, COALESCE(name_1,'') AS name_1
+       FROM erp_user
+       WHERE ${where}
+       ORDER BY code
+       LIMIT 50`,
+      params,
+    );
+    return res.json({ success: true, data: result.rows });
   } catch (ex) {
     if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
     return res.status(500).json({ success: false, msg: ex.message });
@@ -353,6 +620,64 @@ router.get('/ar-billing/detail', async (req, res) => {
   }
 });
 
+router.get('/ar-billing/print-forms', async (req, res) => {
+  const docNo = safeText(req.query.doc_no);
+  if (!docNo) return res.status(400).json({ success: false, msg: 'doc_no is required' });
+  try {
+    await assertPermission(query, req.query.user_code || req.query.emp_code, AR_BILLING_VIEW_PERMISSION);
+    const options = await loadPrintFormOptions(docNo);
+    if (!options) return res.status(404).json({ success: false, msg: 'document not found' });
+    return res.json({ success: true, data: options });
+  } catch (ex) {
+    if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
+    return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
+router.get('/ar-billing/print/render', async (req, res) => {
+  const { doc_no = '', formcodes = '', auto_print = '1', log_print, user_code = '' } = req.query;
+  const docNo = safeText(doc_no);
+  if (!docNo) return res.status(400).type('text/plain').send('doc_no is required');
+
+  try {
+    await assertPermission(query, user_code || req.query.emp_code, AR_BILLING_VIEW_PERMISSION);
+    const [options, printData] = await Promise.all([
+      loadPrintFormOptions(docNo),
+      loadArBillingPrintDocument(docNo),
+    ]);
+
+    if (!options || !printData) return res.status(404).type('text/plain').send('document not found');
+
+    const availableCodes = options.forms.filter((form) => form.available).map((form) => form.formcode);
+    const requestedCodes = uniqueCodes(splitFormCodes(formcodes));
+    const selectedCodes = requestedCodes.length
+      ? requestedCodes.filter((code) => availableCodes.some((available) => available.toLowerCase() === code.toLowerCase()))
+      : availableCodes.slice(0, 1);
+
+    if (!selectedCodes.length) return res.status(404).type('text/plain').send('print form not found');
+
+    const formRows = await loadFormDesignRows(selectedCodes);
+    if (!formRows.length) return res.status(404).type('text/plain').send('print form not found');
+
+    const logThisPrint = req.method !== 'HEAD' && shouldLogPrint(log_print, auto_print);
+    const printCount = logThisPrint
+      ? await createPrintLog(docNo, user_code || printData.header.creator_code)
+      : await getPrintCount(docNo);
+    printData.header.print_count = printCount;
+
+    const html = renderSalePrintHtml({
+      formRows,
+      data: printData,
+      autoPrint: String(auto_print) !== '0',
+    });
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(200).type('html').send(html);
+  } catch (ex) {
+    if (isPermissionError(ex)) return res.status(403).type('text/plain').send(ex.message);
+    return res.status(500).type('text/plain').send(ex.message);
+  }
+});
+
 router.post('/ar-billing/save', async (req, res) => {
   try {
     const payload = normalizePayload(req.body);
@@ -395,6 +720,11 @@ router.post('/ar-billing/save', async (req, res) => {
       savedFormCode = doc.form_code || '';
 
       const invoiceNos = [...new Set(details.map((row) => row.billing_no))];
+      const detailTotals = new Map();
+      for (const row of details) {
+        const key = `${row.billing_no}|${row.bill_type}`;
+        detailTotals.set(key, roundMoney((detailTotals.get(key) || 0) + row.sum_pay_money));
+      }
       const invoiceResult = await client.query(
         `WITH base AS (
            SELECT t.doc_no, t.doc_date, t.trans_flag AS bill_type, COALESCE(t.doc_ref,'') AS ref_doc_no,
@@ -407,6 +737,7 @@ router.post('/ar-billing/save', async (req, res) => {
              AND COALESCE(t.last_status,0) = 0
              AND COALESCE(t.is_cancel,0) = 0
              AND COALESCE(t.is_doc_copy,0) <> 1
+             AND t.doc_date <= $4::date
          )
          SELECT b.*,
                 GREATEST(ROUND(
@@ -418,9 +749,9 @@ router.post('/ar-billing/save', async (req, res) => {
                       AND d.bill_type = b.bill_type
                       AND d.trans_flag IN (235,239)
                       AND COALESCE(d.last_status,0) = 0
-                  ),0), 2), 0) AS balance_ref
+                ),0), 2), 0) AS balance_ref
          FROM base b`,
-        [custCode, invoiceNos, BILLABLE_FLAGS],
+        [custCode, invoiceNos, BILLABLE_FLAGS, docDate],
       );
 
       const invoiceMap = new Map(invoiceResult.rows.map((row) => [`${row.doc_no}|${row.bill_type}`, row]));
@@ -428,7 +759,8 @@ router.post('/ar-billing/save', async (req, res) => {
         const invoice = invoiceMap.get(`${row.billing_no}|${row.bill_type}`);
         if (!invoice) throw new Error(`billing document not found: ${row.billing_no}`);
         const balance = roundMoney(invoice.balance_ref);
-        if (row.sum_pay_money > balance + 0.01) {
+        const requestedTotal = roundMoney(detailTotals.get(`${row.billing_no}|${row.bill_type}`) || 0);
+        if (requestedTotal > balance + 0.01) {
           throw new Error(`sum_pay_money exceeds balance: ${row.billing_no}`);
         }
       }

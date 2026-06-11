@@ -131,6 +131,16 @@ async function loadSaleDocument(docNo) {
   const [headerRes, companyRes, detailsRes, promotions, campaigns, payments] = await Promise.all([
     query(
       `SELECT t.*,
+          COALESCE(NULLIF(cb.total_net_amount,0), t.total_amount, 0) AS total_net_amount,
+          COALESCE(cb.total_amount_pay,0) AS total_amount_pay,
+          COALESCE(cb.cash_amount,0) AS cash_amount,
+          COALESCE(cb.tranfer_amount,0) AS tranfer_amount,
+          COALESCE(cb.card_amount,0) AS card_amount,
+          COALESCE(cb.wallet_amount,0) AS wallet_amount,
+          COALESCE(cb.deposit_amount,0) AS deposit_amount,
+          COALESCE(cb.total_credit_charge,0) AS total_credit_charge,
+          COALESCE(cb.total_income_amount,0) AS total_income_amount,
+          COALESCE(cb.money_change,0) AS money_change,
           COALESCE(df.name_1,'') AS doc_format_name,
           COALESCE(df.form_code,'') AS form_code,
           COALESCE(ar.name_1,'') AS name_1,
@@ -141,6 +151,7 @@ async function loadSaleDocument(docNo) {
           COALESCE(t.contactor,'') AS contactor,
           COALESCE(u.name_1, t.sale_code, '') AS sale_name
        FROM ic_trans t
+       LEFT JOIN cb_trans cb ON cb.doc_no = t.doc_no AND cb.trans_flag = 44
        LEFT JOIN erp_doc_format df ON df.screen_code = 'SI' AND df.code = t.doc_format_code
        LEFT JOIN ar_customer ar ON ar.code = t.cust_code
        LEFT JOIN ar_customer_detail cd ON cd.ar_code = t.cust_code
@@ -156,6 +167,7 @@ async function loadSaleDocument(docNo) {
        FROM ic_trans_detail d
        LEFT JOIN ic_unit u ON u.code = d.unit_code
        WHERE d.trans_flag = 44 AND d.doc_no = $1
+         AND (COALESCE(d.set_ref_line,'') = '' OR COALESCE(d.item_type,0) = 3)
        ORDER BY d.line_number`,
       [docNo]
     ),

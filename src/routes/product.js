@@ -17,6 +17,93 @@ function normalizeStockLevelQty(value) {
   return Number.isFinite(num) && num > 0 ? num : 0;
 }
 
+function httpError(message, statusCode = 400) {
+  const err = new Error(message);
+  err.statusCode = statusCode;
+  return err;
+}
+
+async function ensureProductExists(client, icCode) {
+  const c = String(icCode || "").trim();
+  if (!c) throw httpError("กรุณาระบุรหัสสินค้า", 400);
+  const exists = await client.query(`SELECT 1 FROM ic_inventory WHERE code=$1 LIMIT 1`, [c]);
+  if (!exists.rows.length) throw httpError("ไม่พบสินค้า", 404);
+}
+
+async function ensureWarehouseShelfExists(client, whCode, shelfCode) {
+  const wh = String(whCode || "").trim();
+  const shelf = String(shelfCode || "").trim();
+  if (!wh) throw httpError("กรุณาเลือกคลัง", 400);
+  if (!shelf) throw httpError("กรุณาเลือกที่เก็บ", 400);
+  const result = await client.query(`SELECT 1 FROM ic_shelf WHERE whcode=$1::text AND code=$2::text LIMIT 1`, [wh, shelf]);
+  if (!result.rows.length) throw httpError("คลัง/ที่เก็บไม่ถูกต้อง", 400);
+}
+
+function normalizeWarehouseShelfRows(rows, fallbackWhCode = "", fallbackShelfCode = "") {
+  const list = Array.isArray(rows) ? rows : [];
+  const unique = new Map();
+
+  function add(row) {
+    const whCode = String(row?.wh_code || row?.whcode || "").trim();
+    const shelfCode = String(row?.shelf_code || row?.code || "").trim();
+    if (!whCode || !shelfCode) return;
+    unique.set(`${whCode}\u0000${shelfCode}`, {
+      wh_code: whCode,
+      shelf_code: shelfCode,
+      shelf_list: String(row?.shelf_list || "").trim(),
+      min_point: normalizeStockLevelQty(row?.min_point),
+      max_point: normalizeStockLevelQty(row?.max_point),
+      status: Number(row?.status ?? 1) === 0 ? 0 : 1,
+    });
+  }
+
+  for (const row of list) add(row);
+  add({ wh_code: fallbackWhCode, shelf_code: fallbackShelfCode });
+  return Array.from(unique.values());
+}
+
+async function ensureWarehouseShelfRowsExist(client, rows) {
+  for (const row of rows) {
+    await ensureWarehouseShelfExists(client, row.wh_code, row.shelf_code);
+  }
+}
+
+async function replaceProductWarehouseShelves(client, icCode, rows) {
+  const c = String(icCode || "").trim();
+  await client.query(`DELETE FROM ic_wh_shelf WHERE ic_code=$1::text`, [c]);
+  for (const row of rows) {
+    await client.query(
+      `INSERT INTO ic_wh_shelf (ic_code, wh_code, shelf_code, shelf_list, min_point, max_point, status)` +
+        ` VALUES ($1::text,$2::text,$3::text,$4::text,$5::numeric,$6::numeric,$7::integer)`,
+      [c, row.wh_code, row.shelf_code, row.shelf_list, row.min_point, row.max_point, row.status],
+    );
+  }
+}
+
+async function ensureProductUnitUse(client, icCode, unitCode) {
+  const c = String(icCode || "").trim();
+  const u = String(unitCode || "").trim();
+  if (!c || !u) return;
+  await client.query(
+    `INSERT INTO ic_unit_use (ic_code, code, stand_value, divide_value, ratio, row_order)` +
+      ` SELECT $1::text,$2::text,1,1,1,0` +
+      ` WHERE NOT EXISTS (SELECT 1 FROM ic_unit_use WHERE ic_code=$1::text AND code=$2::text)`,
+    [c, u],
+  );
+}
+
+async function syncProductUnitType(client, icCode) {
+  const c = String(icCode || "").trim();
+  if (!c) return;
+  const unitCountResult = await client.query(
+    `SELECT COUNT(DISTINCT NULLIF(TRIM(code::text), ''))::int AS unit_count FROM ic_unit_use WHERE ic_code=$1::text`,
+    [c],
+  );
+  const unitCount = Number(unitCountResult.rows[0]?.unit_count || 0);
+  const updateResult = await client.query(`UPDATE ic_inventory SET unit_type=$1::integer WHERE code=$2::text`, [unitCount > 1 ? 1 : 0, c]);
+  if (updateResult.rowCount === 0) throw httpError("ไม่พบสินค้า", 404);
+}
+
 function ean13CheckDigit(base12) {
   const digits = String(base12 || "").replace(/\D/g, "");
   if (digits.length !== 12) throw new Error("EAN-13 base must be 12 digits");
@@ -1669,14 +1756,28 @@ router.get("/getProductItemDetail", async (req, res) => {
         ` COALESCE(i.group_sub2,'') AS group_sub2,` +
         ` COALESCE(i.item_design,'') AS item_design, COALESCE(i.item_model,'') AS item_model,` +
         ` COALESCE(d.purchase_point,0) AS purchase_point, COALESCE(d.minimum_qty,0) AS minimum_qty,` +
-        ` COALESCE(d.maximum_qty,0) AS maximum_qty` +
+        ` COALESCE(d.maximum_qty,0) AS maximum_qty,` +
+        ` COALESCE(d.start_sale_wh,'') AS wh_code, COALESCE(d.start_sale_shelf,'') AS shelf_code` +
         ` FROM ic_inventory i` +
         ` LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code` +
         ` WHERE i.code = $1 AND ${activeProductCondition("d")}`,
       [code],
     );
     if (!result.rows.length) return res.status(400).json({ success: false, message: "ไม่พบสินค้า" });
-    return res.json({ success: true, data: result.rows[0] });
+    const warehouseShelfResult = await query(
+      `SELECT ws.wh_code, COALESCE(w.name_1,'') AS wh_name,` +
+        ` ws.shelf_code, COALESCE(s.name_1,'') AS shelf_name,` +
+        ` COALESCE(ws.shelf_list,'') AS shelf_list,` +
+        ` COALESCE(ws.min_point,0) AS min_point, COALESCE(ws.max_point,0) AS max_point,` +
+        ` COALESCE(ws.status,1) AS status` +
+        ` FROM ic_wh_shelf ws` +
+        ` LEFT JOIN ic_warehouse w ON w.code = ws.wh_code` +
+        ` LEFT JOIN ic_shelf s ON s.whcode = ws.wh_code AND s.code = ws.shelf_code` +
+        ` WHERE ws.ic_code=$1::text` +
+        ` ORDER BY ws.wh_code, ws.shelf_code`,
+      [code],
+    );
+    return res.json({ success: true, data: { ...result.rows[0], warehouse_shelves: warehouseShelfResult.rows } });
   } catch (ex) {
     console.error("getProductItemDetail error:", ex.message);
     return res.status(500).json({ success: false, message: ex.message });
@@ -1700,6 +1801,11 @@ router.post("/updateProductItemMain", async (req, res) => {
     group_sub2 = "",
     item_design = "",
     item_model = "",
+    wh_code = "",
+    shelf_code = "",
+    start_sale_wh = "",
+    start_sale_shelf = "",
+    warehouse_shelves = [],
     purchase_point = 0,
     minimum_qty = 0,
     maximum_qty = 0,
@@ -1707,17 +1813,23 @@ router.post("/updateProductItemMain", async (req, res) => {
 
   const c = String(code).trim();
   if (!c) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้า" });
+  if (!String(unit_standard).trim()) return res.status(400).json({ success: false, message: "กรุณาเลือกหน่วยมาตรฐาน" });
+  const whCode = String(wh_code || start_sale_wh || "").trim();
+  const shelfCode = String(shelf_code || start_sale_shelf || "").trim();
+  if (!whCode) return res.status(400).json({ success: false, message: "กรุณาเลือกคลัง" });
+  if (!shelfCode) return res.status(400).json({ success: false, message: "กรุณาเลือกที่เก็บ" });
   const purchasePoint = normalizeStockLevelQty(purchase_point);
   const minimumQty = normalizeStockLevelQty(minimum_qty);
   const maximumQty = normalizeStockLevelQty(maximum_qty);
+  const warehouseShelves = normalizeWarehouseShelfRows(warehouse_shelves, whCode, shelfCode);
 
   try {
     await withTransaction(async (client) => {
-      await client.query(
+      const updateResult = await client.query(
         `UPDATE ic_inventory SET name_1=$1, name_2=$2, name_eng_1=$3, name_eng_2=$4,` +
           ` unit_standard=$5, unit_cost=$6, item_category=$7, item_brand=$8,` +
           ` group_main=$9, group_sub=$10, group_sub2=$11, item_design=$12, item_model=$13` +
-          ` WHERE code=$14`,
+          ` WHERE code=$14::text`,
         [
           String(name_1).trim(),
           String(name_2).trim(),
@@ -1735,21 +1847,30 @@ router.post("/updateProductItemMain", async (req, res) => {
           c,
         ],
       );
+      if (updateResult.rowCount === 0) throw httpError("ไม่พบสินค้า", 404);
+
+      await ensureWarehouseShelfExists(client, whCode, shelfCode);
+      await ensureWarehouseShelfRowsExist(client, warehouseShelves);
+      await ensureProductUnitUse(client, c, String(unit_standard).trim());
 
       await client.query(
-        `INSERT INTO ic_inventory_detail (ic_code, purchase_point, minimum_qty, maximum_qty)` +
-          ` VALUES ($1,$2,$3,$4)` +
+        `INSERT INTO ic_inventory_detail (ic_code, purchase_point, minimum_qty, maximum_qty, start_sale_wh, start_sale_shelf)` +
+          ` VALUES ($1::text,$2::numeric,$3::numeric,$4::numeric,$5::text,$6::text)` +
           ` ON CONFLICT (ic_code) DO UPDATE SET` +
           ` purchase_point = EXCLUDED.purchase_point,` +
           ` minimum_qty = EXCLUDED.minimum_qty,` +
-          ` maximum_qty = EXCLUDED.maximum_qty`,
-        [c, purchasePoint, minimumQty, maximumQty],
+          ` maximum_qty = EXCLUDED.maximum_qty,` +
+          ` start_sale_wh = EXCLUDED.start_sale_wh,` +
+          ` start_sale_shelf = EXCLUDED.start_sale_shelf`,
+        [c, purchasePoint, minimumQty, maximumQty, whCode, shelfCode],
       );
+      await replaceProductWarehouseShelves(client, c, warehouseShelves);
+      await syncProductUnitType(client, c);
     });
     return res.json({ success: true });
   } catch (ex) {
     console.error("updateProductItemMain error:", ex.message);
-    return res.status(500).json({ success: false, message: ex.message });
+    return res.status(ex.statusCode || 500).json({ success: false, message: ex.message });
   }
 });
 
@@ -1770,6 +1891,11 @@ router.post("/createProductItemMain", async (req, res) => {
     group_sub2 = "",
     item_design = "",
     item_model = "",
+    wh_code = "",
+    shelf_code = "",
+    start_sale_wh = "",
+    start_sale_shelf = "",
+    warehouse_shelves = [],
     purchase_point = 0,
     minimum_qty = 0,
     maximum_qty = 0,
@@ -1782,13 +1908,18 @@ router.post("/createProductItemMain", async (req, res) => {
   }
   if (!String(name_1).trim()) return res.status(400).json({ success: false, message: "กรุณาระบุชื่อสินค้า" });
   if (!String(unit_standard).trim()) return res.status(400).json({ success: false, message: "กรุณาเลือกหน่วยมาตรฐาน" });
+  const whCode = String(wh_code || start_sale_wh || "").trim();
+  const shelfCode = String(shelf_code || start_sale_shelf || "").trim();
+  if (!whCode) return res.status(400).json({ success: false, message: "กรุณาเลือกคลัง" });
+  if (!shelfCode) return res.status(400).json({ success: false, message: "กรุณาเลือกที่เก็บ" });
   const purchasePoint = normalizeStockLevelQty(purchase_point);
   const minimumQty = normalizeStockLevelQty(minimum_qty);
   const maximumQty = normalizeStockLevelQty(maximum_qty);
+  const warehouseShelves = normalizeWarehouseShelfRows(warehouse_shelves, whCode, shelfCode);
 
   try {
     await withTransaction(async (client) => {
-      const exists = await client.query(`SELECT 1 FROM ic_inventory WHERE code = $1 LIMIT 1`, [c]);
+      const exists = await client.query(`SELECT 1 FROM ic_inventory WHERE code = $1::text LIMIT 1`, [c]);
       if (exists.rows.length) {
         const err = new Error("รหัสสินค้านี้มีอยู่แล้ว");
         err.statusCode = 400;
@@ -1801,7 +1932,7 @@ router.post("/createProductItemMain", async (req, res) => {
           ` unit_standard, unit_cost, item_category, item_brand,` +
           ` group_main, group_sub, group_sub2, item_design, item_model` +
           `) VALUES (` +
-          ` $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14` +
+          ` $1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text,$11::text,$12::text,$13::text,$14::text` +
           `)`,
         [
           c,
@@ -1822,20 +1953,23 @@ router.post("/createProductItemMain", async (req, res) => {
       );
 
       const unitStd = String(unit_standard).trim();
-      const unitUseExists = await client.query(`SELECT 1 FROM ic_unit_use WHERE ic_code = $1 AND code = $2 LIMIT 1`, [c, unitStd]);
-      if (!unitUseExists.rows.length) {
-        await client.query(`INSERT INTO ic_unit_use (ic_code, code, stand_value, divide_value, ratio, row_order)` + ` VALUES ($1,$2,1,1,1,0)`, [c, unitStd]);
-      }
+      await ensureWarehouseShelfExists(client, whCode, shelfCode);
+      await ensureWarehouseShelfRowsExist(client, warehouseShelves);
+      await ensureProductUnitUse(client, c, unitStd);
 
       await client.query(
-        `INSERT INTO ic_inventory_detail (ic_code, purchase_point, minimum_qty, maximum_qty)` +
-          ` VALUES ($1,$2,$3,$4)` +
+        `INSERT INTO ic_inventory_detail (ic_code, purchase_point, minimum_qty, maximum_qty, start_sale_wh, start_sale_shelf)` +
+          ` VALUES ($1::text,$2::numeric,$3::numeric,$4::numeric,$5::text,$6::text)` +
           ` ON CONFLICT (ic_code) DO UPDATE SET` +
           ` purchase_point = EXCLUDED.purchase_point,` +
           ` minimum_qty = EXCLUDED.minimum_qty,` +
-          ` maximum_qty = EXCLUDED.maximum_qty`,
-        [c, purchasePoint, minimumQty, maximumQty],
+          ` maximum_qty = EXCLUDED.maximum_qty,` +
+          ` start_sale_wh = EXCLUDED.start_sale_wh,` +
+          ` start_sale_shelf = EXCLUDED.start_sale_shelf`,
+        [c, purchasePoint, minimumQty, maximumQty, whCode, shelfCode],
       );
+      await replaceProductWarehouseShelves(client, c, warehouseShelves);
+      await syncProductUnitType(client, c);
     });
 
     return res.json({ success: true, code: c });
@@ -2011,20 +2145,24 @@ router.post("/createProductItemUnitUse", async (req, res) => {
   const dv = Number(divide_value) || 1;
   const ratio = dv !== 0 ? sv / dv : 0;
   try {
-    await query(`INSERT INTO ic_unit_use (ic_code, code, stand_value, divide_value, ratio, row_order, width_length_height, weight)` + ` VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [
-      c,
-      u,
-      sv,
-      dv,
-      ratio,
-      Number(row_order) || 0,
-      String(width_length_height).trim(),
-      String(weight).trim(),
-    ]);
+    await withTransaction(async (client) => {
+      await ensureProductExists(client, c);
+      await client.query(`INSERT INTO ic_unit_use (ic_code, code, stand_value, divide_value, ratio, row_order, width_length_height, weight)` + ` VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [
+        c,
+        u,
+        sv,
+        dv,
+        ratio,
+        Number(row_order) || 0,
+        String(width_length_height).trim(),
+        String(weight).trim(),
+      ]);
+      await syncProductUnitType(client, c);
+    });
     return res.json({ success: true });
   } catch (ex) {
     console.error("createProductItemUnitUse error:", ex.message);
-    return res.status(500).json({ success: false, message: ex.message });
+    return res.status(ex.statusCode || 500).json({ success: false, message: ex.message });
   }
 });
 
@@ -2038,20 +2176,25 @@ router.post("/updateProductItemUnitUse", async (req, res) => {
   const dv = Number(divide_value) || 1;
   const ratio = dv !== 0 ? sv / dv : 0;
   try {
-    await query(`UPDATE ic_unit_use SET stand_value=$1, divide_value=$2, ratio=$3, row_order=$4,` + ` width_length_height=$5, weight=$6 WHERE ic_code=$7 AND code=$8`, [
-      sv,
-      dv,
-      ratio,
-      Number(row_order) || 0,
-      String(width_length_height).trim(),
-      String(weight).trim(),
-      c,
-      u,
-    ]);
+    await withTransaction(async (client) => {
+      await ensureProductExists(client, c);
+      const updateResult = await client.query(`UPDATE ic_unit_use SET stand_value=$1, divide_value=$2, ratio=$3, row_order=$4,` + ` width_length_height=$5, weight=$6 WHERE ic_code=$7 AND code=$8`, [
+        sv,
+        dv,
+        ratio,
+        Number(row_order) || 0,
+        String(width_length_height).trim(),
+        String(weight).trim(),
+        c,
+        u,
+      ]);
+      if (updateResult.rowCount === 0) throw httpError("ไม่พบหน่วยนับ", 404);
+      await syncProductUnitType(client, c);
+    });
     return res.json({ success: true });
   } catch (ex) {
     console.error("updateProductItemUnitUse error:", ex.message);
-    return res.status(500).json({ success: false, message: ex.message });
+    return res.status(ex.statusCode || 500).json({ success: false, message: ex.message });
   }
 });
 
@@ -2062,11 +2205,16 @@ router.post("/deleteProductItemUnitUse", async (req, res) => {
   const u = String(code).trim();
   if (!c || !u) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้าและรหัสหน่วยนับ" });
   try {
-    await query(`DELETE FROM ic_unit_use WHERE ic_code=$1 AND code=$2`, [c, u]);
+    await withTransaction(async (client) => {
+      await ensureProductExists(client, c);
+      const deleteResult = await client.query(`DELETE FROM ic_unit_use WHERE ic_code=$1 AND code=$2`, [c, u]);
+      if (deleteResult.rowCount === 0) throw httpError("ไม่พบหน่วยนับ", 404);
+      await syncProductUnitType(client, c);
+    });
     return res.json({ success: true });
   } catch (ex) {
     console.error("deleteProductItemUnitUse error:", ex.message);
-    return res.status(500).json({ success: false, message: ex.message });
+    return res.status(ex.statusCode || 500).json({ success: false, message: ex.message });
   }
 });
 
