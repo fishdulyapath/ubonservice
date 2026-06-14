@@ -10,6 +10,21 @@ const TRANS_FLAG = 260;
 const SCREEN_CODE = 'EPO';
 const OTHER_EXPENSE_VIEW_PERMISSION = 'cash.other_expense.view';
 const OTHER_EXPENSE_CREATE_PERMISSION = 'cash.other_expense.create';
+const CASH_INQUIRY_TYPES = new Set([1, 2]);
+
+const INQUIRY_TYPE_LABELS = {
+  0: 'ค่าใช้จ่ายเงินเชื่อ',
+  1: 'ค่าใช้จ่ายเงินสด',
+  2: 'ค่าใช้จ่ายเงินสด (สินค้าบริการ)',
+  3: 'ค่าใช้จ่ายเงินเชื่อ (สินค้าบริการ)',
+};
+
+const VAT_TYPE_LABELS = {
+  0: 'ภาษีแยกนอก',
+  1: 'ภาษีรวมใน',
+  2: 'ภาษีอัตราศูนย์',
+  3: 'ไม่กระทบภาษี',
+};
 
 function safeText(value) {
   return String(value ?? '').trim();
@@ -79,6 +94,18 @@ function asAmountText(value) {
   });
 }
 
+function isCashInquiryType(value) {
+  return CASH_INQUIRY_TYPES.has(toInt(value, 0));
+}
+
+function inquiryTypeLabel(value) {
+  return INQUIRY_TYPE_LABELS[toInt(value, 0)] || INQUIRY_TYPE_LABELS[0];
+}
+
+function vatTypeLabel(value) {
+  return VAT_TYPE_LABELS[toInt(value, 0)] || VAT_TYPE_LABELS[0];
+}
+
 function normalizePayload(body) {
   let payload = body || {};
   if (typeof payload === 'string') payload = JSON.parse(payload);
@@ -89,16 +116,17 @@ function normalizePayload(body) {
 function calcVatTotals(baseAmount, vatType = 0, vatRate = 0) {
   const amount = roundMoney(baseAmount);
   const rate = roundMoney(vatRate);
-  if (rate <= 0 || toInt(vatType, 0) === 0) {
+  const type = toInt(vatType, 0);
+  if (rate <= 0 || type === 2 || type === 3) {
     return {
       total_value: amount,
       total_before_vat: amount,
       total_vat_value: 0,
-      total_except_vat: amount,
+      total_except_vat: type === 3 ? amount : 0,
       total_amount: amount,
     };
   }
-  if (toInt(vatType, 0) === 1) {
+  if (type === 0) {
     const vat = roundMoney(amount * rate / 100);
     return {
       total_value: amount,
@@ -340,6 +368,8 @@ async function loadOtherExpensePrintDocument(docNo) {
 
   const header = headerRes.rows[0];
   if (!header) return null;
+  header.inquiry_type_name = inquiryTypeLabel(header.inquiry_type);
+  header.vat_type_name = vatTypeLabel(header.vat_type);
   const company = companyRes.rows[0] || {};
   company.tax_text = company.tax_number ? `หมายเลขประจำตัวผู้เสียภาษี ${company.tax_number}` : '';
   company.telephone_text = company.telephone_number ? `โทร. ${company.telephone_number}` : '';
@@ -563,7 +593,21 @@ router.get('/other-expense/list', async (req, res) => {
     const result = await query(
       `SELECT t.doc_no, t.doc_date, t.doc_time, t.doc_format_code, t.cust_code,
               COALESCE(ap.name_1,'') AS cust_name, COALESCE(t.tax_doc_no,'') AS tax_doc_no,
-              t.tax_doc_date, COALESCE(t.vat_type,0) AS vat_type, COALESCE(t.vat_rate,0) AS vat_rate,
+              t.tax_doc_date, COALESCE(t.inquiry_type,0) AS inquiry_type,
+              CASE COALESCE(t.inquiry_type,0)
+                WHEN 1 THEN 'ค่าใช้จ่ายเงินสด'
+                WHEN 2 THEN 'ค่าใช้จ่ายเงินสด (สินค้าบริการ)'
+                WHEN 3 THEN 'ค่าใช้จ่ายเงินเชื่อ (สินค้าบริการ)'
+                ELSE 'ค่าใช้จ่ายเงินเชื่อ'
+              END AS inquiry_type_name,
+              COALESCE(t.vat_type,0) AS vat_type,
+              CASE COALESCE(t.vat_type,0)
+                WHEN 1 THEN 'ภาษีรวมใน'
+                WHEN 2 THEN 'ภาษีอัตราศูนย์'
+                WHEN 3 THEN 'ไม่กระทบภาษี'
+                ELSE 'ภาษีแยกนอก'
+              END AS vat_type_name,
+              COALESCE(t.vat_rate,0) AS vat_rate,
               COALESCE(t.total_value,0) AS total_value, COALESCE(t.total_before_vat,0) AS total_before_vat,
               COALESCE(t.total_vat_value,0) AS total_vat_value, COALESCE(t.total_amount,0) AS total_amount,
               COALESCE(w.wht_tax_value, COALESCE(cb.total_tax_at_pay,0), 0) AS total_wht_value,
@@ -663,6 +707,8 @@ router.get('/other-expense/detail', async (req, res) => {
       ),
     ]);
     if (!header.rows[0]) return res.status(404).json({ success: false, msg: 'document not found' });
+    header.rows[0].inquiry_type_name = inquiryTypeLabel(header.rows[0].inquiry_type);
+    header.rows[0].vat_type_name = vatTypeLabel(header.rows[0].vat_type);
     return res.json({
       success: true,
       data: {
@@ -750,8 +796,10 @@ router.post('/other-expense/save', async (req, res) => {
     const details = normalizeDetails(payload.details);
     const payments = normalizePayments(payload.payments);
     const whtList = normalizeWhtList(payload.wht_list || payload.withholding_tax, docDate);
+    const inquiryType = toInt(payload.inquiry_type, 0);
+    const isCashExpense = isCashInquiryType(inquiryType);
     const vatType = toInt(payload.vat_type, 0);
-    const vatRate = roundMoney(payload.vat_rate);
+    const vatRate = [2, 3].includes(vatType) ? 0 : roundMoney(payload.vat_rate);
     const branchCode = safeText(payload.branch_code);
     const remark = safeText(payload.remark);
     const taxDocNo = safeText(payload.tax_doc_no);
@@ -759,7 +807,8 @@ router.post('/other-expense/save', async (req, res) => {
 
     if (!supplierCode) return res.status(400).json({ success: false, msg: 'supplier_code is required' });
     if (!details.length) return res.status(400).json({ success: false, msg: 'details is empty' });
-    if (![0, 1, 2].includes(vatType)) return res.status(400).json({ success: false, msg: 'vat_type must be 0, 1, or 2' });
+    if (![0, 1, 2, 3].includes(inquiryType)) return res.status(400).json({ success: false, msg: 'inquiry_type must be 0, 1, 2, or 3' });
+    if (![0, 1, 2, 3].includes(vatType)) return res.status(400).json({ success: false, msg: 'vat_type must be 0, 1, 2, or 3' });
     const invalidWht = whtList.find((row) => Math.abs(row.tax_value - row.submitted_tax_value) > 0.01);
     if (invalidWht) return res.status(400).json({ success: false, msg: 'withholding tax value does not match amount and tax rate' });
 
@@ -776,8 +825,12 @@ router.post('/other-expense/save', async (req, res) => {
     const totalNetAmount = roundMoney(totals.total_amount + cardCharge - whtAmount);
     const totalPaid = roundMoney(payments.cash_amount + transferAmount + cardAmount + chequeAmount);
     const diff = roundMoney(totalPaid - totalNetAmount);
-    if (diff < -0.01) return res.status(400).json({ success: false, msg: 'payment total is less than document total' });
-    if (diff > 0.01) return res.status(400).json({ success: false, msg: 'payment total is greater than document total' });
+    if (isCashExpense) {
+      if (diff < -0.01) return res.status(400).json({ success: false, msg: 'payment total is less than document total' });
+      if (diff > 0.01) return res.status(400).json({ success: false, msg: 'payment total is greater than document total' });
+    } else if (Math.abs(totalPaid) > 0.01) {
+      return res.status(400).json({ success: false, msg: 'credit expense must not include payment rows' });
+    }
 
     let savedDocNo = '';
     let savedDocFormatCode = '';
@@ -828,12 +881,12 @@ router.post('/other-expense/save', async (req, res) => {
           total_except_vat, total_amount, remark, doc_format_code, last_status,
           used_status, creator_code, create_datetime, is_cancel
         ) VALUES (
-          $1,$2,$3::date,$4,$5,'',NULL,0,$6,$7,$8,$9,$10,$11::date,
-          $12,$13,$14,$15,$16,$17,$18,0,0,$19,NOW(),0
+          $1,$2,$3::date,$4,$5,'',NULL,$6,$7,$8,$9,$10,$11,$12::date,
+          $13,$14,$15,$16,$17,$18,$19,0,0,$20,NOW(),0
         )`,
         [
           TRANS_TYPE, TRANS_FLAG, docDate, docTime, savedDocNo,
-          vatType, supplierCode, branchCode, vatRate, taxDocNo || savedDocNo,
+          inquiryType, vatType, supplierCode, branchCode, vatRate, taxDocNo || savedDocNo,
           taxDocDate || docDate, totals.total_value, totals.total_before_vat,
           totals.total_vat_value, totals.total_except_vat, totals.total_amount,
           remark, savedDocFormatCode, creatorCode,
@@ -863,7 +916,7 @@ router.post('/other-expense/save', async (req, res) => {
         );
       }
 
-      if (totals.total_vat_value > 0) {
+      if (vatType !== 3 && (totals.total_vat_value > 0 || vatType === 2)) {
         const supplierRow = supplier.rows[0];
         const vatDate = taxDocDate || docDate;
         await client.query(
@@ -924,70 +977,72 @@ router.post('/other-expense/save', async (req, res) => {
         }
       }
 
-      await client.query(
-        `INSERT INTO cb_trans (
-          trans_type, trans_flag, doc_no, doc_date, doc_time, ap_ar_code,
-          pay_type, doc_format_code, total_amount, total_net_amount, cash_amount,
-          chq_amount, tranfer_amount, card_amount, total_amount_pay,
-          total_credit_charge, total_tax_at_pay, pay_cash_amount, money_change,
-          remark
-        ) VALUES (
-          $1,$2,$3,$4::date,$5,$6,1,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$10,0,$17
-        )`,
-        [
-          TRANS_TYPE, TRANS_FLAG, savedDocNo, docDate, docTime, supplierCode,
-          savedDocFormatCode, totals.total_amount, totalNetAmount,
-          payments.cash_amount, chequeAmount, transferAmount, cardAmount,
-          totalPaid, cardCharge, whtAmount, remark,
-        ],
-      );
-
-      for (const row of payments.transfer) {
-        const passBook = await getPassBook(client, row.pass_book_code);
-        if (!passBook) throw new Error(`pass book not found: ${row.pass_book_code}`);
+      if (isCashExpense) {
         await client.query(
-          `INSERT INTO cb_trans_detail (
-            trans_type, trans_flag, doc_no, doc_date, doc_time, trans_number,
-            bank_code, bank_branch, amount, sum_amount, doc_type, ap_ar_code,
-            trans_number_type, ap_ar_type, last_status
-          ) VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$9,1,$10,0,0,0)`,
+          `INSERT INTO cb_trans (
+            trans_type, trans_flag, doc_no, doc_date, doc_time, ap_ar_code,
+            pay_type, doc_format_code, total_amount, total_net_amount, cash_amount,
+            chq_amount, tranfer_amount, card_amount, total_amount_pay,
+            total_credit_charge, total_tax_at_pay, pay_cash_amount, money_change,
+            remark
+          ) VALUES (
+            $1,$2,$3,$4::date,$5,$6,1,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$10,0,$17
+          )`,
           [
-            TRANS_TYPE, TRANS_FLAG, savedDocNo, docDate, docTime,
-            passBook.code, passBook.bank_code || row.bank_code,
-            passBook.bank_branch || row.bank_branch, row.amount, supplierCode,
+            TRANS_TYPE, TRANS_FLAG, savedDocNo, docDate, docTime, supplierCode,
+            savedDocFormatCode, totals.total_amount, totalNetAmount,
+            payments.cash_amount, chequeAmount, transferAmount, cardAmount,
+            totalPaid, cardCharge, whtAmount, remark,
           ],
         );
-      }
 
-      for (const row of payments.card) {
-        await client.query(
-          `INSERT INTO cb_trans_detail (
-            trans_type, trans_flag, doc_no, doc_date, doc_time, trans_number,
-            credit_card_type, amount, sum_amount, doc_type, ap_ar_code,
-            trans_number_type, ap_ar_type, charge, last_status
-          ) VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8,$9,3,$10,1,1,$11,0)`,
-          [
-            TRANS_TYPE, TRANS_FLAG, savedDocNo, docDate, docTime,
-            row.trans_number, row.credit_card_type, row.amount,
-            roundMoney(row.amount + row.charge), supplierCode, row.charge,
-          ],
-        );
-      }
+        for (const row of payments.transfer) {
+          const passBook = await getPassBook(client, row.pass_book_code);
+          if (!passBook) throw new Error(`pass book not found: ${row.pass_book_code}`);
+          await client.query(
+            `INSERT INTO cb_trans_detail (
+              trans_type, trans_flag, doc_no, doc_date, doc_time, trans_number,
+              bank_code, bank_branch, amount, sum_amount, doc_type, ap_ar_code,
+              trans_number_type, ap_ar_type, last_status
+            ) VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$9,1,$10,0,0,0)`,
+            [
+              TRANS_TYPE, TRANS_FLAG, savedDocNo, docDate, docTime,
+              passBook.code, passBook.bank_code || row.bank_code,
+              passBook.bank_branch || row.bank_branch, row.amount, supplierCode,
+            ],
+          );
+        }
 
-      for (const row of payments.cheque) {
-        if (!row.trans_number) throw new Error('cheque number is required');
-        await client.query(
-          `INSERT INTO cb_trans_detail (
-            trans_type, trans_flag, doc_no, doc_date, doc_time, bank_code,
-            bank_branch, trans_number, amount, sum_amount, chq_due_date, doc_type,
-            ap_ar_code, trans_number_type, ap_ar_type, last_status
-          ) VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$9,$10::date,2,$11,1,1,0)`,
-          [
-            TRANS_TYPE, TRANS_FLAG, savedDocNo, docDate, docTime,
-            row.bank_code, row.bank_branch, row.trans_number, row.amount,
-            row.chq_due_date || docDate, supplierCode,
-          ],
-        );
+        for (const row of payments.card) {
+          await client.query(
+            `INSERT INTO cb_trans_detail (
+              trans_type, trans_flag, doc_no, doc_date, doc_time, trans_number,
+              credit_card_type, amount, sum_amount, doc_type, ap_ar_code,
+              trans_number_type, ap_ar_type, charge, last_status
+            ) VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8,$9,3,$10,1,1,$11,0)`,
+            [
+              TRANS_TYPE, TRANS_FLAG, savedDocNo, docDate, docTime,
+              row.trans_number, row.credit_card_type, row.amount,
+              roundMoney(row.amount + row.charge), supplierCode, row.charge,
+            ],
+          );
+        }
+
+        for (const row of payments.cheque) {
+          if (!row.trans_number) throw new Error('cheque number is required');
+          await client.query(
+            `INSERT INTO cb_trans_detail (
+              trans_type, trans_flag, doc_no, doc_date, doc_time, bank_code,
+              bank_branch, trans_number, amount, sum_amount, chq_due_date, doc_type,
+              ap_ar_code, trans_number_type, ap_ar_type, last_status
+            ) VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$9,$10::date,2,$11,1,1,0)`,
+            [
+              TRANS_TYPE, TRANS_FLAG, savedDocNo, docDate, docTime,
+              row.bank_code, row.bank_branch, row.trans_number, row.amount,
+              row.chq_due_date || docDate, supplierCode,
+            ],
+          );
+        }
       }
     });
 
@@ -996,6 +1051,8 @@ router.post('/other-expense/save', async (req, res) => {
       doc_no: savedDocNo,
       doc_format_code: savedDocFormatCode,
       form_code: savedFormCode,
+      inquiry_type: inquiryType,
+      inquiry_type_name: inquiryTypeLabel(inquiryType),
       wht_amount: whtAmount,
       msg: 'success',
     });

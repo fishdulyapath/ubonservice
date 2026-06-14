@@ -11,6 +11,7 @@ const CANCEL_TRANS_FLAG = 236;
 const SCREEN_CODE = 'ED';
 const DOC_TABLE = 'ap_ar_trans';
 const BILLABLE_FLAGS = [44, 46, 48, 93, 95, 97];
+const CREDIT_NOTE_FLAGS = [48, 97];
 const AR_BILLING_VIEW_PERMISSION = 'sales.ar_billing.view';
 const AR_BILLING_CREATE_PERMISSION = 'sales.ar_billing.create';
 
@@ -30,6 +31,26 @@ function toInt(value, fallback = 0) {
 
 function roundMoney(value) {
   return Math.round(toNumber(value) * 100) / 100;
+}
+
+function isNonZeroAmount(value) {
+  return Math.abs(roundMoney(value)) > 0.0001;
+}
+
+function isSameDirectionAmount(amount, balance) {
+  const amountValue = roundMoney(amount);
+  const balanceValue = roundMoney(balance);
+  if (!isNonZeroAmount(amountValue) || !isNonZeroAmount(balanceValue)) return false;
+  return (amountValue > 0 && balanceValue > 0) || (amountValue < 0 && balanceValue < 0);
+}
+
+function amountExceedsBalance(amount, balance) {
+  if (!isSameDirectionAmount(amount, balance)) return true;
+  return Math.abs(roundMoney(amount)) > Math.abs(roundMoney(balance)) + 0.01;
+}
+
+function creditNoteSql(alias = 't') {
+  return `${alias}.trans_flag IN (${CREDIT_NOTE_FLAGS.join(',')})`;
 }
 
 function todayISO() {
@@ -89,7 +110,7 @@ function normalizeDetails(value) {
       sum_pay_money: roundMoney(row?.sum_pay_money ?? row?.pay_amount ?? row?.balance_ref),
       remark: safeText(row?.remark),
     }))
-    .filter((row) => row.billing_no && row.bill_type && row.sum_pay_money > 0);
+    .filter((row) => row.billing_no && row.bill_type && isNonZeroAmount(row.sum_pay_money));
 }
 
 function splitFormCodes(value) {
@@ -536,7 +557,11 @@ router.get('/ar-billing/open-docs', async (req, res) => {
     const result = await query(
       `WITH base AS (
          SELECT t.doc_no, t.doc_date, t.trans_flag AS bill_type, COALESCE(t.doc_ref,'') AS ref_doc_no,
-                t.doc_ref_date AS ref_doc_date, COALESCE(t.total_amount,0) AS sum_debt_amount,
+                t.doc_ref_date AS ref_doc_date,
+                CASE WHEN ${creditNoteSql('t')}
+                     THEN -1 * COALESCE(t.total_amount,0)
+                     ELSE COALESCE(t.total_amount,0)
+                END AS sum_debt_amount,
                 COALESCE(t.due_date, t.doc_date) AS due_date, COALESCE(t.vat_rate,0) AS vat_rate,
                 COALESCE(t.sale_code,'') AS sale_code, COALESCE(t.cust_code,'') AS cust_code
          FROM ic_trans t
@@ -549,7 +574,7 @@ router.get('/ar-billing/open-docs', async (req, res) => {
            ${extra}
        )
        SELECT b.*,
-              GREATEST(ROUND(
+              ROUND(
                 b.sum_debt_amount
                 - COALESCE((
                   SELECT SUM(d.sum_pay_money)
@@ -558,9 +583,9 @@ router.get('/ar-billing/open-docs', async (req, res) => {
                     AND d.bill_type = b.bill_type
                     AND d.trans_flag IN (235,239)
                     AND COALESCE(d.last_status,0) = 0
-                ),0), 2), 0) AS balance_ref
+                ),0), 2) AS balance_ref
        FROM base b
-       WHERE GREATEST(ROUND(
+       WHERE ABS(ROUND(
                 b.sum_debt_amount
                 - COALESCE((
                   SELECT SUM(d.sum_pay_money)
@@ -569,7 +594,7 @@ router.get('/ar-billing/open-docs', async (req, res) => {
                     AND d.bill_type = b.bill_type
                     AND d.trans_flag IN (235,239)
                     AND COALESCE(d.last_status,0) = 0
-                ),0), 2), 0) > 0
+                ),0), 2)) > 0.0001
        ORDER BY b.doc_date, b.doc_no
        LIMIT 200`,
       params,
@@ -728,7 +753,11 @@ router.post('/ar-billing/save', async (req, res) => {
       const invoiceResult = await client.query(
         `WITH base AS (
            SELECT t.doc_no, t.doc_date, t.trans_flag AS bill_type, COALESCE(t.doc_ref,'') AS ref_doc_no,
-                  t.doc_ref_date AS ref_doc_date, COALESCE(t.total_amount,0) AS sum_debt_amount,
+                  t.doc_ref_date AS ref_doc_date,
+                  CASE WHEN ${creditNoteSql('t')}
+                       THEN -1 * COALESCE(t.total_amount,0)
+                       ELSE COALESCE(t.total_amount,0)
+                  END AS sum_debt_amount,
                   COALESCE(t.due_date, t.doc_date) AS due_date, COALESCE(t.vat_rate,0) AS vat_rate
            FROM ic_trans t
            WHERE t.cust_code = $1
@@ -740,7 +769,7 @@ router.post('/ar-billing/save', async (req, res) => {
              AND t.doc_date <= $4::date
          )
          SELECT b.*,
-                GREATEST(ROUND(
+                ROUND(
                   b.sum_debt_amount
                   - COALESCE((
                     SELECT SUM(d.sum_pay_money)
@@ -749,7 +778,7 @@ router.post('/ar-billing/save', async (req, res) => {
                       AND d.bill_type = b.bill_type
                       AND d.trans_flag IN (235,239)
                       AND COALESCE(d.last_status,0) = 0
-                ),0), 2), 0) AS balance_ref
+                ),0), 2) AS balance_ref
          FROM base b`,
         [custCode, invoiceNos, BILLABLE_FLAGS, docDate],
       );
@@ -760,7 +789,7 @@ router.post('/ar-billing/save', async (req, res) => {
         if (!invoice) throw new Error(`billing document not found: ${row.billing_no}`);
         const balance = roundMoney(invoice.balance_ref);
         const requestedTotal = roundMoney(detailTotals.get(`${row.billing_no}|${row.bill_type}`) || 0);
-        if (requestedTotal > balance + 0.01) {
+        if (amountExceedsBalance(requestedTotal, balance)) {
           throw new Error(`sum_pay_money exceeds balance: ${row.billing_no}`);
         }
       }
