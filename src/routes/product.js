@@ -100,7 +100,21 @@ async function syncProductUnitType(client, icCode) {
     [c],
   );
   const unitCount = Number(unitCountResult.rows[0]?.unit_count || 0);
-  const updateResult = await client.query(`UPDATE ic_inventory SET unit_type=$1::integer WHERE code=$2::text`, [unitCount > 1 ? 1 : 0, c]);
+  const updateResult = await client.query(
+    `WITH standard_unit AS (` +
+      ` SELECT COALESCE(NULLIF(u.stand_value, 0), 1) AS stand_value,` +
+      `        COALESCE(NULLIF(u.divide_value, 0), 1) AS divide_value` +
+      ` FROM ic_inventory i` +
+      ` LEFT JOIN ic_unit_use u ON u.ic_code = i.code AND u.code = i.unit_standard` +
+      ` WHERE i.code=$2::text` +
+      ` LIMIT 1` +
+      `)` +
+      ` UPDATE ic_inventory SET unit_type=$1::integer,` +
+      ` unit_standard_stand_value = (SELECT stand_value FROM standard_unit),` +
+      ` unit_standard_divide_value = (SELECT divide_value FROM standard_unit)` +
+      ` WHERE code=$2::text`,
+    [unitCount > 1 ? 1 : 0, c],
+  );
   if (updateResult.rowCount === 0) throw httpError("ไม่พบสินค้า", 404);
 }
 
@@ -1128,6 +1142,8 @@ router.post("/adjustStock", async (req, res) => {
     }
 
     // คำนวณยอดคงเหลือปัจจุบัน (base units) เพื่อหา diff
+    await syncProductUnitType(pool, item_code);
+
     const balRes = await runQuery(
       "load-current-balance",
       `SELECT COALESCE(SUM(balance_qty), 0) AS sum_balance_qty
@@ -1930,9 +1946,10 @@ router.post("/createProductItemMain", async (req, res) => {
         `INSERT INTO ic_inventory (` +
           ` code, name_1, name_2, name_eng_1, name_eng_2,` +
           ` unit_standard, unit_cost, item_category, item_brand,` +
-          ` group_main, group_sub, group_sub2, item_design, item_model` +
+          ` group_main, group_sub, group_sub2, item_design, item_model,` +
+          ` unit_standard_stand_value, unit_standard_divide_value` +
           `) VALUES (` +
-          ` $1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text,$11::text,$12::text,$13::text,$14::text` +
+          ` $1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text,$11::text,$12::text,$13::text,$14::text,1,1` +
           `)`,
         [
           c,

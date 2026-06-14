@@ -3,6 +3,7 @@ const router = express.Router();
 const { withTransaction, query } = require('../db');
 const { resolveDocumentNo } = require('../utils/docFormat');
 const { getEmployeePermissions } = require('../utils/permissions');
+const { renderSalePrintHtml } = require('../utils/salePrintRenderer');
 
 const TRANS_TYPE = 1;
 const TRANS_FLAG = 260;
@@ -46,6 +47,36 @@ function normalizeDate(value, fallback = todayISO()) {
 function normalizeNullableDate(value) {
   const text = safeText(value);
   return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null;
+}
+
+function splitFormCodes(value) {
+  return String(value || '')
+    .split(',')
+    .map((code) => code.trim())
+    .filter(Boolean);
+}
+
+function uniqueCodes(codes) {
+  const seen = new Set();
+  return codes.filter((code) => {
+    const key = code.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function lowerCodes(codes) {
+  return codes.map((code) => code.toLowerCase());
+}
+
+function asAmountText(value) {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num) || Math.abs(num) < 0.005) return '';
+  return num.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
 }
 
 function normalizePayload(body) {
@@ -203,6 +234,216 @@ async function getPassBook(client, code) {
     [code],
   );
   return result.rows[0] || null;
+}
+
+async function loadPaymentRowsForPrint(docNo) {
+  const tableRes = await query(
+    `SELECT
+        to_regclass('public.cb_trans') AS cb_table,
+        to_regclass('public.cb_trans_detail') AS cb_detail_table`
+  );
+  if (!tableRes.rows[0]?.cb_table) return [];
+
+  const cbRes = await query(
+    `SELECT
+        COALESCE(cash_amount,0) AS cash_amount,
+        COALESCE(tranfer_amount,0) AS tranfer_amount,
+        COALESCE(card_amount,0) AS card_amount,
+        COALESCE(chq_amount,0) AS chq_amount
+     FROM cb_trans
+     WHERE doc_no = $1 AND trans_flag = $2
+     LIMIT 1`,
+    [docNo, TRANS_FLAG],
+  );
+
+  const labels = [];
+  const amounts = [];
+  const cashAmount = asAmountText(cbRes.rows[0]?.cash_amount);
+  if (cashAmount) {
+    labels.push('เงินสด');
+    amounts.push(cashAmount);
+  }
+
+  if (tableRes.rows[0]?.cb_detail_table) {
+    const detailRes = await query(
+      `SELECT doc_type, COALESCE(trans_number,'') AS trans_number,
+              COALESCE(amount,0) AS amount, COALESCE(sum_amount, amount, 0) AS sum_amount
+       FROM cb_trans_detail
+       WHERE doc_no = $1 AND trans_flag = $2
+       ORDER BY roworder`,
+      [docNo, TRANS_FLAG],
+    );
+
+    for (const row of detailRes.rows) {
+      const docType = Number(row.doc_type || 0);
+      const amount = asAmountText(docType === 3 ? row.sum_amount : row.amount);
+      if (!amount) continue;
+      let label = String(row.trans_number || '').trim();
+      if (docType === 1) label = label ? `เงินโอน ~ ${label}` : 'เงินโอน';
+      else if (docType === 3) label = label ? `บัตรเครดิต ~ ${label}` : 'บัตรเครดิต';
+      else if (docType === 2) label = label ? `เช็ค ~ ${label}` : 'เช็ค';
+      labels.push(label || 'จ่ายเงิน');
+      amounts.push(amount);
+    }
+  }
+
+  return labels.length
+    ? [{ trans_number: labels.join('\n'), amount: amounts.join('\n') }]
+    : [];
+}
+
+async function loadOtherExpensePrintDocument(docNo) {
+  const [headerRes, companyRes, detailsRes, payments] = await Promise.all([
+    query(
+      `SELECT t.*,
+          COALESCE(df.name_1,'') AS doc_format_name,
+          COALESCE(df.form_code,'') AS form_code,
+          COALESCE(ap.name_1,'') AS name_1,
+          COALESCE(ap.address,'') AS address,
+          COALESCE(ap.telephone,'') AS telephone,
+          COALESCE(ap.fax,'') AS fax,
+          COALESCE(ad.tax_id,'') AS tax_id,
+          COALESCE(u.name_1, t.creator_code, '') AS sale_name
+       FROM ic_trans t
+       LEFT JOIN erp_doc_format df ON df.screen_code = $2 AND df.code = t.doc_format_code
+       LEFT JOIN ap_supplier ap ON ap.code = t.cust_code
+       LEFT JOIN ap_supplier_detail ad ON ad.ap_code = t.cust_code
+       LEFT JOIN erp_user u ON UPPER(u.code) = UPPER(t.creator_code)
+       WHERE t.trans_flag = $3 AND t.doc_no = $1
+       LIMIT 1`,
+      [docNo, SCREEN_CODE, TRANS_FLAG],
+    ),
+    query('SELECT * FROM erp_company_profile ORDER BY roworder LIMIT 1'),
+    query(
+      `SELECT
+          line_number,
+          item_code,
+          item_name,
+          item_code AS expense_code,
+          item_name AS expense_name,
+          '' AS unit_code,
+          '' AS unit_name,
+          1 AS qty,
+          price,
+          sum_amount,
+          sum_amount AS amount,
+          sum_amount_exclude_vat,
+          total_vat_value,
+          remark
+       FROM ic_trans_detail
+       WHERE trans_flag = $2 AND doc_no = $1
+       ORDER BY line_number, roworder`,
+      [docNo, TRANS_FLAG],
+    ),
+    loadPaymentRowsForPrint(docNo),
+  ]);
+
+  const header = headerRes.rows[0];
+  if (!header) return null;
+  const company = companyRes.rows[0] || {};
+  company.tax_text = company.tax_number ? `หมายเลขประจำตัวผู้เสียภาษี ${company.tax_number}` : '';
+  company.telephone_text = company.telephone_number ? `โทร. ${company.telephone_number}` : '';
+
+  return {
+    header,
+    company,
+    details: detailsRes.rows || [],
+    payments,
+  };
+}
+
+async function loadPrintFormOptions(docNo) {
+  const docRes = await query(
+    `SELECT t.doc_no, COALESCE(t.doc_format_code,'') AS doc_format_code,
+        COALESCE(df.name_1,'') AS doc_format_name,
+        COALESCE(df.form_code,'') AS form_code
+     FROM ic_trans t
+     LEFT JOIN erp_doc_format df ON df.screen_code = $2 AND df.code = t.doc_format_code
+     WHERE t.trans_flag = $3 AND t.doc_no = $1
+     LIMIT 1`,
+    [docNo, SCREEN_CODE, TRANS_FLAG],
+  );
+
+  const doc = docRes.rows[0];
+  if (!doc) return null;
+
+  const codes = uniqueCodes(splitFormCodes(doc.form_code));
+  let formRows = [];
+  if (codes.length) {
+    const result = await query(
+      `SELECT formcode, formname
+       FROM formdesign
+       WHERE lower(formcode) = ANY($1::text[])`,
+      [lowerCodes(codes)],
+    );
+    formRows = result.rows;
+  }
+
+  const byCode = new Map(formRows.map((row) => [String(row.formcode || '').toLowerCase(), row]));
+  const forms = codes.map((code, index) => {
+    const row = byCode.get(code.toLowerCase());
+    return {
+      formcode: row?.formcode || code,
+      formname: row?.formname || code,
+      available: !!row,
+      is_default: index === 0,
+    };
+  });
+
+  return {
+    doc_no: doc.doc_no,
+    doc_format_code: doc.doc_format_code,
+    doc_format_name: doc.doc_format_name,
+    form_code: doc.form_code,
+    forms,
+  };
+}
+
+async function loadFormDesignRows(formCodes) {
+  if (!formCodes.length) return [];
+  const result = await query(
+    `SELECT formcode, formname, formdesigntext, formbackground
+     FROM formdesign
+     WHERE lower(formcode) = ANY($1::text[])`,
+    [lowerCodes(formCodes)],
+  );
+  const byCode = new Map(result.rows.map((row) => [String(row.formcode || '').toLowerCase(), row]));
+  return formCodes.map((code) => byCode.get(code.toLowerCase())).filter(Boolean);
+}
+
+function shouldLogPrint(logPrint, autoPrint) {
+  if (logPrint !== undefined) {
+    const value = String(logPrint).trim().toLowerCase();
+    return value !== '0' && value !== 'false' && value !== 'no';
+  }
+  return String(autoPrint) !== '0';
+}
+
+async function getPrintCount(docNo) {
+  const result = await query(
+    `SELECT COUNT(*)::int AS print_count
+     FROM erp_print_logs
+     WHERE trans_flag = $2 AND doc_no = $1`,
+    [docNo, TRANS_FLAG],
+  );
+  return Number(result.rows[0]?.print_count || 0);
+}
+
+async function createPrintLog(docNo, userCode) {
+  return withTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO erp_print_logs (doc_no, trans_flag, user_code, print_datetime)
+       VALUES ($1, $2, $3, NOW())`,
+      [docNo, TRANS_FLAG, String(userCode || 'WEB').trim() || 'WEB'],
+    );
+    const result = await client.query(
+      `SELECT COUNT(*)::int AS print_count
+       FROM erp_print_logs
+       WHERE trans_flag = $2 AND doc_no = $1`,
+      [docNo, TRANS_FLAG],
+    );
+    return Number(result.rows[0]?.print_count || 0);
+  });
 }
 
 router.get('/other-expense/doc-formats', async (req, res) => {
@@ -437,6 +678,64 @@ router.get('/other-expense/detail', async (req, res) => {
   } catch (ex) {
     if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
     return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
+router.get('/other-expense/print-forms', async (req, res) => {
+  const docNo = safeText(req.query.doc_no);
+  if (!docNo) return res.status(400).json({ success: false, msg: 'doc_no is required' });
+  try {
+    await assertPermission(query, req.query.user_code || req.query.emp_code, OTHER_EXPENSE_VIEW_PERMISSION);
+    const options = await loadPrintFormOptions(docNo);
+    if (!options) return res.status(404).json({ success: false, msg: 'document not found' });
+    return res.json({ success: true, data: options });
+  } catch (ex) {
+    if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
+    return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
+router.get('/other-expense/print/render', async (req, res) => {
+  const { doc_no = '', formcodes = '', auto_print = '1', log_print, user_code = '' } = req.query;
+  const docNo = safeText(doc_no);
+  if (!docNo) return res.status(400).type('text/plain').send('doc_no is required');
+
+  try {
+    await assertPermission(query, user_code || req.query.emp_code, OTHER_EXPENSE_VIEW_PERMISSION);
+    const [options, printData] = await Promise.all([
+      loadPrintFormOptions(docNo),
+      loadOtherExpensePrintDocument(docNo),
+    ]);
+
+    if (!options || !printData) return res.status(404).type('text/plain').send('document not found');
+
+    const availableCodes = options.forms.filter((form) => form.available).map((form) => form.formcode);
+    const requestedCodes = uniqueCodes(splitFormCodes(formcodes));
+    const selectedCodes = requestedCodes.length
+      ? requestedCodes.filter((code) => availableCodes.some((available) => available.toLowerCase() === code.toLowerCase()))
+      : availableCodes.slice(0, 1);
+
+    if (!selectedCodes.length) return res.status(404).type('text/plain').send('print form not found');
+
+    const formRows = await loadFormDesignRows(selectedCodes);
+    if (!formRows.length) return res.status(404).type('text/plain').send('print form not found');
+
+    const logThisPrint = req.method !== 'HEAD' && shouldLogPrint(log_print, auto_print);
+    const printCount = logThisPrint
+      ? await createPrintLog(docNo, user_code || printData.header.creator_code)
+      : await getPrintCount(docNo);
+    printData.header.print_count = printCount;
+
+    const html = renderSalePrintHtml({
+      formRows,
+      data: printData,
+      autoPrint: String(auto_print) !== '0',
+    });
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(200).type('html').send(html);
+  } catch (ex) {
+    if (isPermissionError(ex)) return res.status(403).type('text/plain').send(ex.message);
+    return res.status(500).type('text/plain').send(ex.message);
   }
 });
 
