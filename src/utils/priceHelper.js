@@ -69,7 +69,7 @@ async function getProductPriceLocalx(
     formulaTaxTypeInClause = '(0,1)';
   } else if (vatTypeVal === 1) {
     formulaTaxTypeInClause = '(0,2)';
-  } else if (vatTypeVal === 3) {
+  } else if (vatTypeVal === 2 || vatTypeVal === 3) {
     formulaTaxTypeInClause = '(0,3)';
   }
 
