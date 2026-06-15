@@ -1947,9 +1947,9 @@ router.post("/createProductItemMain", async (req, res) => {
           ` code, name_1, name_2, name_eng_1, name_eng_2,` +
           ` unit_standard, unit_cost, item_category, item_brand,` +
           ` group_main, group_sub, group_sub2, item_design, item_model,` +
-          ` unit_standard_stand_value, unit_standard_divide_value` +
+          ` unit_standard_stand_value, unit_standard_divide_value, update_detail, update_price` +
           `) VALUES (` +
-          ` $1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text,$11::text,$12::text,$13::text,$14::text,1,1` +
+          ` $1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text,$11::text,$12::text,$13::text,$14::text,1,1,1,1` +
           `)`,
         [
           c,
