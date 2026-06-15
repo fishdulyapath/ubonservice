@@ -1163,13 +1163,16 @@ async function handleSaveTrans(req, res, options = {}) {
           // โอน
           const pb_bank_code = p.bank_code || 'KBANK';
           const pb_bank_branch = p.bank_branch || 'KBANK2';
+          const transfer_date = /^\d{4}-\d{2}-\d{2}$/.test(String(p.transfer_date || p.chq_due_date || ''))
+            ? String(p.transfer_date || p.chq_due_date)
+            : doc_date;
           await client.query(
             `INSERT INTO cb_trans_detail (
               trans_type,trans_flag,doc_no,doc_date,doc_time,trans_number,
               bank_code,bank_branch,amount,sum_amount,doc_type,ap_ar_code,
-              trans_number_type,ap_ar_type
-            ) VALUES (2,$1,$2,$3::date,$4,$5,$6,$7,$8,$8,'1',$9,0,0)`,
-            [44, doc_no, doc_date, doc_time, trans_number, pb_bank_code, pb_bank_branch, pay_amount, cust_code]
+              chq_due_date,trans_number_type,ap_ar_type
+            ) VALUES (2,$1,$2,$3::date,$4,$5,$6,$7,$8,$8,'1',$9,$10::date,0,0)`,
+            [44, doc_no, doc_date, doc_time, trans_number, pb_bank_code, pb_bank_branch, pay_amount, cust_code, transfer_date]
           );
         } else if (pay_type === '21') {
           // บัตรเครดิต

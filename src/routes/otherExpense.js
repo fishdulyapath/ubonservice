@@ -173,13 +173,15 @@ function normalizePayments(value) {
         pass_book_code: safeText(row?.pass_book_code || row?.trans_number),
         bank_code: safeText(row?.bank_code),
         bank_branch: safeText(row?.bank_branch),
+        chq_due_date: normalizeDate(row?.transfer_date || row?.chq_due_date || row?.due_date, ''),
         amount: roundMoney(row?.amount ?? row?.pay_amount),
       }))
       .filter((row) => row.amount > 0),
     card: card
       .map((row) => ({
         credit_card_type: safeText(row?.credit_card_type || row?.credit_type) || 'WR',
-        trans_number: safeText(row?.trans_number) || '1',
+        trans_number: safeText(row?.trans_number || row?.card_number) || '1',
+        no_approved: safeText(row?.no_approved || row?.approval_no),
         amount: roundMoney(row?.amount ?? row?.pay_amount),
         charge: roundMoney(row?.charge),
       }))
@@ -1003,12 +1005,13 @@ router.post('/other-expense/save', async (req, res) => {
             `INSERT INTO cb_trans_detail (
               trans_type, trans_flag, doc_no, doc_date, doc_time, trans_number,
               bank_code, bank_branch, amount, sum_amount, doc_type, ap_ar_code,
-              trans_number_type, ap_ar_type, last_status
-            ) VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$9,1,$10,0,0,0)`,
+              chq_due_date, trans_number_type, ap_ar_type, last_status
+            ) VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$9,1,$10,$11::date,0,0,0)`,
             [
               TRANS_TYPE, TRANS_FLAG, savedDocNo, docDate, docTime,
               passBook.code, passBook.bank_code || row.bank_code,
               passBook.bank_branch || row.bank_branch, row.amount, supplierCode,
+              row.chq_due_date || docDate,
             ],
           );
         }
@@ -1018,12 +1021,13 @@ router.post('/other-expense/save', async (req, res) => {
             `INSERT INTO cb_trans_detail (
               trans_type, trans_flag, doc_no, doc_date, doc_time, trans_number,
               credit_card_type, amount, sum_amount, doc_type, ap_ar_code,
-              trans_number_type, ap_ar_type, charge, last_status
-            ) VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8,$9,3,$10,1,1,$11,0)`,
+              trans_number_type, ap_ar_type, charge, ref1, no_approved, last_status
+            ) VALUES ($1,$2,$3,$4::date,$5,$6,$7,$8,$9,3,$10,1,1,$11,$6,$12,0)`,
             [
               TRANS_TYPE, TRANS_FLAG, savedDocNo, docDate, docTime,
               row.trans_number, row.credit_card_type, row.amount,
               roundMoney(row.amount + row.charge), supplierCode, row.charge,
+              row.no_approved,
             ],
           );
         }
