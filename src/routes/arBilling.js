@@ -10,8 +10,10 @@ const TRANS_FLAG = 235;
 const CANCEL_TRANS_FLAG = 236;
 const SCREEN_CODE = 'ED';
 const DOC_TABLE = 'ap_ar_trans';
-const BILLABLE_FLAGS = [44, 46, 48, 93, 95, 97];
-const CREDIT_NOTE_FLAGS = [48, 97];
+const BILLABLE_FLAGS = [44, 46, 48, 93, 95, 97, 99, 101, 103];
+const SALE_FLAGS = [44];
+const DEBIT_NOTE_FLAGS = [46, 93, 95, 99, 101];
+const CREDIT_NOTE_FLAGS = [48, 97, 103];
 const AR_BILLING_VIEW_PERMISSION = 'sales.ar_billing.view';
 const AR_BILLING_CREATE_PERMISSION = 'sales.ar_billing.create';
 
@@ -49,8 +51,330 @@ function amountExceedsBalance(amount, balance) {
   return Math.abs(roundMoney(amount)) > Math.abs(roundMoney(balance)) + 0.01;
 }
 
-function creditNoteSql(alias = 't') {
-  return `${alias}.trans_flag IN (${CREDIT_NOTE_FLAGS.join(',')})`;
+function boolFlag(value) {
+  if (typeof value === 'boolean') return value;
+  const text = String(value ?? '').trim().toLowerCase();
+  return text === '1' || text === 'true' || text === 'yes' || text === 'on';
+}
+
+async function loadArBillingProfile(queryFn, userCode = '') {
+  const profile = {
+    branchStatus: 0,
+    arBillInform: false,
+    filterPayBill: false,
+    showBranchDocOnly: false,
+    useCreditPayBillCalc: false,
+    userCanChangeBranch: false,
+    userBranchCode: '',
+  };
+
+  try {
+    const companyRes = await queryFn(
+      `SELECT COALESCE(branch_status,0) AS branch_status
+       FROM erp_company_profile
+       ORDER BY roworder
+       LIMIT 1`,
+    );
+    profile.branchStatus = toInt(companyRes.rows[0]?.branch_status);
+  } catch {
+    profile.branchStatus = 0;
+  }
+
+  try {
+    const optionRes = await queryFn(
+      `SELECT COALESCE(ar_bill_inform,0) AS ar_bill_inform,
+              COALESCE(filter_pay_bill,0) AS filter_pay_bill,
+              COALESCE(show_branch_doc_only,0) AS show_branch_doc_only,
+              COALESCE(use_credit_pay_bill_calc,0) AS use_credit_pay_bill_calc
+       FROM erp_option
+       LIMIT 1`,
+    );
+    const row = optionRes.rows[0] || {};
+    profile.arBillInform = boolFlag(row.ar_bill_inform);
+    profile.filterPayBill = boolFlag(row.filter_pay_bill);
+    profile.showBranchDocOnly = boolFlag(row.show_branch_doc_only);
+    profile.useCreditPayBillCalc = boolFlag(row.use_credit_pay_bill_calc);
+  } catch {
+    // Keep C#-compatible defaults when the option table/columns are absent.
+  }
+
+  const code = safeText(userCode);
+  if (code) {
+    try {
+      const userRes = await queryFn(
+        `SELECT COALESCE(change_branch_code,0) AS change_branch_code,
+                COALESCE(branch_code,'') AS branch_code
+         FROM erp_user
+         WHERE UPPER(code) = UPPER($1)
+         LIMIT 1`,
+        [code],
+      );
+      const row = userRes.rows[0] || {};
+      profile.userCanChangeBranch = boolFlag(row.change_branch_code);
+      profile.userBranchCode = safeText(row.branch_code);
+    } catch {
+      profile.userCanChangeBranch = false;
+    }
+  }
+
+  return profile;
+}
+
+function billTypeNameSql(alias = 'doc_type') {
+  return `CASE ${alias}
+    WHEN 44 THEN 'ขายเชื่อ'
+    WHEN 46 THEN 'เพิ่มหนี้'
+    WHEN 48 THEN 'ลดหนี้'
+    WHEN 93 THEN 'ตั้งหนี้ยกมา'
+    WHEN 95 THEN 'เพิ่มหนี้ยกมา'
+    WHEN 97 THEN 'ลดหนี้ยกมา'
+    WHEN 99 THEN 'ตั้งหนี้อื่น'
+    WHEN 101 THEN 'เพิ่มหนี้อื่น'
+    WHEN 103 THEN 'ลดหนี้อื่น'
+    ELSE ${alias}::text
+  END`;
+}
+
+function arBalanceDocCte({ filterPayBill = false, includeSearch = false, includeBranch = false, includeDocNos = false, useCreditPayBillCalc = false }) {
+  const searchSql = includeSearch
+    ? `AND (
+         temp3.doc_no ILIKE $search
+         OR COALESCE(temp3.ref_doc_no,'') ILIKE $search
+         OR COALESCE(temp3.tax_doc_no,'') ILIKE $search
+         OR COALESCE(temp3.ship_code,'') ILIKE $search
+       )`
+    : '';
+  const branchSql = includeBranch ? `AND COALESCE(temp3.branch_code,'') = $branch` : '';
+  const docNosSql = includeDocNos ? `AND temp3.doc_no = ANY($docNos::text[])` : '';
+  const filterPayBillSql = filterPayBill
+    ? `AND NOT EXISTS (
+         SELECT 1
+         FROM ap_ar_trans_detail d
+         WHERE d.billing_no = temp3.doc_no
+           AND d.bill_type = temp3.bill_type
+           AND COALESCE(d.last_status,0) = 0
+           AND d.trans_flag = ${TRANS_FLAG}
+       )`
+    : '';
+  const dueDateSql = useCreditPayBillCalc ? `AND temp3.due_date = $dueDate::date` : '';
+
+  return `
+    WITH temp3 AS (
+      SELECT temp2.*,
+             GREATEST(($docDate::date - temp2.due_date)::int, 0) AS due_day,
+             (${billTypeNameSql('temp2.bill_type')}) AS bill_type_name,
+             (
+               SELECT ship_code
+               FROM ic_trans_shipment s
+               WHERE s.doc_no = temp2.doc_no
+                 AND s.trans_flag = temp2.bill_type
+               LIMIT 1
+             ) AS ship_code
+      FROM (
+        SELECT t.cust_code,
+               t.doc_no,
+               t.doc_date,
+               CASE WHEN t.trans_flag IN (93,95,97) THEN COALESCE(t.due_date, t.doc_date)
+                    ELSE COALESCE(t.credit_date, t.due_date, t.doc_date)
+               END AS due_date,
+               t.trans_flag AS bill_type,
+               COALESCE(t.used_status,0) AS used_status,
+               COALESCE(t.doc_ref,'') AS ref_doc_no,
+               t.doc_ref_date AS ref_doc_date,
+               COALESCE(t.tax_doc_no,'') AS tax_doc_no,
+               t.tax_doc_date AS tax_doc_date,
+               COALESCE(t.credit_day,0) AS credit_day,
+               COALESCE(t.total_amount,0) AS sum_debt_amount,
+               COALESCE(t.total_amount,0) - COALESCE((
+                 SELECT SUM(COALESCE(d.sum_pay_money,0) + COALESCE(d.lost_profit_exchange_amount,0))
+                 FROM ap_ar_trans_detail d
+                 WHERE COALESCE(d.last_status,0) = 0
+                   AND d.trans_flag IN (239)
+                   AND d.billing_no = t.doc_no
+                   AND d.bill_type = t.trans_flag
+               ),0) AS balance_ref,
+               CASE WHEN COALESCE(t.currency_code,'') = '' THEN COALESCE(t.total_amount,0) ELSE COALESCE(t.total_amount_2,t.total_amount,0) END AS sum_debt_amount_2,
+               COALESCE(t.currency_code,'') AS currency_code,
+               CASE WHEN COALESCE(t.currency_code,'') = '' THEN 1 ELSE COALESCE(t.exchange_rate,1) END AS exchange_rate,
+               CASE WHEN COALESCE(t.currency_code,'') = '' THEN
+                 COALESCE(t.total_amount,0) - COALESCE((
+                   SELECT SUM(COALESCE(d.sum_pay_money_2,0))
+                   FROM ap_ar_trans_detail d
+                   WHERE COALESCE(d.last_status,0) = 0
+                     AND d.trans_flag IN (239,19)
+                     AND d.billing_no = t.doc_no
+                     AND d.bill_type = t.trans_flag
+                 ),0)
+               ELSE
+                 COALESCE(t.total_amount_2,t.total_amount,0) - COALESCE((
+                   SELECT SUM(COALESCE(d.sum_pay_money_2,0))
+                   FROM ap_ar_trans_detail d
+                   WHERE COALESCE(d.last_status,0) = 0
+                     AND d.trans_flag IN (239,19)
+                     AND d.billing_no = t.doc_no
+                     AND d.bill_type = t.trans_flag
+                 ),0)
+               END AS balance_ref_2,
+               COALESCE(t.branch_code,'') AS branch_code,
+               COALESCE(t.remark,'') AS source_remark,
+               COALESCE(t.vat_rate,0) AS vat_rate
+        FROM ic_trans t
+        WHERE COALESCE(t.last_status,0) = 0
+          AND t.trans_flag = ANY($saleFlags::int[])
+          AND COALESCE(t.inquiry_type,0) IN (0,2)
+          AND t.cust_code = $custCode
+          AND t.doc_date <= $docDate::date
+          AND COALESCE(t.is_cancel,0) = 0
+          AND COALESCE(t.is_doc_copy,0) <> 1
+
+        UNION ALL
+
+        SELECT t.cust_code,
+               t.doc_no,
+               t.doc_date,
+               CASE WHEN t.trans_flag IN (93,95,97) THEN COALESCE(t.due_date, t.doc_date)
+                    ELSE COALESCE(t.credit_date, t.due_date, t.doc_date)
+               END AS due_date,
+               t.trans_flag AS bill_type,
+               COALESCE(t.used_status,0) AS used_status,
+               CASE WHEN t.trans_flag IN (14,81,83,85,93,95,97,315,260) THEN COALESCE(t.doc_ref,'') ELSE '' END AS ref_doc_no,
+               CASE WHEN t.trans_flag IN (14,81,83,85,93,95,97,315,260) THEN t.doc_ref_date ELSE NULL END AS ref_doc_date,
+               COALESCE(t.tax_doc_no,'') AS tax_doc_no,
+               t.tax_doc_date AS tax_doc_date,
+               COALESCE(t.credit_day,0) AS credit_day,
+               COALESCE(t.total_amount,0) AS sum_debt_amount,
+               COALESCE(t.total_amount,0) - COALESCE((
+                 SELECT SUM(COALESCE(d.sum_pay_money,0))
+                 FROM ap_ar_trans_detail d
+                 WHERE COALESCE(d.last_status,0) = 0
+                   AND d.trans_flag IN (239)
+                   AND d.billing_no = t.doc_no
+                   AND d.bill_type = t.trans_flag
+               ),0) AS balance_ref,
+               CASE WHEN COALESCE(t.currency_code,'') = '' THEN COALESCE(t.total_amount,0) ELSE COALESCE(t.total_amount_2,t.total_amount,0) END AS sum_debt_amount_2,
+               COALESCE(t.currency_code,'') AS currency_code,
+               CASE WHEN COALESCE(t.currency_code,'') = '' THEN 1 ELSE COALESCE(t.exchange_rate,1) END AS exchange_rate,
+               CASE WHEN COALESCE(t.currency_code,'') = '' THEN
+                 COALESCE(t.total_amount,0) - COALESCE((
+                   SELECT SUM(COALESCE(d.sum_pay_money_2,0))
+                   FROM ap_ar_trans_detail d
+                   WHERE COALESCE(d.last_status,0) = 0
+                     AND d.trans_flag IN (239,19)
+                     AND d.billing_no = t.doc_no
+                     AND d.bill_type = t.trans_flag
+                 ),0)
+               ELSE
+                 COALESCE(t.total_amount_2,t.total_amount,0) - COALESCE((
+                   SELECT SUM(COALESCE(d.sum_pay_money_2,0))
+                   FROM ap_ar_trans_detail d
+                   WHERE COALESCE(d.last_status,0) = 0
+                     AND d.trans_flag IN (239,19)
+                     AND d.billing_no = t.doc_no
+                     AND d.bill_type = t.trans_flag
+                 ),0)
+               END AS balance_ref_2,
+               COALESCE(t.branch_code,'') AS branch_code,
+               COALESCE(t.remark,'') AS source_remark,
+               COALESCE(t.vat_rate,0) AS vat_rate
+        FROM ic_trans t
+        WHERE COALESCE(t.last_status,0) = 0
+          AND t.trans_flag = ANY($debitFlags::int[])
+          AND t.cust_code = $custCode
+          AND t.doc_date <= $docDate::date
+          AND COALESCE(t.is_cancel,0) = 0
+          AND COALESCE(t.is_doc_copy,0) <> 1
+
+        UNION ALL
+
+        SELECT t.cust_code,
+               t.doc_no,
+               t.doc_date,
+               CASE WHEN t.trans_flag IN (93,95,97) THEN COALESCE(t.due_date, t.doc_date)
+                    ELSE COALESCE(t.credit_date, t.due_date, t.doc_date)
+               END AS due_date,
+               t.trans_flag AS bill_type,
+               COALESCE(t.used_status,0) AS used_status,
+               CASE WHEN t.trans_flag IN (16,81,83,85,93,95,97,315,260) THEN COALESCE(t.doc_ref,'') ELSE '' END AS ref_doc_no,
+               CASE WHEN t.trans_flag IN (16,81,83,85,93,95,97,315,260) THEN t.doc_ref_date ELSE NULL END AS ref_doc_date,
+               COALESCE(t.tax_doc_no,'') AS tax_doc_no,
+               t.tax_doc_date AS tax_doc_date,
+               COALESCE(t.credit_day,0) AS credit_day,
+               -1 * COALESCE(t.total_amount,0) AS sum_debt_amount,
+               -1 * (COALESCE(t.total_amount,0) + COALESCE((
+                 SELECT SUM(COALESCE(d.sum_pay_money,0))
+                 FROM ap_ar_trans_detail d
+                 WHERE COALESCE(d.last_status,0) = 0
+                   AND d.trans_flag IN (239)
+                   AND d.billing_no = t.doc_no
+                   AND d.bill_type = t.trans_flag
+               ),0)) AS balance_ref,
+               -1 * (CASE WHEN COALESCE(t.currency_code,'') = '' THEN COALESCE(t.total_amount,0) ELSE COALESCE(t.total_amount_2,t.total_amount,0) END) AS sum_debt_amount_2,
+               COALESCE(t.currency_code,'') AS currency_code,
+               CASE WHEN COALESCE(t.currency_code,'') = '' THEN 1 ELSE COALESCE(t.exchange_rate,1) END AS exchange_rate,
+               CASE WHEN COALESCE(t.currency_code,'') = '' THEN
+                 -1 * (COALESCE(t.total_amount,0) + COALESCE((
+                   SELECT SUM(COALESCE(d.sum_pay_money_2,0))
+                   FROM ap_ar_trans_detail d
+                   WHERE COALESCE(d.last_status,0) = 0
+                     AND d.trans_flag IN (239)
+                     AND d.billing_no = t.doc_no
+                     AND d.bill_type = t.trans_flag
+                 ),0))
+               ELSE
+                 -1 * (COALESCE(t.total_amount_2,t.total_amount,0) + COALESCE((
+                   SELECT SUM(COALESCE(d.sum_pay_money_2,0))
+                   FROM ap_ar_trans_detail d
+                   WHERE COALESCE(d.last_status,0) = 0
+                     AND d.trans_flag IN (239)
+                     AND d.billing_no = t.doc_no
+                     AND d.bill_type = t.trans_flag
+                 ),0))
+               END AS balance_ref_2,
+               COALESCE(t.branch_code,'') AS branch_code,
+               COALESCE(t.remark,'') AS source_remark,
+               COALESCE(t.vat_rate,0) AS vat_rate
+        FROM ic_trans t
+        WHERE COALESCE(t.last_status,0) = 0
+          AND (
+            (t.trans_flag = 48 AND COALESCE(t.inquiry_type,0) IN (0,2,4))
+            OR (t.trans_flag <> 48 AND t.trans_flag = ANY($creditFlags::int[]))
+          )
+          AND t.cust_code = $custCode
+          AND t.doc_date <= $docDate::date
+          AND COALESCE(t.is_cancel,0) = 0
+          AND COALESCE(t.is_doc_copy,0) <> 1
+      ) temp2
+    ),
+    ar_balance_docs AS (
+      SELECT temp3.*,
+             EXISTS (
+               SELECT 1
+               FROM ap_ar_trans_detail d
+               WHERE d.billing_no = temp3.doc_no
+                 AND COALESCE(d.last_status,0) = 0
+                 AND d.trans_flag = ${TRANS_FLAG}
+             ) AS already_billed
+      FROM temp3
+      WHERE ABS(ROUND(COALESCE(temp3.balance_ref,0), 2)) > 0.0001
+        ${docNosSql}
+        ${searchSql}
+        ${branchSql}
+        ${filterPayBillSql}
+        ${dueDateSql}
+    )`;
+}
+
+function withArBalanceParams(sql, params) {
+  return sql
+    .replace(/\$custCode/g, `$${params.custCode}`)
+    .replace(/\$docDate/g, `$${params.docDate}`)
+    .replace(/\$saleFlags/g, `$${params.saleFlags}`)
+    .replace(/\$debitFlags/g, `$${params.debitFlags}`)
+    .replace(/\$creditFlags/g, `$${params.creditFlags}`)
+    .replace(/\$search/g, `$${params.search}`)
+    .replace(/\$branch/g, `$${params.branch}`)
+    .replace(/\$docNos/g, `$${params.docNos}`)
+    .replace(/\$dueDate/g, `$${params.dueDate}`);
 }
 
 function todayISO() {
@@ -236,6 +560,9 @@ async function loadArBillingPrintDocument(docNo) {
                     WHEN 93 THEN 'ตั้งหนี้ยกมา'
                     WHEN 95 THEN 'เพิ่มหนี้ยกมา'
                     WHEN 97 THEN 'ลดหนี้ยกมา'
+                    WHEN 99 THEN 'ตั้งหนี้อื่น'
+                    WHEN 101 THEN 'เพิ่มหนี้อื่น'
+                    WHEN 103 THEN 'ลดหนี้อื่น'
                     ELSE d.bill_type::text
                   END AS bill_type_name
          FROM ap_ar_trans_detail d
@@ -545,61 +872,55 @@ router.get('/ar-billing/open-docs', async (req, res) => {
   const custCode = safeText(req.query.cust_code);
   const search = safeText(req.query.search);
   const docDate = normalizeDate(req.query.doc_date);
+  const dueDate = normalizeDate(req.query.due_date, docDate);
+  const branchCodeFromRequest = safeText(req.query.branch_code);
+  const userCode = req.query.user_code || req.query.emp_code;
   if (!custCode) return res.json({ success: true, data: [] });
-  const params = [custCode, BILLABLE_FLAGS, docDate];
-  let extra = '';
-  if (search) {
-    params.push(`%${search}%`);
-    extra = `AND (t.doc_no ILIKE $${params.length} OR COALESCE(t.doc_ref,'') ILIKE $${params.length})`;
-  }
   try {
-    await assertPermission(query, req.query.user_code || req.query.emp_code, AR_BILLING_VIEW_PERMISSION);
+    await assertPermission(query, userCode, AR_BILLING_VIEW_PERMISSION);
+    const profile = await loadArBillingProfile(query, userCode);
+    const branchCode = branchCodeFromRequest || profile.userBranchCode;
+    const includeBranch = profile.branchStatus === 1 && profile.showBranchDocOnly && !profile.userCanChangeBranch && !!branchCode;
+    const params = [];
+    const idx = {
+      custCode: params.push(custCode),
+      docDate: params.push(docDate),
+      saleFlags: params.push(SALE_FLAGS),
+      debitFlags: params.push(DEBIT_NOTE_FLAGS),
+      creditFlags: params.push(CREDIT_NOTE_FLAGS),
+    };
+    if (search) idx.search = params.push(`%${search}%`);
+    if (includeBranch) idx.branch = params.push(branchCode);
+    if (profile.useCreditPayBillCalc) idx.dueDate = params.push(dueDate);
+    const cte = withArBalanceParams(
+      arBalanceDocCte({
+        filterPayBill: profile.filterPayBill,
+        includeSearch: !!search,
+        includeBranch,
+        useCreditPayBillCalc: profile.useCreditPayBillCalc,
+      }),
+      idx,
+    );
     const result = await query(
-      `WITH base AS (
-         SELECT t.doc_no, t.doc_date, t.trans_flag AS bill_type, COALESCE(t.doc_ref,'') AS ref_doc_no,
-                t.doc_ref_date AS ref_doc_date,
-                CASE WHEN ${creditNoteSql('t')}
-                     THEN -1 * COALESCE(t.total_amount,0)
-                     ELSE COALESCE(t.total_amount,0)
-                END AS sum_debt_amount,
-                COALESCE(t.due_date, t.doc_date) AS due_date, COALESCE(t.vat_rate,0) AS vat_rate,
-                COALESCE(t.sale_code,'') AS sale_code, COALESCE(t.cust_code,'') AS cust_code
-         FROM ic_trans t
-         WHERE t.cust_code = $1
-           AND t.trans_flag = ANY($2::int[])
-           AND COALESCE(t.last_status,0) = 0
-           AND COALESCE(t.is_cancel,0) = 0
-           AND COALESCE(t.is_doc_copy,0) <> 1
-           AND t.doc_date <= $3::date
-           ${extra}
-       )
-       SELECT b.*,
-              ROUND(
-                b.sum_debt_amount
-                - COALESCE((
-                  SELECT SUM(d.sum_pay_money)
-                  FROM ap_ar_trans_detail d
-                  WHERE d.billing_no = b.doc_no
-                    AND d.bill_type = b.bill_type
-                    AND d.trans_flag IN (235,239)
-                    AND COALESCE(d.last_status,0) = 0
-                ),0), 2) AS balance_ref
-       FROM base b
-       WHERE ABS(ROUND(
-                b.sum_debt_amount
-                - COALESCE((
-                  SELECT SUM(d.sum_pay_money)
-                  FROM ap_ar_trans_detail d
-                  WHERE d.billing_no = b.doc_no
-                    AND d.bill_type = b.bill_type
-                    AND d.trans_flag IN (235,239)
-                    AND COALESCE(d.last_status,0) = 0
-                ),0), 2)) > 0.0001
-       ORDER BY b.doc_date, b.doc_no
+      `${cte}
+       SELECT doc_no, doc_date, bill_type, bill_type_name, ref_doc_no, ref_doc_date,
+              tax_doc_no, tax_doc_date, due_date, due_day, credit_day,
+              sum_debt_amount, ROUND(balance_ref,2) AS balance_ref,
+              sum_debt_amount_2, ROUND(balance_ref_2,2) AS balance_ref_2,
+              currency_code, exchange_rate, vat_rate, branch_code, ship_code,
+              source_remark, already_billed
+       FROM ar_balance_docs
+       ORDER BY due_date, doc_date, doc_no
        LIMIT 200`,
       params,
     );
-    return res.json({ success: true, data: result.rows });
+    return res.json({
+      success: true,
+      data: result.rows.map((row) => ({
+        ...row,
+        ar_bill_blocked: profile.arBillInform && boolFlag(row.already_billed),
+      })),
+    });
   } catch (ex) {
     if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
     return res.status(500).json({ success: false, msg: ex.message });
@@ -629,6 +950,9 @@ router.get('/ar-billing/detail', async (req, res) => {
                   WHEN 93 THEN 'ตั้งหนี้ยกมา'
                   WHEN 95 THEN 'เพิ่มหนี้ยกมา'
                   WHEN 97 THEN 'ลดหนี้ยกมา'
+                  WHEN 99 THEN 'ตั้งหนี้อื่น'
+                  WHEN 101 THEN 'เพิ่มหนี้อื่น'
+                  WHEN 103 THEN 'ลดหนี้อื่น'
                   ELSE d.bill_type::text
                 END AS bill_type_name
          FROM ap_ar_trans_detail d
@@ -732,6 +1056,7 @@ router.post('/ar-billing/save', async (req, res) => {
       const customer = await client.query('SELECT code FROM ar_customer WHERE code = $1 LIMIT 1', [custCode]);
       if (!customer.rows[0]) throw new Error('customer not found');
       await assertCreatePermission(client, requestUserCode);
+      const profile = await loadArBillingProfile(client.query.bind(client), requestUserCode);
 
       const doc = await resolveDocumentNo(client, {
         screenCode: SCREEN_CODE,
@@ -750,37 +1075,45 @@ router.post('/ar-billing/save', async (req, res) => {
         const key = `${row.billing_no}|${row.bill_type}`;
         detailTotals.set(key, roundMoney((detailTotals.get(key) || 0) + row.sum_pay_money));
       }
+      if (profile.arBillInform) {
+        const duplicated = await client.query(
+          `SELECT DISTINCT billing_no
+           FROM ap_ar_trans_detail
+           WHERE billing_no = ANY($1::text[])
+             AND trans_flag = $2
+             AND COALESCE(last_status,0) = 0
+           LIMIT 10`,
+          [invoiceNos, TRANS_FLAG],
+        );
+        if (duplicated.rows.length) {
+          throw new Error(`billing document already used: ${duplicated.rows.map((row) => row.billing_no).join(', ')}`);
+        }
+      }
+
+      const invoiceParams = [];
+      const invoiceIdx = {
+        custCode: invoiceParams.push(custCode),
+        docDate: invoiceParams.push(docDate),
+        saleFlags: invoiceParams.push(SALE_FLAGS),
+        debitFlags: invoiceParams.push(DEBIT_NOTE_FLAGS),
+        creditFlags: invoiceParams.push(CREDIT_NOTE_FLAGS),
+        docNos: invoiceParams.push(invoiceNos),
+      };
+      const invoiceCte = withArBalanceParams(
+        arBalanceDocCte({
+          includeDocNos: true,
+        }),
+        invoiceIdx,
+      );
       const invoiceResult = await client.query(
-        `WITH base AS (
-           SELECT t.doc_no, t.doc_date, t.trans_flag AS bill_type, COALESCE(t.doc_ref,'') AS ref_doc_no,
-                  t.doc_ref_date AS ref_doc_date,
-                  CASE WHEN ${creditNoteSql('t')}
-                       THEN -1 * COALESCE(t.total_amount,0)
-                       ELSE COALESCE(t.total_amount,0)
-                  END AS sum_debt_amount,
-                  COALESCE(t.due_date, t.doc_date) AS due_date, COALESCE(t.vat_rate,0) AS vat_rate
-           FROM ic_trans t
-           WHERE t.cust_code = $1
-             AND t.doc_no = ANY($2::text[])
-             AND t.trans_flag = ANY($3::int[])
-             AND COALESCE(t.last_status,0) = 0
-             AND COALESCE(t.is_cancel,0) = 0
-             AND COALESCE(t.is_doc_copy,0) <> 1
-             AND t.doc_date <= $4::date
-         )
-         SELECT b.*,
-                ROUND(
-                  b.sum_debt_amount
-                  - COALESCE((
-                    SELECT SUM(d.sum_pay_money)
-                    FROM ap_ar_trans_detail d
-                    WHERE d.billing_no = b.doc_no
-                      AND d.bill_type = b.bill_type
-                      AND d.trans_flag IN (235,239)
-                      AND COALESCE(d.last_status,0) = 0
-                ),0), 2) AS balance_ref
-         FROM base b`,
-        [custCode, invoiceNos, BILLABLE_FLAGS, docDate],
+        `${invoiceCte}
+         SELECT doc_no, doc_date, bill_type, bill_type_name, ref_doc_no, ref_doc_date,
+                tax_doc_no, tax_doc_date, due_date, credit_day,
+                sum_debt_amount, ROUND(balance_ref,2) AS balance_ref,
+                sum_debt_amount_2, ROUND(balance_ref_2,2) AS balance_ref_2,
+                currency_code, exchange_rate, vat_rate, branch_code, ship_code, source_remark
+         FROM ar_balance_docs`,
+        invoiceParams,
       );
 
       const invoiceMap = new Map(invoiceResult.rows.map((row) => [`${row.doc_no}|${row.bill_type}`, row]));
@@ -819,25 +1152,38 @@ router.post('/ar-billing/save', async (req, res) => {
         const invoice = invoiceMap.get(`${row.billing_no}|${row.bill_type}`);
         const debtAmount = roundMoney(invoice.sum_debt_amount);
         const balanceRef = roundMoney(invoice.balance_ref);
+        const debtAmount2 = roundMoney(invoice.sum_debt_amount_2 ?? debtAmount);
+        const balanceRef2 = roundMoney(invoice.balance_ref_2 ?? balanceRef);
+        const sumPayMoney2 = balanceRef && balanceRef2
+          ? roundMoney(row.sum_pay_money * (balanceRef2 / balanceRef))
+          : roundMoney(row.sum_pay_money);
         const billingDate = dateToISO(invoice.doc_date, docDate);
         const invoiceDueDate = dateToISO(invoice.due_date, billingDate);
         const refDocDate = nullableDateToISO(invoice.ref_doc_date);
+        const billTaxDate = nullableDateToISO(invoice.tax_doc_date);
         await client.query(
           `INSERT INTO ap_ar_trans_detail (
             trans_type, trans_flag, doc_date, doc_no, doc_ref, billing_no,
             billing_date, due_date, sum_debt_amount, sum_debt_balance, remark,
             line_number, bill_type, sum_pay_money, balance_ref, vat_rate,
             final_amount, last_status, calc_flag, ref_doc_no, ref_doc_date,
+            bill_tax_no, bill_tax_date, sum_debt_amount_2, currency_code,
+            exchange_rate, exchange_rate_old, balance_ref_2, sum_pay_money_2,
             cust_code, creator_code, create_datetime
           ) VALUES (
             $1,$2,$3::date,$4,'',$5,$6::date,$7::date,$8,0,$9,
-            $10,$11,$12,$13,$14,0,0,0,$15,$16::date,'',$17,NOW()
+            $10,$11,$12,$13,$14,0,0,0,$15,$16::date,
+            $17,$18::date,$19,$20,$21,$22,$23,$24,'',$25,NOW()
           )`,
           [
             TRANS_TYPE, TRANS_FLAG, docDate, savedDocNo, row.billing_no,
             billingDate, invoiceDueDate, debtAmount, row.remark, i, row.bill_type,
             row.sum_pay_money, balanceRef, roundMoney(invoice.vat_rate),
-            safeText(invoice.ref_doc_no), refDocDate, creatorCode,
+            safeText(invoice.ref_doc_no), refDocDate,
+            safeText(invoice.tax_doc_no), billTaxDate, debtAmount2,
+            safeText(invoice.currency_code), roundMoney(invoice.exchange_rate || 1),
+            roundMoney(invoice.exchange_rate || 1), balanceRef2, sumPayMoney2,
+            creatorCode,
           ],
         );
       }
@@ -860,7 +1206,7 @@ router.post('/ar-billing/save', async (req, res) => {
     if (isPermissionError(ex)) {
       return res.status(403).json({ success: false, msg: ex.message });
     }
-    if (ex.message && ex.message.includes('exceeds balance')) {
+    if (ex.message && (ex.message.includes('exceeds balance') || ex.message.includes('already used'))) {
       return res.status(400).json({ success: false, msg: ex.message });
     }
     return res.status(500).json({ success: false, msg: ex.message });
