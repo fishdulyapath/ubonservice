@@ -1,13 +1,14 @@
 const express = require('express');
 const router = express.Router();
 const { withTransaction, query } = require('../db');
-const { resolveDocumentNo } = require('../utils/docFormat');
+const { buildDocPattern, resolveDocumentNo } = require('../utils/docFormat');
 const { getEmployeePermissions } = require('../utils/permissions');
 const { renderSalePrintHtml } = require('../utils/salePrintRenderer');
 
 const TRANS_TYPE = 2;
 const TRANS_FLAG = 260;
 const SCREEN_CODE = 'EPO';
+const WHT_SCREEN_CODE = 'RWHT';
 const OTHER_EXPENSE_VIEW_PERMISSION = 'cash.other_expense.view';
 const OTHER_EXPENSE_CREATE_PERMISSION = 'cash.other_expense.create';
 const CASH_INQUIRY_TYPES = new Set([1, 2]);
@@ -104,6 +105,73 @@ function inquiryTypeLabel(value) {
 
 function vatTypeLabel(value) {
   return VAT_TYPE_LABELS[toInt(value, 0)] || VAT_TYPE_LABELS[0];
+}
+
+async function resolveWhtDocFormat(client, docFormatCode = '') {
+  const code = safeText(docFormatCode);
+  const sql = `
+    SELECT code, COALESCE(name_1,'') AS name_1,
+           COALESCE(NULLIF(format,''), NULLIF(tax_format,''), '@YYMM####') AS format,
+           COALESCE(doc_running,'') AS doc_running
+    FROM erp_doc_format
+    WHERE UPPER(screen_code) = $1
+      ${code ? 'AND code = $2' : ''}
+    ORDER BY code
+    LIMIT 1`;
+  const result = await client.query(sql, code ? [WHT_SCREEN_CODE, code] : [WHT_SCREEN_CODE]);
+  const row = result.rows[0];
+  if (!row) throw new Error(code ? `wht doc format not found: ${code}` : 'wht doc format not found');
+  return row;
+}
+
+function nextRunningFromPattern(pattern, lastDocNo = '', startRunningDoc = '') {
+  const firstHash = pattern.indexOf('#');
+  if (firstHash < 0) return pattern;
+  let runLen = 0;
+  while (firstHash + runLen < pattern.length && pattern[firstHash + runLen] === '#') runLen += 1;
+  const patternWithoutNumber = pattern.slice(0, firstHash) + pattern.slice(firstHash + runLen);
+  const readRunning = (docNo) => {
+    const text = safeText(docNo);
+    if (text.length < firstHash + runLen) return 0;
+    const withoutNumber = text.slice(0, firstHash) + text.slice(firstHash + runLen);
+    if (withoutNumber !== patternWithoutNumber) return 0;
+    const runText = text.slice(firstHash, firstHash + runLen);
+    return /^\d+$/.test(runText) ? parseInt(runText, 10) : 0;
+  };
+  const current = Math.max(readRunning(lastDocNo), readRunning(startRunningDoc));
+  const next = current + 1;
+  const max = Math.pow(10, runLen) - 1;
+  if (next > max) throw new Error('wht tax doc running overflow');
+  return pattern.slice(0, firstHash) + String(next).padStart(runLen, '0') + pattern.slice(firstHash + runLen);
+}
+
+async function resolveWhtTaxDocNo(client, { docFormatCode = '', docDate = '' } = {}) {
+  const docFormat = await resolveWhtDocFormat(client, docFormatCode);
+  const pattern = buildDocPattern(docFormat.format, docFormat.code, normalizeDate(docDate));
+  await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`gl_wht_list|tax_doc_no|${docFormat.code}|${pattern}`]);
+  const likePattern = pattern.replace(/#/g, '_');
+  const result = await client.query(
+    `SELECT tax_doc_no
+     FROM gl_wht_list
+     WHERE COALESCE(tax_doc_no,'') LIKE $1
+     ORDER BY tax_doc_no DESC
+     LIMIT 1`,
+    [likePattern],
+  );
+  const taxDocNo = nextRunningFromPattern(pattern, result.rows[0]?.tax_doc_no, docFormat.doc_running);
+  return {
+    tax_doc_no: taxDocNo,
+    doc_format_code: docFormat.code,
+    doc_format_name: docFormat.name_1 || '',
+    doc_format: docFormat.format || '',
+  };
+}
+
+async function whtTaxDocNoExists(client, taxDocNo) {
+  const text = safeText(taxDocNo);
+  if (!text) return false;
+  const result = await client.query('SELECT 1 FROM gl_wht_list WHERE tax_doc_no = $1 LIMIT 1', [text]);
+  return result.rowCount > 0;
 }
 
 function normalizePayload(body) {
@@ -227,7 +295,7 @@ function normalizeWhtList(value, docDate) {
         : roundMoney(row.tax_value);
       return {
         line_number: index,
-        income_type: safeText(row?.income_type) || 'ค่าบริการ',
+        income_type: safeText(row?.income_type) || 'หัก 3 %',
         tax_rate: taxRate,
         amount,
         tax_value: calculatedTaxValue,
@@ -512,6 +580,25 @@ router.get('/other-expense/doc-formats', async (req, res) => {
   }
 });
 
+router.get('/other-expense/wht-doc-formats', async (req, res) => {
+  try {
+    await assertLookupPermission(query, req.query.user_code || req.query.emp_code);
+    const result = await query(
+      `SELECT code, COALESCE(name_1,'') AS name_1,
+              COALESCE(NULLIF(format,''), NULLIF(tax_format,''), '@YYMM####') AS format,
+              COALESCE(doc_running,'') AS doc_running
+       FROM erp_doc_format
+       WHERE UPPER(screen_code) = $1
+       ORDER BY code`,
+      [WHT_SCREEN_CODE],
+    );
+    return res.json({ success: true, data: result.rows });
+  } catch (ex) {
+    if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
+    return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
 router.get('/other-expense/next-doc-no', async (req, res) => {
   const { doc_format_code = '', doc_date = '' } = req.query;
   try {
@@ -521,6 +608,23 @@ router.get('/other-expense/next-doc-no', async (req, res) => {
         screenCode: SCREEN_CODE,
         docFormatCode: doc_format_code,
         transFlag: TRANS_FLAG,
+        docDate: normalizeDate(doc_date),
+      })
+    );
+    return res.json({ success: true, ...result });
+  } catch (ex) {
+    if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
+    return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
+router.get('/other-expense/next-wht-doc-no', async (req, res) => {
+  const { doc_format_code = '', doc_date = '' } = req.query;
+  try {
+    await assertLookupPermission(query, req.query.user_code || req.query.emp_code);
+    const result = await withTransaction((client) =>
+      resolveWhtTaxDocNo(client, {
+        docFormatCode: doc_format_code,
         docDate: normalizeDate(doc_date),
       })
     );
@@ -630,7 +734,10 @@ router.get('/other-expense/list', async (req, res) => {
               COALESCE(t.total_value,0) AS total_value, COALESCE(t.total_before_vat,0) AS total_before_vat,
               COALESCE(t.total_vat_value,0) AS total_vat_value, COALESCE(t.total_amount,0) AS total_amount,
               COALESCE(w.wht_tax_value, COALESCE(cb.total_tax_at_pay,0), 0) AS total_wht_value,
-              COALESCE(cb.total_net_amount, COALESCE(t.total_amount,0) - COALESCE(w.wht_tax_value,0)) AS total_net_payable,
+              CASE
+                WHEN cb.doc_no IS NOT NULL THEN COALESCE(cb.total_net_amount,0) - COALESCE(cb.total_tax_at_pay, COALESCE(w.wht_tax_value,0), 0)
+                ELSE COALESCE(t.total_amount,0) - COALESCE(w.wht_tax_value,0)
+              END AS total_net_payable,
               COALESCE(t.last_status,0) AS last_status, COALESCE(t.used_status,0) AS used_status,
               COALESCE(t.remark,'') AS remark, COALESCE(d.detail_count,0) AS detail_count,
               COALESCE(d.expense_names,'') AS expense_names, COALESCE(w.wht_count,0) AS wht_count
@@ -845,9 +952,10 @@ router.post('/other-expense/save', async (req, res) => {
     if (payments.tiger_amount > 0 && (!payments.tiger_voucher_num || !payments.tiger_voucher_code)) {
       return res.status(400).json({ success: false, msg: 'tiger voucher number and code are required' });
     }
-    const totalNetAmount = roundMoney(totals.total_amount + cardCharge - whtAmount);
+    const totalNetAmount = roundMoney(totals.total_amount + cardCharge);
     const totalPaid = roundMoney(cashAmount + transferAmount + cardAmount + chequeAmount);
-    const diff = roundMoney(totalPaid - totalNetAmount);
+    const totalAmountPay = roundMoney(totalPaid + whtAmount);
+    const diff = roundMoney(totalAmountPay - totalNetAmount);
     if (isCashExpense) {
       if (diff < -0.01) return res.status(400).json({ success: false, msg: 'payment total is less than document total' });
       if (diff > 0.01) return res.status(400).json({ success: false, msg: 'payment total is greater than document total' });
@@ -858,6 +966,7 @@ router.post('/other-expense/save', async (req, res) => {
     let savedDocNo = '';
     let savedDocFormatCode = '';
     let savedFormCode = '';
+    let savedWhtTaxDocNo = '';
 
     await withTransaction(async (client) => {
       await assertCreatePermission(client, requestUserCode);
@@ -963,7 +1072,16 @@ router.post('/other-expense/save', async (req, res) => {
 
       if (whtList.length > 0) {
         const supplierRow = supplier.rows[0];
-        const whtTaxDocNo = safeText(payload.wht_tax_doc_no) || savedDocNo;
+        const whtDocFormatCode = safeText(payload.wht_doc_format_code || payload.wht_tax_doc_format_code || payload.wht_format_code);
+        let whtTaxDocNo = safeText(payload.wht_tax_doc_no);
+        if (whtDocFormatCode || !whtTaxDocNo || await whtTaxDocNoExists(client, whtTaxDocNo)) {
+          const resolvedWhtDoc = await resolveWhtTaxDocNo(client, {
+            docFormatCode: whtDocFormatCode,
+            docDate: whtList[0].due_date || docDate,
+          });
+          whtTaxDocNo = resolvedWhtDoc.tax_doc_no;
+        }
+        savedWhtTaxDocNo = whtTaxDocNo;
         await client.query(
           `INSERT INTO gl_wht_list (
             doc_date, doc_no, amount, tax_value, status, trans_flag, due_date,
@@ -989,12 +1107,12 @@ router.post('/other-expense/save', async (req, res) => {
               status, trans_flag, due_date, line_number, cust_code, sum_amount,
               tax_doc_no
             ) VALUES (
-              $1::date,$2,$3,$4,$5,$6,0,$7,$8::date,$9,$10,$11,$12
+              NULL,$1,$2,$3,$4,$5,0,$6,$7::date,$8,$9,0,$10
             )`,
             [
-              docDate, savedDocNo, row.income_type, row.tax_rate, row.amount,
-              row.tax_value, TRANS_FLAG, row.due_date || docDate, i,
-              supplierCode, roundMoney(row.amount - row.tax_value), rowTaxDocNo,
+              savedDocNo, row.income_type, row.tax_rate, row.amount,
+              row.tax_value, TRANS_FLAG, row.due_date || docDate, i + 1,
+              supplierCode, rowTaxDocNo,
             ],
           );
         }
@@ -1017,7 +1135,7 @@ router.post('/other-expense/save', async (req, res) => {
             TRANS_TYPE, TRANS_FLAG, savedDocNo, docDate, docTime, supplierCode,
             savedDocFormatCode, totals.total_amount, totalNetAmount,
             cashAmount, chequeAmount, transferAmount, cardAmount,
-            totalPaid, cardCharge, whtAmount, cbRemark, cbDescription,
+            totalAmountPay, cardCharge, whtAmount, cbRemark, cbDescription,
           ],
         );
 
@@ -1081,6 +1199,7 @@ router.post('/other-expense/save', async (req, res) => {
       inquiry_type: inquiryType,
       inquiry_type_name: inquiryTypeLabel(inquiryType),
       wht_amount: whtAmount,
+      wht_tax_doc_no: savedWhtTaxDocNo,
       msg: 'success',
     });
   } catch (ex) {
