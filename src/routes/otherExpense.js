@@ -917,6 +917,7 @@ router.post('/other-expense/save', async (req, res) => {
     const docDate = normalizeDate(payload.doc_date);
     const docTime = safeText(payload.doc_time) || currentTimeText();
     const supplierCode = safeText(payload.cust_code || payload.supplier_code);
+    const whtSupplierCode = safeText(payload.wht_supplier_code || payload.wht_cust_code || payload.withholding_supplier_code || supplierCode);
     const requestUserCode = safeText(payload.emp_code) || safeText(payload.creator_code);
     const creatorCode = requestUserCode || 'smlstaff';
     const details = normalizeDetails(payload.details);
@@ -982,6 +983,22 @@ router.post('/other-expense/save', async (req, res) => {
         [supplierCode],
       );
       if (!supplier.rows[0]) throw new Error('supplier not found');
+
+      let whtSupplierRow = supplier.rows[0];
+      if (whtList.length > 0 && whtSupplierCode !== supplierCode) {
+        const whtSupplier = await client.query(
+          `SELECT s.code, COALESCE(s.name_1,'') AS name_1, COALESCE(s.address,'') AS address,
+                  COALESCE(s.ap_status,0) AS ap_status,
+                  COALESCE((SELECT d.tax_id FROM ap_supplier_detail d WHERE d.ap_code = s.code LIMIT 1),'') AS tax_id,
+                  COALESCE((SELECT d.card_id FROM ap_supplier_detail d WHERE d.ap_code = s.code LIMIT 1),'') AS card_id
+           FROM ap_supplier s
+           WHERE s.code = $1
+           LIMIT 1`,
+          [whtSupplierCode],
+        );
+        if (!whtSupplier.rows[0]) throw new Error('wht supplier not found');
+        whtSupplierRow = whtSupplier.rows[0];
+      }
 
       const expenseCodes = [...new Set(details.map((row) => row.expense_code))];
       const expenseResult = await client.query(
@@ -1071,7 +1088,6 @@ router.post('/other-expense/save', async (req, res) => {
       }
 
       if (whtList.length > 0) {
-        const supplierRow = supplier.rows[0];
         const whtDocFormatCode = safeText(payload.wht_doc_format_code || payload.wht_tax_doc_format_code || payload.wht_format_code);
         let whtTaxDocNo = safeText(payload.wht_tax_doc_no);
         if (whtDocFormatCode || !whtTaxDocNo || await whtTaxDocNoExists(client, whtTaxDocNo)) {
@@ -1092,9 +1108,9 @@ router.post('/other-expense/save', async (req, res) => {
           )`,
           [
             docDate, savedDocNo, whtBaseAmount, whtAmount, TRANS_FLAG,
-            whtList[0].due_date || docDate, supplierCode, supplierRow.card_id || '',
-            supplierRow.tax_id || '', toInt(supplierRow.ap_status, 0),
-            supplierRow.name_1 || '', whtTaxDocNo, supplierRow.address || '',
+            whtList[0].due_date || docDate, whtSupplierRow.code, whtSupplierRow.card_id || '',
+            whtSupplierRow.tax_id || '', toInt(whtSupplierRow.ap_status, 0),
+            whtSupplierRow.name_1 || '', whtTaxDocNo, whtSupplierRow.address || '',
           ],
         );
 
@@ -1112,7 +1128,7 @@ router.post('/other-expense/save', async (req, res) => {
             [
               savedDocNo, row.income_type, row.tax_rate, row.amount,
               row.tax_value, TRANS_FLAG, row.due_date || docDate, i + 1,
-              supplierCode, rowTaxDocNo,
+              whtSupplierRow.code, rowTaxDocNo,
             ],
           );
         }
