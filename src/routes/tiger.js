@@ -13,6 +13,13 @@ function tigerMockEnabled() {
 // อ่าน config Tiger จาก erp_option แทน env
 // ถ้าไม่มีข้อมูล → ระบบ Tiger ปิด → endpoint ทุกตัวจะคืน 503
 async function loadTigerConfig() {
+  const envEndPoint = (process.env.TIGER_API_URL || process.env.TIGER_END_POINT || '').trim();
+  const envAppId = (process.env.TIGER_APP_ID || '').trim();
+  const envApiKey = (process.env.TIGER_API_KEY || process.env.TIGER_X_API_KEY || '').trim();
+  if (envEndPoint && envAppId && envApiKey) {
+    return { appId: envAppId, endPoint: envEndPoint, apiKey: envApiKey };
+  }
+
   const result = await query(
     'SELECT tiger_app_id, tiger_end_point, tiger_x_api_key FROM erp_option LIMIT 1',
   );
@@ -54,6 +61,131 @@ async function callTiger(path, { method = 'GET', body } = {}) {
     throw err;
   }
   return data;
+}
+
+function loadTigerVoucherConfig() {
+  const username = String(process.env.TIGER_VOUCHER_USERNAME || '').trim();
+  const password = String(process.env.TIGER_VOUCHER_PASSWORD || '').trim();
+  const mobile = String(process.env.TIGER_VOUCHER_MOBILE || '').trim();
+  const baseUrl = String(process.env.TIGER_VOUCHER_BASE_URL || 'https://api.tigercashbox.com/api').trim().replace(/\/$/, '');
+  if (!username || !password || !baseUrl) return null;
+  return { username, password, mobile, baseUrl };
+}
+
+function todayVoucherDate() {
+  const now = new Date();
+  return `${String(now.getDate()).padStart(2, '0')}-${String(now.getMonth() + 1).padStart(2, '0')}-${now.getFullYear()}`;
+}
+
+function currentVoucherTime() {
+  const now = new Date();
+  return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+}
+
+async function tigerVoucherRequest(url, { method = 'POST', token = '', form } = {}) {
+  const headers = { Accept: 'application/json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(url, { method, headers, body: form });
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!res.ok) {
+    const msg = data?.message || data?.msg || `Tiger voucher API ${res.status}`;
+    const err = new Error(msg);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+function findValueDeep(value, names) {
+  if (!value || typeof value !== 'object') return '';
+  const queue = [value];
+  const keys = new Set(names.map((name) => name.toLowerCase()));
+  while (queue.length) {
+    const current = queue.shift();
+    if (!current || typeof current !== 'object') continue;
+    for (const [key, nested] of Object.entries(current)) {
+      if (keys.has(key.toLowerCase()) && nested !== undefined && nested !== null && String(nested).trim() !== '') {
+        return String(nested).trim();
+      }
+      if (nested && typeof nested === 'object') queue.push(nested);
+    }
+  }
+  return '';
+}
+
+function normalizeTigerVoucherResponse(data) {
+  const voucherNum = findValueDeep(data, ['voucher_num', 'voucher_number', 'voucherNo', 'voucher_no', 'number']);
+  const voucherCode = findValueDeep(data, ['voucher_code', 'voucherCode', 'code', 'pin', 'password']);
+  return {
+    raw: data,
+    voucher_num: voucherNum,
+    voucher_code: voucherCode,
+  };
+}
+
+function tigerVoucherPayload(payload = {}) {
+  const amount = Number(payload.amount || 0);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    const err = new Error('amount must be greater than zero');
+    err.status = 400;
+    throw err;
+  }
+  return {
+    amount: String(Math.round(amount * 100) / 100),
+    number_of_voucher: String(payload.number_of_voucher || 1),
+    start_date: String(payload.start_date || todayVoucherDate()),
+    expire_date: String(payload.expire_date || payload.start_date || todayVoucherDate()),
+    note: String(payload.note || ''),
+    ref_num: String(payload.ref_num || ''),
+    category: String(payload.category || 'other-expense'),
+    authen_required: String(payload.authen_required ?? 1),
+    start_time: String(payload.start_time || currentVoucherTime()),
+    expire_time: String(payload.expire_time || '23:59:59'),
+    approved_required: String(payload.approved_required ?? 1),
+  };
+}
+
+async function createTigerVoucher(payload = {}) {
+  const cfg = loadTigerVoucherConfig();
+  if (!cfg) {
+    const err = new Error('Tiger voucher not configured');
+    err.status = 503;
+    throw err;
+  }
+
+  const loginForm = new FormData();
+  loginForm.append('username', cfg.username);
+  loginForm.append('password', cfg.password);
+  if (cfg.mobile) loginForm.append('mobile', cfg.mobile);
+  const loginData = await tigerVoucherRequest(`${cfg.baseUrl}/tigerpay/login`, { form: loginForm });
+  const token = loginData?.success?.token
+    || loginData?.token
+    || loginData?.data?.token
+    || loginData?.access_token
+    || loginData?.data?.access_token;
+  if (!token) {
+    const err = new Error('Tiger voucher login did not return token');
+    err.status = 502;
+    err.data = loginData;
+    throw err;
+  }
+
+  const voucherPayload = tigerVoucherPayload(payload);
+  const form = new FormData();
+  Object.entries(voucherPayload).forEach(([key, value]) => form.append(key, value));
+
+  const data = await tigerVoucherRequest(`${cfg.baseUrl}/voucher/create`, { token, form });
+  const normalized = normalizeTigerVoucherResponse(data);
+  if (!normalized.voucher_num && !normalized.voucher_code) {
+    const err = new Error('Tiger voucher response did not include voucher number or code');
+    err.status = 502;
+    err.data = data;
+    throw err;
+  }
+  return normalized;
 }
 
 function tigerStatusFromResponse(data) {
@@ -189,7 +321,15 @@ async function markTigerPendingPaid(client, row, { amount: amountInput, source =
 router.get('/tiger/config', async (req, res) => {
   try {
     const cfg = await loadTigerConfig();
-    return res.json({ status: 'success', data: { enabled: !!cfg, mock_enabled: tigerMockEnabled() } });
+    const voucherCfg = loadTigerVoucherConfig();
+    return res.json({
+      status: 'success',
+      data: {
+        enabled: !!cfg,
+        voucher_enabled: !!voucherCfg,
+        mock_enabled: tigerMockEnabled(),
+      },
+    });
   } catch (ex) {
     console.error('tiger config error:', ex.message);
     return res.status(500).json({ status: 'error', message: ex.message });
@@ -229,6 +369,33 @@ router.put('/tiger/orders/:id', async (req, res) => {
   } catch (ex) {
     console.error('tiger cancel error:', ex.message);
     return res.status(ex.status || 500).json({ status: 'error', message: ex.message });
+  }
+});
+
+// POST /service/v1/tiger/vouchers
+router.post('/tiger/vouchers', async (req, res) => {
+  try {
+    if (tigerMockEnabled()) {
+      const amount = Number(req.body?.amount || 0);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({ success: false, msg: 'amount must be greater than zero' });
+      }
+      const suffix = String(Date.now()).slice(-8);
+      return res.json({
+        success: true,
+        data: {
+          voucher_num: `MOCK-V${suffix}`,
+          voucher_code: `MOCK-C${suffix}`,
+          amount,
+          mock: true,
+        },
+      });
+    }
+    const data = await createTigerVoucher(req.body || {});
+    return res.json({ success: true, data });
+  } catch (ex) {
+    console.error('tiger voucher create error:', ex.message);
+    return res.status(ex.status || 500).json({ success: false, msg: ex.message, data: ex.data });
   }
 });
 

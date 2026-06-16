@@ -5,7 +5,7 @@ const { resolveDocumentNo } = require('../utils/docFormat');
 const { getEmployeePermissions } = require('../utils/permissions');
 const { renderSalePrintHtml } = require('../utils/salePrintRenderer');
 
-const TRANS_TYPE = 1;
+const TRANS_TYPE = 2;
 const TRANS_FLAG = 260;
 const SCREEN_CODE = 'EPO';
 const OTHER_EXPENSE_VIEW_PERMISSION = 'cash.other_expense.view';
@@ -166,8 +166,25 @@ function normalizePayments(value) {
   const transfer = Array.isArray(source.transfer) ? source.transfer : [];
   const card = Array.isArray(source.card) ? source.card : [];
   const cheque = Array.isArray(source.cheque) ? source.cheque : [];
+  const tiger = Array.isArray(source.tiger) ? source.tiger : [];
+  const tigerRows = tiger
+    .map((row) => ({
+      voucher_num: safeText(row?.voucher_num || row?.voucher_number),
+      voucher_code: safeText(row?.voucher_code || row?.code),
+      ref_num: safeText(row?.ref_num),
+      amount: roundMoney(row?.amount ?? row?.pay_amount),
+    }))
+    .filter((row) => row.amount > 0);
+  const tigerAmount = source.tiger_amount === undefined
+    ? roundMoney(tigerRows.reduce((sum, row) => sum + row.amount, 0))
+    : roundMoney(source.tiger_amount);
+  const firstTiger = tigerRows[0] || {};
   return {
     cash_amount: roundMoney(source.cash_amount),
+    tiger_amount: tigerAmount,
+    tiger: tigerRows,
+    tiger_voucher_num: safeText(source.tiger_voucher_num || firstTiger.voucher_num),
+    tiger_voucher_code: safeText(source.tiger_voucher_code || firstTiger.voucher_code),
     transfer: transfer
       .map((row) => ({
         pass_book_code: safeText(row?.pass_book_code || row?.trans_number),
@@ -820,12 +837,16 @@ router.post('/other-expense/save', async (req, res) => {
     const cardAmount = roundMoney(payments.card.reduce((sum, row) => sum + row.amount + row.charge, 0));
     const cardCharge = roundMoney(payments.card.reduce((sum, row) => sum + row.charge, 0));
     const chequeAmount = roundMoney(payments.cheque.reduce((sum, row) => sum + row.amount, 0));
+    const cashAmount = roundMoney(payments.cash_amount + payments.tiger_amount);
     const whtAmount = roundMoney(whtList.reduce((sum, row) => sum + row.tax_value, 0));
     const whtBaseAmount = roundMoney(whtList.reduce((sum, row) => sum + row.amount, 0));
     if (whtBaseAmount > totals.total_before_vat + 0.01) return res.status(400).json({ success: false, msg: 'withholding tax base is greater than document base' });
     if (whtAmount > totals.total_amount + 0.01) return res.status(400).json({ success: false, msg: 'withholding tax is greater than document total' });
+    if (payments.tiger_amount > 0 && (!payments.tiger_voucher_num || !payments.tiger_voucher_code)) {
+      return res.status(400).json({ success: false, msg: 'tiger voucher number and code are required' });
+    }
     const totalNetAmount = roundMoney(totals.total_amount + cardCharge - whtAmount);
-    const totalPaid = roundMoney(payments.cash_amount + transferAmount + cardAmount + chequeAmount);
+    const totalPaid = roundMoney(cashAmount + transferAmount + cardAmount + chequeAmount);
     const diff = roundMoney(totalPaid - totalNetAmount);
     if (isCashExpense) {
       if (diff < -0.01) return res.status(400).json({ success: false, msg: 'payment total is less than document total' });
@@ -880,18 +901,18 @@ router.post('/other-expense/save', async (req, res) => {
           trans_type, trans_flag, doc_date, doc_time, doc_no, doc_ref, doc_ref_date,
           inquiry_type, vat_type, cust_code, branch_code, vat_rate, tax_doc_no,
           tax_doc_date, total_value, total_before_vat, total_vat_value,
-          total_except_vat, total_amount, remark, doc_format_code, last_status,
-          used_status, creator_code, create_datetime, is_cancel
+          total_except_vat, total_after_vat, total_amount, remark, doc_format_code,
+          credit_date, last_status, used_status, creator_code, create_datetime, is_cancel
         ) VALUES (
           $1,$2,$3::date,$4,$5,'',NULL,$6,$7,$8,$9,$10,$11,$12::date,
-          $13,$14,$15,$16,$17,$18,$19,0,0,$20,NOW(),0
+          $13,$14,$15,$16,$17,$18,$19,$20,$21::date,0,0,$22,NOW(),0
         )`,
         [
           TRANS_TYPE, TRANS_FLAG, docDate, docTime, savedDocNo,
           inquiryType, vatType, supplierCode, branchCode, vatRate, taxDocNo || savedDocNo,
           taxDocDate || docDate, totals.total_value, totals.total_before_vat,
           totals.total_vat_value, totals.total_except_vat, totals.total_amount,
-          remark, savedDocFormatCode, creatorCode,
+          totals.total_amount, remark, savedDocFormatCode, docDate, creatorCode,
         ],
       );
 
@@ -903,17 +924,17 @@ router.post('/other-expense/save', async (req, res) => {
         await client.query(
           `INSERT INTO ic_trans_detail (
             trans_type, trans_flag, doc_date, doc_time, doc_no, cust_code,
-            item_code, item_name, qty, price, sum_amount, sum_amount_exclude_vat,
-            total_vat_value, branch_code, remark, line_number, calc_flag,
+            inquiry_type, item_code, item_name, qty, price, sum_amount,
+            sum_amount_exclude_vat, branch_code, remark, line_number, calc_flag,
+            ref_row, is_get_price, doc_date_calc, doc_time_calc,
             last_status, creator_code, create_datetime
           ) VALUES (
-            $1,$2,$3::date,$4,$5,$6,$7,$8,1,$9,$10,$11,$12,$13,$14,$15,1,0,$16,NOW()
+            $1,$2,$3::date,$4,$5,$6,$7,$8,$9,0,0,$10,$11,$12,$13,$14,1,-1,1,$3::date,$4,0,$15,NOW()
           )`,
           [
             TRANS_TYPE, TRANS_FLAG, docDate, docTime, savedDocNo, supplierCode,
-            row.expense_code, itemName, row.amount, row.amount,
-            rowVat.total_value, rowVat.total_vat_value, row.branch_code || branchCode,
-            row.remark, i, creatorCode,
+            inquiryType, row.expense_code, itemName, row.amount,
+            rowVat.total_value, row.branch_code || branchCode, row.remark, i, creatorCode,
           ],
         );
       }
@@ -980,21 +1001,23 @@ router.post('/other-expense/save', async (req, res) => {
       }
 
       if (isCashExpense) {
+        const cbRemark = payments.tiger_amount > 0 ? payments.tiger_voucher_num : remark;
+        const cbDescription = payments.tiger_amount > 0 ? payments.tiger_voucher_code : '';
         await client.query(
           `INSERT INTO cb_trans (
             trans_type, trans_flag, doc_no, doc_date, doc_time, ap_ar_code,
             pay_type, doc_format_code, total_amount, total_net_amount, cash_amount,
             chq_amount, tranfer_amount, card_amount, total_amount_pay,
             total_credit_charge, total_tax_at_pay, pay_cash_amount, money_change,
-            remark
+            remark, description
           ) VALUES (
-            $1,$2,$3,$4::date,$5,$6,1,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$10,0,$17
+            $1,$2,$3,$4::date,$5,$6,2,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,0,0,$17,$18
           )`,
           [
             TRANS_TYPE, TRANS_FLAG, savedDocNo, docDate, docTime, supplierCode,
             savedDocFormatCode, totals.total_amount, totalNetAmount,
-            payments.cash_amount, chequeAmount, transferAmount, cardAmount,
-            totalPaid, cardCharge, whtAmount, remark,
+            cashAmount, chequeAmount, transferAmount, cardAmount,
+            totalPaid, cardCharge, whtAmount, cbRemark, cbDescription,
           ],
         );
 
