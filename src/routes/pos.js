@@ -1284,10 +1284,15 @@ router.get('/getDocSaleHistory', async (req, res) => {
     }
 
     if (search.trim()) {
-      const like = `%${search.trim()}%`;
-      params.push(like, like, like);
-      const n = params.length;
-      whereExtra = ` AND (ict.doc_no ILIKE $${n - 2} OR ict.cust_code ILIKE $${n - 1} OR ar.name_1 ILIKE $${n})`;
+      // แบ่งคำค้นหาเป็น token แต่ละคำ (whitespace) — ทุกคำต้องตรงในบางฟิลด์ (AND)
+      // ทำให้ค้น "อู่ ช่าง เขม" เจอลูกค้าที่ชื่อมีทั้งสามคำ แม้ไม่ได้อยู่ติดกัน
+      const tokens = search.trim().split(/\s+/).filter(Boolean).slice(0, 20);
+      const clauses = tokens.map((tok) => {
+        params.push(`%${tok}%`);
+        const idx = params.length;
+        return `(ict.doc_no ILIKE $${idx} OR ict.cust_code ILIKE $${idx} OR ar.name_1 ILIKE $${idx})`;
+      });
+      whereExtra = clauses.length ? ` AND (${clauses.join(' AND ')})` : '';
     } else if (from_date.trim() && to_date.trim()) {
       params.push(from_date.trim(), to_date.trim());
       whereExtra = ` AND ict.doc_date BETWEEN $${params.length - 1}::date AND $${params.length}::date`;
@@ -1334,14 +1339,16 @@ router.get('/getProductSaleHistory', async (req, res) => {
     let whereExtra = '';
 
     if (search.trim()) {
-      const like = `%${search.trim()}%`;
-      params.push(like, like, like, like, like);
-      const n = params.length;
-      whereExtra = `
-        AND (
-          t.doc_no ILIKE $${n - 4}
-          OR t.cust_code ILIKE $${n - 3}
-          OR ar.name_1 ILIKE $${n - 2}
+      // แบ่งคำค้นหาเป็น token แต่ละคำ (whitespace) — ทุกคำต้องตรงในบางฟิลด์ (AND)
+      // ทำให้ค้น "กระจกหน้า ดี 03" เจอสินค้าที่ชื่อมีทั้งสามคำ แม้ไม่ได้อยู่ติดกัน
+      const tokens = search.trim().split(/\s+/).filter(Boolean).slice(0, 20);
+      const clauses = tokens.map((tok) => {
+        params.push(`%${tok}%`);
+        const idx = params.length;
+        return `(
+          t.doc_no ILIKE $${idx}
+          OR t.cust_code ILIKE $${idx}
+          OR ar.name_1 ILIKE $${idx}
           OR EXISTS (
             SELECT 1
             FROM ic_trans_detail d
@@ -1350,9 +1357,11 @@ router.get('/getProductSaleHistory', async (req, res) => {
               AND d.trans_flag = t.trans_flag
               AND (COALESCE(d.set_ref_line,'') = '' OR COALESCE(d.item_type,0) = 3)
               AND ${activeProductCondition('item_detail')}
-              AND (d.item_code ILIKE $${n - 1} OR d.item_name ILIKE $${n})
+              AND (d.item_code ILIKE $${idx} OR d.item_name ILIKE $${idx})
           )
         )`;
+      });
+      whereExtra = clauses.length ? ` AND (${clauses.join(' AND ')})` : '';
     } else if (from_date.trim() && to_date.trim()) {
       params.push(from_date.trim(), to_date.trim());
       whereExtra = ` AND t.doc_date BETWEEN $${params.length - 1}::date AND $${params.length}::date`;
