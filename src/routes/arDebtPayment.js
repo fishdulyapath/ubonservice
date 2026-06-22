@@ -581,7 +581,13 @@ async function loadPaymentRowsForPrint(docNo) {
         COALESCE(cash_amount,0) AS cash_amount,
         COALESCE(petty_cash_amount,0) AS petty_cash_amount,
         COALESCE(discount_amount,0) AS discount_amount,
-        COALESCE(total_income_amount,0) AS total_income_amount
+        COALESCE(total_income_amount,0) AS total_income_amount,
+        COALESCE(total_amount,0) AS total_amount,
+        COALESCE(total_net_amount,0) AS total_net_amount,
+        COALESCE(total_amount_pay,0) AS total_amount_pay,
+        COALESCE(tranfer_amount,0) AS tranfer_amount,
+        COALESCE(chq_amount,0) AS chq_amount,
+        COALESCE(card_amount,0) AS card_amount
      FROM cb_trans
      WHERE doc_no = $1 AND trans_flag = $2
      LIMIT 1`,
@@ -615,7 +621,25 @@ async function loadPaymentRowsForPrint(docNo) {
     addPayment(paymentLabel(row), roundMoney(toNumber(row.amount) + toNumber(row.charge)));
   }
 
-  return labels.length ? [{ trans_number: labels.join('\n'), amount: amounts.join('\n') }] : [];
+  const summary = cbRes.rows[0] || {};
+  return [{
+    trans_number: labels.join('\n'),
+    amount: amounts.join('\n'),
+    total_amount: summary.total_amount,
+    total_net_amount: summary.total_net_amount,
+    total_amount_pay: summary.total_amount_pay,
+    discount_amount: summary.discount_amount,
+    total_discount: summary.total_net_amount,
+    cash_amount: summary.cash_amount,
+    cash: summary.cash_amount,
+    tranfer_amount: summary.tranfer_amount,
+    transfer_amount: summary.tranfer_amount,
+    tranfer: summary.tranfer_amount,
+    transfer: summary.tranfer_amount,
+    chq_amount: summary.chq_amount,
+    chq: summary.chq_amount,
+    card_amount: summary.card_amount,
+  }];
 }
 
 async function loadArDebtPaymentPrintDocument(docNo) {
@@ -626,6 +650,15 @@ async function loadArDebtPaymentPrintDocument(docNo) {
           COALESCE(t.total_net_value,0) AS total_amount,
           COALESCE(t.total_net_value,0) AS total_net_amount,
           COALESCE(t.total_net_value,0) AS total_after_discount,
+          COALESCE(cb.total_amount_pay, t.total_net_value, 0) AS total_amount_pay,
+          COALESCE(cb.cash_amount,0) AS cash_amount,
+          COALESCE(cb.tranfer_amount,0) AS tranfer_amount,
+          COALESCE(cb.tranfer_amount,0) AS transfer_amount,
+          COALESCE(cb.chq_amount,0) AS chq_amount,
+          COALESCE(cb.card_amount,0) AS card_amount,
+          COALESCE(cb.total_income_amount,0) AS total_income_amount,
+          COALESCE(cb.petty_cash_amount,0) AS petty_cash_amount,
+          COALESCE(cb.discount_amount,0) AS discount_amount,
           COALESCE(df.name_1,'') AS doc_format_name,
           COALESCE(df.form_code,'') AS form_code,
           COALESCE(ar.name_1,'') AS name_1,
@@ -636,6 +669,7 @@ async function loadArDebtPaymentPrintDocument(docNo) {
           COALESCE(u.name_1, t.creator_code, '') AS sale_name
        FROM ap_ar_trans t
        LEFT JOIN erp_doc_format df ON df.screen_code = $2 AND df.code = t.doc_format_code
+        LEFT JOIN cb_trans cb ON cb.doc_no = t.doc_no AND cb.trans_flag = t.trans_flag
        LEFT JOIN ar_customer ar ON ar.code = t.cust_code
        LEFT JOIN ar_customer_detail cd ON cd.ar_code = t.cust_code
        LEFT JOIN erp_user u ON UPPER(u.code) = UPPER(t.creator_code)
@@ -647,18 +681,24 @@ async function loadArDebtPaymentPrintDocument(docNo) {
     query(
       `SELECT
           line_number,
-          doc_ref AS item_code,
-          CONCAT_WS(' / ', NULLIF(doc_ref,''), NULLIF(billing_no,'')) AS item_name,
+          doc_ref,
+          billing_no,
+          COALESCE(NULLIF(billing_no,''), NULLIF(doc_ref,''), '') AS item_code,
+          COALESCE(NULLIF(billing_no,''), NULLIF(doc_ref,''), '') AS item_name,
           bill_type_name,
           '' AS unit_code,
           '' AS unit_name,
           1 AS qty,
+          sum_pay_money,
           sum_pay_money AS price,
           sum_pay_money AS sum_amount,
           sum_pay_money AS amount,
+          sum_pay_money AS total_amount,
+          sum_pay_money AS total_net_amount,
           sum_pay_money AS sum_debt_amount,
           balance_ref,
           billing_date,
+          billing_date AS doc_date,
           due_date,
           remark
        FROM (
@@ -691,6 +731,13 @@ async function loadArDebtPaymentPrintDocument(docNo) {
     company,
     details: detailsRes.rows || [],
     payments,
+    campaigns: [{
+      cash: header.cash_amount,
+      chq: header.chq_amount,
+      tranfer: header.tranfer_amount,
+      transfer: header.tranfer_amount,
+      card: header.card_amount,
+    }],
   };
 }
 
@@ -1598,6 +1645,9 @@ router.get('/ar-debt-payment/print/render', async (req, res) => {
       formRows,
       data: printData,
       autoPrint: String(auto_print) !== '0',
+      coordinateScale: 0.72,
+      csharpTextAlignment: true,
+      pageSize: 'Letter',
     });
     res.setHeader('Cache-Control', 'no-store');
     return res.status(200).type('html').send(html);

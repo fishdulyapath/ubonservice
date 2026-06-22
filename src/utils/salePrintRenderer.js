@@ -35,11 +35,17 @@ const SUMMARY_FIELD_NAMES = new Set([
 
 const PAYMENT_CHECK_FIELD_NAMES = new Set([
   'cash_amount',
+  'cash',
   'tranfer_amount',
+  'tranfer',
   'transfer_amount',
+  'transfer',
   'chq_amount',
+  'chq',
   'cheque_amount',
+  'cheque',
   'card_amount',
+  'card',
 ]);
 
 function asBuffer(value) {
@@ -478,7 +484,7 @@ function extractPlaceholders(text) {
 
 function formatObjectValue(rawValue, fieldName, format) {
   if (isDateField(fieldName)) return formatThaiDate(rawValue);
-  if (String(format || '').toLowerCase().startsWith('text:')) return formatThaiBaht(rawValue);
+  if (String(format || '').toLowerCase().replace(/[()]/g, '').startsWith('text:')) return formatThaiBaht(rawValue);
   if (isNumericFormat(format)) return formatNumberValue(rawValue, format);
   if (!format && /^qty$/i.test(String(fieldName || '')) && rawValue !== null && rawValue !== undefined && rawValue !== '') {
     return formatNumberValue(rawValue, '#,##0.00');
@@ -1078,8 +1084,10 @@ function renderSalePrintHtml({
   coordinateScale = COORD_SCALE,
   csharpTextAlignment = false,
   advancePaymentMethodChecks = false,
+  pageSize = 'A4',
 }) {
   const rendererOptions = { coordinateScale, csharpTextAlignment, advancePaymentMethodChecks };
+  const printPageSize = /^[a-z0-9 ._-]+$/i.test(String(pageSize || '')) ? String(pageSize || 'A4') : 'A4';
   const forms = formRows.map((form) => parseFormDesign(form, rendererOptions)).filter((form) => form.pages.length);
   const pages = forms.map((form) => renderForm(form, data)).join('\n');
 
@@ -1090,7 +1098,7 @@ function renderSalePrintHtml({
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(data.header?.doc_no || 'sale-print')}</title>
   <style>
-    @page { size: A4 portrait; margin: 0; }
+    @page { size: ${printPageSize} portrait; margin: 0; }
     * { box-sizing: border-box; }
     html, body { margin: 0; min-height: 100%; background: #e5e7eb; }
     body { font-family: ${DEFAULT_FONT}; color: #000; }
