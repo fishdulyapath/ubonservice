@@ -1018,6 +1018,8 @@ router.get('/ar-billing/print/render', async (req, res) => {
       formRows,
       data: printData,
       autoPrint: String(auto_print) !== '0',
+      coordinateScale: 0.72,
+      csharpTextAlignment: true,
     });
     res.setHeader('Cache-Control', 'no-store');
     return res.status(200).type('html').send(html);

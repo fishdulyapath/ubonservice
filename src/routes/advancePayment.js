@@ -274,6 +274,17 @@ async function loadAdvancePaymentPrintDocument(docNo) {
   const [headerRes, companyRes, detailsRes, payments] = await Promise.all([
     query(
       `SELECT t.*,
+          COALESCE(NULLIF(cb.total_net_amount,0), t.total_amount, 0) AS total_net_amount,
+          COALESCE(cb.total_amount_pay,0) AS total_amount_pay,
+          COALESCE(cb.cash_amount,0) AS cash_amount,
+          COALESCE(cb.tranfer_amount,0) AS tranfer_amount,
+          COALESCE(cb.tranfer_amount,0) AS transfer_amount,
+          COALESCE(cb.chq_amount,0) AS chq_amount,
+          COALESCE(cb.card_amount,0) AS card_amount,
+          COALESCE(cb.total_credit_charge,0) AS total_credit_charge,
+          COALESCE(cb.total_income_amount,0) AS total_income_amount,
+          COALESCE(cb.petty_cash_amount,0) AS petty_cash_amount,
+          COALESCE(cb.discount_amount,0) AS discount_amount,
           COALESCE(df.name_1,'') AS doc_format_name,
           COALESCE(df.form_code,'') AS form_code,
           COALESCE(ar.name_1,'') AS name_1,
@@ -283,6 +294,7 @@ async function loadAdvancePaymentPrintDocument(docNo) {
           COALESCE(cd.tax_id,'') AS tax_id,
           COALESCE(u.name_1, t.creator_code, '') AS sale_name
        FROM ic_trans t
+       LEFT JOIN cb_trans cb ON cb.doc_no = t.doc_no AND cb.trans_flag = t.trans_flag
        LEFT JOIN erp_doc_format df ON df.screen_code = $2 AND df.code = t.doc_format_code
        LEFT JOIN ar_customer ar ON ar.code = t.cust_code
        LEFT JOIN ar_customer_detail cd ON cd.ar_code = t.cust_code
@@ -616,6 +628,9 @@ router.get('/advance-payment/print/render', async (req, res) => {
       formRows,
       data: printData,
       autoPrint: String(auto_print) !== '0',
+      coordinateScale: 0.72,
+      csharpTextAlignment: true,
+      advancePaymentMethodChecks: true,
     });
     res.setHeader('Cache-Control', 'no-store');
     return res.status(200).type('html').send(html);

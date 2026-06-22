@@ -33,6 +33,15 @@ const SUMMARY_FIELD_NAMES = new Set([
   'money_change',
 ]);
 
+const PAYMENT_CHECK_FIELD_NAMES = new Set([
+  'cash_amount',
+  'tranfer_amount',
+  'transfer_amount',
+  'chq_amount',
+  'cheque_amount',
+  'card_amount',
+]);
+
 function asBuffer(value) {
   if (!value) return Buffer.alloc(0);
   if (Buffer.isBuffer(value)) return value;
@@ -132,8 +141,13 @@ function toNumber(value, fallback = 0) {
   return Number.isFinite(num) ? num : fallback;
 }
 
-function toPt(value, fallback = 0) {
-  return toNumber(value, fallback) * COORD_SCALE;
+function coordScale(options = {}) {
+  const scale = Number(options.coordinateScale);
+  return Number.isFinite(scale) && scale > 0 ? scale : COORD_SCALE;
+}
+
+function toPt(value, fallback = 0, options = {}) {
+  return toNumber(value, fallback) * coordScale(options);
 }
 
 function getStyleColor(value, fallback = '#000000') {
@@ -175,47 +189,48 @@ function parsePageSetup(pageBlock) {
   };
 }
 
-function parseFont(objectBlock, fallback = null) {
+function parseFont(objectBlock, fallback = null, options = {}) {
   const fontBlock = blockValues(objectBlock, 'Font')[0] || '';
   const fontName = firstTag(fontBlock, 'Name') || firstTag(objectBlock, 'FontName');
   const fontSize = firstTag(fontBlock, 'Size') || firstTag(objectBlock, 'FontSize');
   const fontStyle = (firstTag(fontBlock, 'Style') || firstTag(objectBlock, 'FontStyle')).toLowerCase();
+  const scale = coordScale(options);
   return {
     name: fontName || fallback?.name || DEFAULT_FONT,
-    size: fontSize === '' ? (fallback?.size || Math.max(6, 10 * COORD_SCALE)) : Math.max(6, toNumber(fontSize, 10) * COORD_SCALE),
+    size: fontSize === '' ? (fallback?.size || Math.max(6, 10 * scale)) : Math.max(6, toNumber(fontSize, 10) * scale),
     bold: fontStyle ? fontStyle.includes('bold') : !!fallback?.bold,
     italic: fontStyle ? fontStyle.includes('italic') : !!fallback?.italic,
     underline: fontStyle ? fontStyle.includes('underline') : !!fallback?.underline,
   };
 }
 
-function parseBorder(objectBlock) {
+function parseBorder(objectBlock, options = {}) {
   const lineBlock = blockValues(objectBlock, 'LineColor')[0] || '';
   const lineColor = firstTag(lineBlock, 'ColorCode') || firstTag(objectBlock, 'LineColor');
   return {
     color: getStyleColor(lineColor, '#000000'),
-    width: Math.max(0.25, toNumber(firstTag(objectBlock, 'PenWidth'), 1) * COORD_SCALE),
+    width: Math.max(0.25, toNumber(firstTag(objectBlock, 'PenWidth'), 1) * coordScale(options)),
   };
 }
 
-function parsePadding(objectBlock) {
+function parsePadding(objectBlock, options = {}) {
   const paddingBlock = blockValues(objectBlock, 'Padding')[0] || '';
   const all = toNumber(firstTag(paddingBlock, 'All'), 0);
   const fallback = all >= 0 ? all : 0;
   return {
-    top: toPt(firstTag(paddingBlock, 'Top'), fallback),
-    right: toPt(firstTag(paddingBlock, 'Right'), fallback),
-    bottom: toPt(firstTag(paddingBlock, 'Bottom'), fallback),
-    left: toPt(firstTag(paddingBlock, 'Left'), fallback),
+    top: toPt(firstTag(paddingBlock, 'Top'), fallback, options),
+    right: toPt(firstTag(paddingBlock, 'Right'), fallback, options),
+    bottom: toPt(firstTag(paddingBlock, 'Bottom'), fallback, options),
+    left: toPt(firstTag(paddingBlock, 'Left'), fallback, options),
   };
 }
 
-function parseTableColumn(columnBlock, objectBlock) {
+function parseTableColumn(columnBlock, objectBlock, options = {}) {
   const displayFormat = firstTag(columnBlock, 'DisplayFormat');
   const fieldFormat = firstTag(columnBlock, 'FieldFormat');
   const text = firstTag(columnBlock, 'Text');
   const headerText = firstTag(columnBlock, 'HeaderText');
-  const tableFont = parseFont(objectBlock);
+  const tableFont = parseFont(objectBlock, null, options);
   return {
     queryRule: firstAnyTag(columnBlock, ['QueryRule', 'queryRule']) || firstAnyTag(objectBlock, ['QueryRule', 'queryRule']),
     fieldName: firstTag(columnBlock, 'FieldName') || extractPlaceholder(text),
@@ -227,25 +242,25 @@ function parseTableColumn(columnBlock, objectBlock) {
     width: toNumber(firstTag(columnBlock, 'ColumnsWidth'), 1),
     align: firstTag(columnBlock, 'ContentAlign'),
     headerAlign: firstTag(columnBlock, 'ContentHeaderAlign') || firstTag(columnBlock, 'HeaderAlignment') || firstTag(columnBlock, 'ContentAlign'),
-    font: parseFont(columnBlock, tableFont),
-    padding: parsePadding(columnBlock),
+    font: parseFont(columnBlock, tableFont, options),
+    padding: parsePadding(columnBlock, options),
   };
 }
 
-function parseTableColumns(objectBlock) {
+function parseTableColumns(objectBlock, options = {}) {
   const columns = [];
   for (const tableColumnsBlock of blockValues(objectBlock, 'TableColumns')) {
     const nestedColumns = blockValues(tableColumnsBlock, 'Column');
     if (nestedColumns.length) {
-      columns.push(...nestedColumns.map((columnBlock) => parseTableColumn(columnBlock, objectBlock)));
+      columns.push(...nestedColumns.map((columnBlock) => parseTableColumn(columnBlock, objectBlock, options)));
     } else if (tableColumnsBlock.trim()) {
-      columns.push(parseTableColumn(tableColumnsBlock, objectBlock));
+      columns.push(parseTableColumn(tableColumnsBlock, objectBlock, options));
     }
   }
   return columns;
 }
 
-function parseDrawObject(objectBlock) {
+function parseDrawObject(objectBlock, options = {}) {
   const objectOnlyBlock = objectBlock.split('<TableColumns>')[0] || objectBlock;
   const toolType = firstTag(objectOnlyBlock, 'ToolType');
   const roundedBlock = blockValues(objectOnlyBlock, 'RoundedRectangleRadius')[0] || '';
@@ -260,40 +275,41 @@ function parseDrawObject(objectBlock) {
     text: firstTag(objectOnlyBlock, 'Text'),
     replaceText: firstTag(objectOnlyBlock, 'ReplaceText'),
     align: firstTag(objectOnlyBlock, 'ContentAlign'),
-    left: toPt(lastTag(objectOnlyBlock, 'Left')),
-    top: toPt(lastTag(objectOnlyBlock, 'Top')),
-    width: toPt(lastTag(objectOnlyBlock, 'Width')),
-    height: toPt(lastTag(objectOnlyBlock, 'Height')),
-    startX: toPt(firstTag(objectOnlyBlock, 'StartPointX')),
-    startY: toPt(firstTag(objectOnlyBlock, 'StartPointY')),
-    stopX: toPt(firstTag(objectOnlyBlock, 'StopPointX')),
-    stopY: toPt(firstTag(objectOnlyBlock, 'StopPointY')),
-    lineSpace: toPt(firstTag(objectOnlyBlock, 'LineSpace')),
+    left: toPt(lastTag(objectOnlyBlock, 'Left'), 0, options),
+    top: toPt(lastTag(objectOnlyBlock, 'Top'), 0, options),
+    width: toPt(lastTag(objectOnlyBlock, 'Width'), 0, options),
+    height: toPt(lastTag(objectOnlyBlock, 'Height'), 0, options),
+    startX: toPt(firstTag(objectOnlyBlock, 'StartPointX'), 0, options),
+    startY: toPt(firstTag(objectOnlyBlock, 'StartPointY'), 0, options),
+    stopX: toPt(firstTag(objectOnlyBlock, 'StopPointX'), 0, options),
+    stopY: toPt(firstTag(objectOnlyBlock, 'StopPointY'), 0, options),
+    lineSpace: toPt(firstTag(objectOnlyBlock, 'LineSpace'), 0, options),
     rowPerPage: toNumber(firstTag(objectOnlyBlock, 'RowPerPage'), 0),
-    radius: toPt(firstTag(roundedBlock, 'All')),
+    radius: toPt(firstTag(roundedBlock, 'All'), 0, options),
     image: firstTag(objectOnlyBlock, 'Image'),
     pictureMode: firstTag(objectOnlyBlock, 'PictureBoxSizeMode'),
     barcodeType: firstTag(objectOnlyBlock, 'BarcodeType'),
-    font: parseFont(objectOnlyBlock),
-    border: parseBorder(objectOnlyBlock),
+    font: parseFont(objectOnlyBlock, null, options),
+    border: parseBorder(objectOnlyBlock, options),
     color: getStyleColor(firstTag(objectOnlyBlock, 'Color'), '#000000'),
     backgroundColor: getStyleColor(firstTag(objectOnlyBlock, 'BackgroundColor'), 'transparent'),
-    padding: parsePadding(objectOnlyBlock),
-    columns: parseTableColumns(objectBlock),
+    padding: parsePadding(objectOnlyBlock, options),
+    columns: parseTableColumns(objectBlock, options),
   };
 }
 
-function parseFormDesign(form) {
+function parseFormDesign(form, options = {}) {
   const xml = decodeZipEntry(form.formdesigntext);
   const pages = blockValues(xml, 'PageList').map((pageBlock) => ({
     setup: parsePageSetup(pageBlock),
-    objects: blockValues(pageBlock, 'DrawObjectList').map(parseDrawObject),
+    objects: blockValues(pageBlock, 'DrawObjectList').map((objectBlock) => parseDrawObject(objectBlock, options)),
   }));
 
   return {
     formcode: form.formcode,
     formname: form.formname || form.formcode,
     pages,
+    options,
   };
 }
 
@@ -470,6 +486,20 @@ function formatObjectValue(rawValue, fieldName, format) {
   return rawValue ?? '';
 }
 
+function isPaymentCheckField(fieldName) {
+  return PAYMENT_CHECK_FIELD_NAMES.has(normalizeKey(fieldName));
+}
+
+function isPaymentCheckboxObject(object, fieldName, pageMeta) {
+  if (!useCSharpTextAlignment(pageMeta)) return false;
+  if (!isPaymentCheckField(fieldName)) return false;
+  return object.width <= 28 && object.height <= 28;
+}
+
+function paymentCheckText(object, rawValue) {
+  return toNumber(rawValue) > 0 ? (object.replaceText || 'X') : '';
+}
+
 function resolveText(object, data, row, pageMeta) {
   let text = object.text || '';
 
@@ -484,6 +514,7 @@ function resolveText(object, data, row, pageMeta) {
   if (!placeholder) return text.replace(/\\n/g, '\n');
 
   const rawValue = getRawValue(placeholder, object.queryRule, data, row);
+  if (isPaymentCheckboxObject(object, placeholder, pageMeta)) return paymentCheckText(object, rawValue);
   const value = formatObjectValue(rawValue, placeholder, object.fieldFormat || object.displayFormat);
   if (object.replaceText) return object.replaceText.includes('@') ? object.replaceText.replace(/@/g, value) : object.replaceText;
   if (/^\s*\[[^\]]+\]\s*,\s*[A-Za-z0-9_]+\s*$/.test(text)) return value;
@@ -509,6 +540,43 @@ function cssVAlign(align) {
   if (text.includes('top')) return 'flex-start';
   if (text.includes('bottom')) return 'flex-end';
   if (text.includes('middle') || text.includes('center')) return 'center';
+  return 'flex-start';
+}
+
+function useCSharpTextAlignment(pageMeta) {
+  return !!pageMeta?.formOptions?.csharpTextAlignment;
+}
+
+function primaryObjectFieldName(object) {
+  return object.fieldName || extractPlaceholder(object.text) || extractPlaceholder(object.replaceText);
+}
+
+function isNumericFieldName(fieldName) {
+  return /(^|_)(qty|quantity|price|amount|discount|sum|total|vat|value|rate|balance|credit|cash|card|change|cost|fee|charge)(_|$)/i.test(String(fieldName || ''));
+}
+
+function isNumericObjectField(object) {
+  const fieldName = primaryObjectFieldName(object);
+  const format = object.fieldFormat || object.displayFormat;
+  return isNumericFormat(format) || SUMMARY_FIELD_NAMES.has(normalizeKey(fieldName)) || isNumericFieldName(fieldName);
+}
+
+function textObjectAlign(object, pageMeta) {
+  if (!useCSharpTextAlignment(pageMeta)) return cssAlign(object.align);
+  if (isPageCounterObject(object)) return cssAlign(object.align);
+  if (!objectFieldNames(object).length) return 'left';
+  return isNumericObjectField(object) ? 'right' : 'left';
+}
+
+function tableBodyAlign(column, pageMeta) {
+  if (!useCSharpTextAlignment(pageMeta)) return cssAlign(column.align);
+  return isNumericTableColumn(column) ? 'right' : 'left';
+}
+
+function tableBodyJustify(column, pageMeta) {
+  const align = tableBodyAlign(column, pageMeta);
+  if (align === 'right') return 'flex-end';
+  if (align === 'center') return 'center';
   return 'flex-start';
 }
 
@@ -582,6 +650,7 @@ function renderTextObject(object, data, row, pageMeta) {
   const value = resolveText(object, data, row, pageMeta);
   const htmlValue = escapeHtmlWithPrintGaps(value, object.width);
   const verticalAlign = cssVAlign(object.align);
+  const textAlign = textObjectAlign(object, pageMeta);
   const contentNudge = verticalAlign === 'center' ? 'transform:translateY(-0.08em)' : verticalAlign === 'flex-end' ? 'transform:translateY(-0.12em)' : '';
   const contentStyle = [
     'display:block',
@@ -597,7 +666,7 @@ function renderTextObject(object, data, row, pageMeta) {
     `width:${object.width.toFixed(2)}pt`,
     `height:${object.height.toFixed(2)}pt`,
     fontCss(object.font),
-    `text-align:${cssAlign(object.align)}`,
+    `text-align:${textAlign}`,
     `align-items:${verticalAlign}`,
     `color:${object.color || '#000000'}`,
     object.backgroundColor && object.backgroundColor !== 'transparent' ? `background:${object.backgroundColor}` : '',
@@ -685,7 +754,7 @@ function resolveTableCell(column, data, row) {
   return formatObjectValue(raw, column.fieldName, column.format);
 }
 
-function renderTableObject(object, data, pageRows) {
+function renderTableObject(object, data, pageRows, pageMeta) {
   const rowHeight = Math.max(14, object.lineSpace || 18);
   const columns = tableColumns(object);
   const visibleHeader = columns.some((column) => tableHeaderText(column));
@@ -717,7 +786,9 @@ function renderTableObject(object, data, pageRows) {
       const value = resolveTableCell(column, data, row);
       const padding = `${column.padding.top.toFixed(2)}pt ${column.padding.right.toFixed(2)}pt ${column.padding.bottom.toFixed(2)}pt ${column.padding.left.toFixed(2)}pt`;
       const text = htmlWithLineBreaks(value);
-      return `<div class="${tableCellClass(column)}" data-min-font-pt="${TABLE_MIN_FONT_PT}" style="left:${column.left.toFixed(2)}pt;top:${top.toFixed(2)}pt;width:${column.width.toFixed(2)}pt;height:${height.toFixed(2)}pt;text-align:${cssAlign(column.align)};justify-content:${cssJustify(column.align)};align-items:${cssVAlign(column.align)};${fontCss(column.font, tableBodyFontOptions(column))};line-height:${TABLE_BODY_LINE_HEIGHT};padding:${padding};"><span class="sml-table-cell-content">${text}</span></div>`;
+      const textAlign = tableBodyAlign(column, pageMeta);
+      const justifyContent = tableBodyJustify(column, pageMeta);
+      return `<div class="${tableCellClass(column)}" data-min-font-pt="${TABLE_MIN_FONT_PT}" style="left:${column.left.toFixed(2)}pt;top:${top.toFixed(2)}pt;width:${column.width.toFixed(2)}pt;height:${height.toFixed(2)}pt;text-align:${textAlign};justify-content:${justifyContent};align-items:${cssVAlign(column.align)};${fontCss(column.font, tableBodyFontOptions(column))};line-height:${TABLE_BODY_LINE_HEIGHT};padding:${padding};"><span class="sml-table-cell-content">${text}</span></div>`;
     }).join('');
     return cells;
   }).join('');
@@ -748,7 +819,7 @@ function renderObject(object, data, pageRows, pageMeta) {
     case 'ImageField':
       return renderImageFieldObject(object, data, pageMeta);
     case 'Table':
-      return renderTableObject(object, data, isDetailTable(object) ? pageRows : normalizeRows(rowsForQueryRule(tableQueryRule(object), data)));
+      return renderTableObject(object, data, isDetailTable(object) ? pageRows : normalizeRows(rowsForQueryRule(tableQueryRule(object), data)), pageMeta);
     default:
       return '';
   }
@@ -916,10 +987,34 @@ function isCopyPageSet(form) {
   return form.pages.length > 1 && form.pages.some(pageHasCopyLabel);
 }
 
+function paymentAmount(data, fieldName) {
+  return toNumber(data.header?.[fieldName]) || toNumber(data.header?.[fieldName === 'tranfer_amount' ? 'transfer_amount' : fieldName]);
+}
+
+function renderAdvancePaymentMethodChecks(data, pageMeta) {
+  if (!pageMeta.formOptions?.advancePaymentMethodChecks || !pageMeta.isSummaryPage) return '';
+
+  const checks = [
+    { field: 'chq_amount', left: 48.00, top: 660.20 },
+    { field: 'tranfer_amount', left: 127.44, top: 660.20 },
+    { field: 'cash_amount', left: 220.80, top: 660.20 },
+  ];
+
+  return checks
+    .filter((check) => paymentAmount(data, check.field) > 0)
+    .map((check) => `<div class="sml-payment-check" style="left:${check.left.toFixed(2)}pt;top:${check.top.toFixed(2)}pt;">X</div>`)
+    .join('\n');
+}
+
+function renderCompatibilityOverlays(data, pageMeta) {
+  return renderAdvancePaymentMethodChecks(data, pageMeta);
+}
+
 function renderPage(form, page, data, pageRows, pageMeta) {
   const pageRenderMeta = {
     ...pageMeta,
     page,
+    formOptions: form.options || {},
     summaryStartTop: summaryStartTop(page),
   };
   const content = page.objects
@@ -927,10 +1022,12 @@ function renderPage(form, page, data, pageRows, pageMeta) {
     .map((object) => renderObject(object, data, pageRows, pageRenderMeta))
     .filter(Boolean)
     .join('\n');
+  const overlays = renderCompatibilityOverlays(data, pageRenderMeta);
 
   return `
     <section class="sml-page" data-form="${escapeHtml(form.formcode)}" style="width:${page.setup.width.toFixed(2)}pt;height:${page.setup.height.toFixed(2)}pt;">
       ${content}
+      ${overlays}
     </section>`;
 }
 
@@ -974,8 +1071,16 @@ function renderForm(form, data) {
   }).join('\n')).join('\n');
 }
 
-function renderSalePrintHtml({ formRows, data, autoPrint = true }) {
-  const forms = formRows.map(parseFormDesign).filter((form) => form.pages.length);
+function renderSalePrintHtml({
+  formRows,
+  data,
+  autoPrint = true,
+  coordinateScale = COORD_SCALE,
+  csharpTextAlignment = false,
+  advancePaymentMethodChecks = false,
+}) {
+  const rendererOptions = { coordinateScale, csharpTextAlignment, advancePaymentMethodChecks };
+  const forms = formRows.map((form) => parseFormDesign(form, rendererOptions)).filter((form) => form.pages.length);
   const pages = forms.map((form) => renderForm(form, data)).join('\n');
 
   return `<!doctype html>
@@ -1013,6 +1118,18 @@ function renderSalePrintHtml({ formRows, data, autoPrint = true }) {
       z-index: 2;
       color: #000;
       overflow: hidden;
+    }
+    .sml-payment-check {
+      position: absolute;
+      z-index: 6;
+      width: 12pt;
+      height: 12pt;
+      color: #000;
+      font-family: Arial, sans-serif;
+      font-size: 8.6pt;
+      line-height: 1;
+      text-align: center;
+      font-weight: 400;
     }
     .sml-table-border,
     .sml-table-line {
