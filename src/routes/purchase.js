@@ -77,8 +77,24 @@ function calcAfterDiscount(discountWord, amount, point = 2, qty = 1, alwaysRound
   return roundPoint(result, point);
 }
 
+function isPermiumItem(item) {
+  // ic_trans_detail.is_permium (1=ของแถม) — สะกดตาม schema ต้นฉบับ
+  return String(item?.is_permium ?? item?.is_premium ?? '0') === '1';
+}
+
 function calcPULineAmounts(item) {
   const qty = toNumber(item?.qty);
+  // ของแถม (is_permium=1): บังคับ price/sum_amount = 0 ฝั่ง server กัน client ส่งผิด
+  if (isPermiumItem(item)) {
+    return {
+      qty,
+      price: 0,
+      discount: '',
+      discount_amount: 0,
+      sum_amount: 0,
+      is_permium: 1,
+    };
+  }
   const price = toNumber(item?.price);
   const gross = roundMoney(price * qty);
   const discountWord = String(item?.discount || '').trim()
@@ -90,6 +106,7 @@ function calcPULineAmounts(item) {
     discount: discountWord,
     discount_amount: roundMoney(gross - net),
     sum_amount: Math.max(0, roundMoney(net)),
+    is_permium: 0,
   };
 }
 
@@ -102,6 +119,7 @@ function normalizePUItem(item) {
     discount: amounts.discount,
     discount_amount: amounts.discount_amount,
     sum_amount: amounts.sum_amount,
+    is_permium: amounts.is_permium,
   };
 }
 
@@ -268,6 +286,7 @@ async function validatePUSavePlan(client, body) {
   const missingWhRows = [];
   const missingShelfRows = [];
   const recalculatedAmountRows = [];
+  const freeItemRows = [];
   for (const [index, item] of items.entries()) {
     const code = String(item?.item_code || '').trim();
     const unit = String(item?.unit_code || '').trim();
@@ -284,12 +303,16 @@ async function validatePUSavePlan(client, body) {
     }
     if (!safeText(item?.wh_code)) missingWhRows.push(index + 1);
     if (!safeText(item?.shelf_code)) missingShelfRows.push(index + 1);
+    if (expected.is_permium === 1) freeItemRows.push(index + 1);
   }
   if (invalidItems.length) errors.push(`invalid item rows: ${invalidItems.map((row) => row.line).join(', ')}`);
   if (missingWhRows.length) errors.push(`item wh_code is required: ${missingWhRows.join(', ')}`);
   if (missingShelfRows.length) errors.push(`item shelf_code is required: ${missingShelfRows.join(', ')}`);
   if (recalculatedAmountRows.length) {
     warnings.push(`line discount_amount/sum_amount will be recalculated on save: ${recalculatedAmountRows.join(', ')}`);
+  }
+  if (freeItemRows.length) {
+    warnings.push(`free/bonus items (is_permium=1): lines ${freeItemRows.join(', ')}`);
   }
 
   let resolvedDoc = null;
@@ -612,19 +635,25 @@ async function insertPUDetails(client, docNo, fields) {
   for (let index = 0; index < fields.items.length; index += 1) {
     const item = fields.items[index] || {};
     const sumAmount = toNumber(item.sum_amount);
+    const isPermium = isPermiumItem(item) ? 1 : 0;
+    // sum_of_cost = มูลค่ารับเข้าจริง (price × qty), average_cost = ราคาต่อหน่วย (price)
+    // ตรงกับ C# — ของแถม (is_permium=1) ทั้งคู่เป็น 0
+    const unitPrice = toNumber(item.price);
+    const lineQty = toNumber(item.qty);
+    const sumOfCost = isPermium ? 0 : roundMoney(unitPrice * lineQty);
     await client.query(
       `INSERT INTO ic_trans_detail
         (trans_type, trans_flag, doc_date, doc_time, doc_no, cust_code, inquiry_type,
          item_code, item_name, unit_code, qty, price, sum_amount, line_number,
          stand_value, divide_value, ratio, calc_flag, doc_date_calc, doc_time_calc,
          creator_code, sum_of_cost, ref_doc_no, ref_row, wh_code, shelf_code, vat_type,
-         average_cost, tax_type, discount, discount_amount, barcode)
+         average_cost, tax_type, discount, discount_amount, barcode, is_permium)
        VALUES
         (1, $1, $2::date, $3, $4, $5, $6,
          $7, $8, $9, $10, $11, $12, $13,
          $14, $15, $16, 1, $2::date, $3,
          $17, $18, $19, -1, $20, $21, $22,
-         $23, $24, $25, $26, $27)`,
+         $23, $24, $25, $26, $27, $28)`,
       [
         PU_TRANS_FLAG,
         fields.docDate,
@@ -635,24 +664,25 @@ async function insertPUDetails(client, docNo, fields) {
         safeText(item.item_code),
         String(item.item_name ?? ''),
         safeText(item.unit_code),
-        toNumber(item.qty),
-        toNumber(item.price),
+        lineQty,
+        unitPrice,
         sumAmount,
         index,
         toNumber(item.stand_value, 1),
         toNumber(item.divide_value, 1),
         0,
         fields.creatorCode,
-        sumAmount,
+        sumOfCost,
         safeText(item.doc_no || item.ref_doc_no),
         safeText(item.wh_code),
         safeText(item.shelf_code),
         fields.taxType,
-        sumAmount,
+        isPermium ? 0 : unitPrice,
         toInt(item.tax_type, 0),
         String(item.discount ?? ''),
         toNumber(item.discount_amount),
         safeText(item.barcode),
+        isPermium,
       ],
     );
   }
@@ -856,7 +886,7 @@ async function savePUDocTransaction(client, payload, mode) {
         (1, $1, $2::date, $3, $4, $5, $6,
          $7, $8, $9, $10, $11, $12,
          $13, $14, $15, $16, $17,
-         $18, $19, $19, $20, $21::date,
+         $18, $19, 0, $20, $21::date,
          $22, $23, $24, NULLIF($25,'')::date, $26, $27)`,
       [
         PU_TRANS_FLAG,
@@ -894,7 +924,7 @@ async function savePUDocTransaction(client, payload, mode) {
        SET doc_date = $1::date, doc_time = $2, cust_code = $3, remark = $4,
            vat_type = $5, vat_rate = $6, total_value = $7, total_before_vat = $8,
            total_vat_value = $9, total_after_vat = $10, total_except_vat = $11,
-           total_amount = $12, balance_amount = $12, total_discount = $13,
+           total_amount = $12, balance_amount = 0, total_discount = $13,
            discount_word = $14, wh_from = $15, location_from = $16, inquiry_type = $17,
            tax_doc_no = $18, tax_doc_date = $19::date, doc_ref = $20,
            doc_ref_date = NULLIF($21,'')::date,
@@ -1091,13 +1121,14 @@ router.post('/getPurchaseLatestItemPrices', async (req, res) => {
           r.item_code,
           r.unit_code,
           r.barcode,
-          COALESCE(last_pu.price,0) AS price,
-          COALESCE(last_pu.doc_no,'') AS price_doc_no,
-          COALESCE(last_pu.doc_date::text,'') AS price_doc_date,
-          COALESCE(last_pu.unit_code,r.unit_code) AS price_unit_code,
-          COALESCE(last_pu.barcode,'') AS price_barcode
+          COALESCE(last_pu.price, last_po.price, 0) AS price,
+          COALESCE(last_pu.doc_no, last_po.doc_no, '') AS price_doc_no,
+          COALESCE(last_pu.doc_date::text, last_po.doc_date::text, '') AS price_doc_date,
+          COALESCE(last_pu.unit_code, last_po.unit_code, r.unit_code) AS price_unit_code,
+          COALESCE(last_pu.barcode, last_po.barcode, '') AS price_barcode
        FROM requested r
        LEFT JOIN LATERAL (
+         -- ดึงราคาซื้อล่าสุดจาก PU (trans_flag=12) ก่อน
          SELECT d.price, d.doc_no, d.doc_date, d.unit_code, d.barcode, d.line_number, t.doc_time
          FROM ic_trans_detail d
          JOIN ic_trans t ON t.doc_no = d.doc_no AND t.trans_flag = d.trans_flag
@@ -1112,8 +1143,25 @@ router.post('/getPurchaseLatestItemPrices', async (req, res) => {
            d.line_number DESC
          LIMIT 1
        ) last_pu ON true
+       LEFT JOIN LATERAL (
+         -- fallback: ดึงราคาจาก PO (trans_flag=6) ล่าสุด ถ้าไม่มี PU
+         SELECT d.price, d.doc_no, d.doc_date, d.unit_code, d.barcode, d.line_number, t.doc_time
+         FROM ic_trans_detail d
+         JOIN ic_trans t ON t.doc_no = d.doc_no AND t.trans_flag = d.trans_flag
+         WHERE d.trans_flag = $3
+           AND COALESCE(t.last_status,0) = 0
+           AND COALESCE(d.is_permium,0) = 0
+           AND d.item_code = r.item_code
+           AND COALESCE(d.unit_code,'') = r.unit_code
+         ORDER BY
+           d.doc_date DESC,
+           d.doc_no DESC,
+           COALESCE(t.doc_time,'') DESC,
+           d.line_number DESC
+         LIMIT 1
+       ) last_po ON true
        ORDER BY r.item_code, r.unit_code, r.barcode`,
-      [JSON.stringify(items), PU_TRANS_FLAG],
+      [JSON.stringify(items), PU_TRANS_FLAG, PO_TRANS_FLAG],
     );
     return successResponse(res, result.rows);
   } catch (ex) {
@@ -1260,6 +1308,9 @@ router.get('/getPODocWait', async (req, res) => {
     fromdate = '',
     todate = '',
     approve_only = '',
+    vat_type = '',
+    cust_code = '',
+    branch_code = '',
   } = req.query;
   const params = [];
   const where = [
@@ -1267,6 +1318,25 @@ router.get('/getPODocWait', async (req, res) => {
     'COALESCE(po.last_status,0) = 0',
     'COALESCE(po.doc_success,0) = 0',
   ];
+
+  // กรองตามเจ้าหนี้ — ตรงกับ C# _icTransRefControl.cs:1424
+  if (String(cust_code || '').trim()) {
+    params.push(String(cust_code).trim());
+    where.push(`po.cust_code = $${params.length}`);
+  }
+
+  // กรองตาม vat_type ของ PU ที่กำลังสร้าง — ตรงกับ C# _icTransRefControl.cs:1429
+  const vatTypeNum = parseInt(vat_type, 10);
+  if (Number.isFinite(vatTypeNum)) {
+    params.push(vatTypeNum);
+    where.push(`po.vat_type = $${params.length}`);
+  }
+
+  // กรองตาม branch_code — ตรงกับ C# _icTransRefControl.cs:1503-1508 (เฉพาะโหมดสาขา)
+  if (String(branch_code || '').trim()) {
+    params.push(String(branch_code).trim());
+    where.push(`COALESCE(po.branch_code,'') = $${params.length}`);
+  }
 
   const searchText = String(search || '').trim();
   if (searchText) {
@@ -1277,6 +1347,7 @@ router.get('/getPODocWait', async (req, res) => {
     where.push(`po.doc_date BETWEEN $${params.length - 1}::date AND $${params.length}::date`);
   }
 
+  // approve_only=1 บังคับ approve_status=1 (รองรับ ref_po_approve ใน C#)
   if (String(approve_only) === '1') {
     where.push('COALESCE(po.approve_status,0) = 1');
   }
@@ -1430,6 +1501,7 @@ router.get('/getDocPoDetail', async (req, res) => {
           COALESCE(po.divide_value,1) AS divide_value,
           COALESCE(po.ratio,1) AS ratio,
           COALESCE(inv.tax_type,0) AS tax_type,
+          COALESCE(MAX(po.is_permium),0) AS is_permium,
           COALESCE(det.maximum_qty,0) AS maximum_qty,
           COALESCE(det.minimum_qty,0) AS minimum_qty,
           CASE WHEN COALESCE(SUM(pu.qty),0) > 0 THEN 1 ELSE 0 END AS updateable
@@ -1446,7 +1518,8 @@ router.get('/getDocPoDetail', async (req, res) => {
        GROUP BY
           po.item_code, po.item_name, po.unit_code, po.qty, po.price,
           po.wh_code, po.shelf_code, po.barcode, po.stand_value,
-          po.divide_value, po.ratio, inv.tax_type, det.maximum_qty, det.minimum_qty
+          po.divide_value, po.ratio, inv.tax_type, det.maximum_qty, det.minimum_qty,
+          COALESCE(po.is_permium,0)
        ORDER BY MIN(po.line_number)`,
       [docNo],
     );
@@ -1507,6 +1580,7 @@ router.get('/getPUDocDetail', async (req, res) => {
             COALESCE(d.discount,'') AS discount,
             COALESCE(d.discount_amount,0) AS discount_amount,
             COALESCE(d.tax_type,0) AS tax_type,
+            COALESCE(d.is_permium,0) AS is_permium,
             COALESCE(det.maximum_qty,0) AS maximum_qty,
             COALESCE(det.minimum_qty,0) AS minimum_qty
          FROM ic_trans_detail d

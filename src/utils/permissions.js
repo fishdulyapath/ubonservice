@@ -26,6 +26,7 @@ const PERMISSIONS = [
   { key: 'purchase.pu.create', label: 'ซื้อ/ตั้งหนี้ (PU): สร้างเอกสาร' },
   { key: 'purchase.pu.edit', label: 'ซื้อ/ตั้งหนี้ (PU): แก้ไขเอกสาร' },
   { key: 'purchase.pu.print', label: 'ซื้อ/ตั้งหนี้ (PU): พิมพ์เอกสาร' },
+  { key: 'purchase.premium.manage', label: 'ของแถมซื้อ: จัดการเงื่อนไขของแถม' },
   { key: 'product.view', label: 'จัดการสินค้า: เข้าหน้าจอ' },
   { key: 'product.images', label: 'จัดการสินค้า: ดูรูปภาพ' },
   { key: 'product.images.edit', label: 'จัดการสินค้า: แก้ไขรูปภาพ' },
