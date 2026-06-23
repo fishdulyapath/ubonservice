@@ -1333,14 +1333,18 @@ router.get('/getDocSaleHistory', async (req, res) => {
 // ── GET /service/v1/getProductSaleHistory ───────────────────────────────────
 // ประวัติขายระดับเอกสาร: ค้นด้วยสินค้า / ลูกค้า / เลขที่เอกสาร และรวมขายสด+ขายเชื่อ
 router.get('/getProductSaleHistory', async (req, res) => {
-  const { search = '', from_date = '', to_date = '' } = req.query;
+  const { search = '', from_date = '', to_date = '', item_code = '' } = req.query;
   try {
     const params = [];
     let whereExtra = '';
+    let itemCodeWhere = '';
+    const itemCode = String(item_code || '').trim();
+    if (itemCode) {
+      params.push(itemCode);
+      itemCodeWhere = `AND d.item_code = $${params.length}`;
+    }
 
     if (search.trim()) {
-      // แบ่งคำค้นหาเป็น token แต่ละคำ (whitespace) — ทุกคำต้องตรงในบางฟิลด์ (AND)
-      // ทำให้ค้น "กระจกหน้า ดี 03" เจอสินค้าที่ชื่อมีทั้งสามคำ แม้ไม่ได้อยู่ติดกัน
       const tokens = search.trim().split(/\s+/).filter(Boolean).slice(0, 20);
       const clauses = tokens.map((tok) => {
         params.push(`%${tok}%`);
@@ -1405,6 +1409,7 @@ router.get('/getProductSaleHistory', async (req, res) => {
             AND d.trans_flag = t.trans_flag
             AND (COALESCE(d.set_ref_line,'') = '' OR COALESCE(d.item_type,0) = 3)
             AND ${activeProductCondition('item_detail')}
+            ${itemCodeWhere}
         )
         ${whereExtra}
       ORDER BY t.create_datetime DESC

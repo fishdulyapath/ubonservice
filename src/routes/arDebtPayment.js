@@ -14,6 +14,8 @@ const REF_TRANS_FLAG = 99;
 const SCREEN_CODE = 'EE';
 const DOC_TABLE = 'ap_ar_trans';
 const VIEW_PERMISSION = 'sales.ar_debt_payment.view';
+const HISTORY_PERMISSION = 'sales.ar_debt_payment.history.view';
+const READ_PERMISSIONS = [VIEW_PERMISSION, HISTORY_PERMISSION];
 const CREATE_PERMISSION = 'sales.ar_debt_payment.create';
 const VAT_SALE_CALC = 1;
 const SALE_FLAGS = [44];
@@ -849,6 +851,15 @@ async function assertPermission(queryFn, userCode, permissionKey) {
   }
 }
 
+async function assertAnyPermission(queryFn, userCode, permissionKeys) {
+  const code = safeText(userCode);
+  if (!code) throw new Error('creator_code or emp_code is required for permission check');
+  const permissions = await getEmployeePermissions(queryFn, code);
+  if (!permissionKeys.some((key) => permissions.includes(key))) {
+    throw new Error(`permission denied: ${permissionKeys.join(' or ')}`);
+  }
+}
+
 async function assertCreatePermission(client, userCode) {
   await assertPermission(client.query.bind(client), userCode, CREATE_PERMISSION);
 }
@@ -1083,7 +1094,7 @@ router.get('/ar-debt-payment/list', async (req, res) => {
   }
   params.push(lim);
   try {
-    await assertPermission(query, req.query.user_code || req.query.emp_code, VIEW_PERMISSION);
+    await assertAnyPermission(query, req.query.user_code || req.query.emp_code, READ_PERMISSIONS);
     const result = await query(
       `SELECT t.doc_no, t.doc_date, t.doc_time, t.doc_format_code, t.cust_code,
               COALESCE(c.name_1,'') AS cust_name, COALESCE(t.sale_code,'') AS sale_code,
@@ -1523,7 +1534,7 @@ router.get('/ar-debt-payment/detail', async (req, res) => {
   const docNo = safeText(req.query.doc_no);
   if (!docNo) return res.status(400).json({ success: false, msg: 'doc_no is required' });
   try {
-    await assertPermission(query, req.query.user_code || req.query.emp_code, VIEW_PERMISSION);
+    await assertAnyPermission(query, req.query.user_code || req.query.emp_code, READ_PERMISSIONS);
     const [header, details, refs, payment, paymentDetails, vatSale] = await Promise.all([
       query(
         `SELECT t.*, COALESCE(c.name_1,'') AS cust_name, COALESCE(c.address,'') AS cust_address,
@@ -1600,7 +1611,7 @@ router.get('/ar-debt-payment/print-forms', async (req, res) => {
   const docNo = safeText(req.query.doc_no);
   if (!docNo) return res.status(400).json({ success: false, msg: 'doc_no is required' });
   try {
-    await assertPermission(query, req.query.user_code || req.query.emp_code, VIEW_PERMISSION);
+    await assertAnyPermission(query, req.query.user_code || req.query.emp_code, READ_PERMISSIONS);
     const options = await loadPrintFormOptions(docNo);
     if (!options) return res.status(404).json({ success: false, msg: 'document not found' });
     return res.json({ success: true, data: options });
@@ -1616,7 +1627,7 @@ router.get('/ar-debt-payment/print/render', async (req, res) => {
   if (!docNo) return res.status(400).type('text/plain').send('doc_no is required');
 
   try {
-    await assertPermission(query, user_code || req.query.emp_code, VIEW_PERMISSION);
+    await assertAnyPermission(query, user_code || req.query.emp_code, READ_PERMISSIONS);
     const [options, printData] = await Promise.all([
       loadPrintFormOptions(docNo),
       loadArDebtPaymentPrintDocument(docNo),

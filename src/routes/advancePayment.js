@@ -9,6 +9,8 @@ const TRANS_TYPE = 2;
 const TRANS_FLAG = 40;
 const SCREEN_CODE = 'SD';
 const ADVANCE_PAYMENT_VIEW_PERMISSION = 'sales.advance_payment.view';
+const ADVANCE_PAYMENT_HISTORY_PERMISSION = 'sales.advance_payment.history.view';
+const ADVANCE_PAYMENT_READ_PERMISSIONS = [ADVANCE_PAYMENT_VIEW_PERMISSION, ADVANCE_PAYMENT_HISTORY_PERMISSION];
 const ADVANCE_PAYMENT_CREATE_PERMISSION = 'sales.advance_payment.create';
 
 function safeText(value) {
@@ -164,6 +166,15 @@ async function assertPermission(queryFn, userCode, permissionKey) {
   const permissions = await getEmployeePermissions(queryFn, code);
   if (!permissions.includes(permissionKey)) {
     throw new Error(`permission denied: ${permissionKey}`);
+  }
+}
+
+async function assertAnyPermission(queryFn, userCode, permissionKeys) {
+  const code = safeText(userCode);
+  if (!code) throw new Error('creator_code or emp_code is required for permission check');
+  const permissions = await getEmployeePermissions(queryFn, code);
+  if (!permissionKeys.some((key) => permissions.includes(key))) {
+    throw new Error(`permission denied: ${permissionKeys.join(' or ')}`);
   }
 }
 
@@ -506,7 +517,7 @@ router.get('/advance-payment/list', async (req, res) => {
   }
   params.push(lim);
   try {
-    await assertPermission(query, req.query.user_code || req.query.emp_code, ADVANCE_PAYMENT_VIEW_PERMISSION);
+    await assertAnyPermission(query, req.query.user_code || req.query.emp_code, ADVANCE_PAYMENT_READ_PERMISSIONS);
     const result = await query(
       `SELECT t.doc_no, t.doc_date, t.doc_time, t.doc_format_code, t.cust_code,
               COALESCE(c.name_1,'') AS cust_name, COALESCE(t.total_amount,0) AS total_amount,
@@ -530,7 +541,7 @@ router.get('/advance-payment/detail', async (req, res) => {
   const docNo = safeText(req.query.doc_no);
   if (!docNo) return res.status(400).json({ success: false, msg: 'doc_no is required' });
   try {
-    await assertPermission(query, req.query.user_code || req.query.emp_code, ADVANCE_PAYMENT_VIEW_PERMISSION);
+    await assertAnyPermission(query, req.query.user_code || req.query.emp_code, ADVANCE_PAYMENT_READ_PERMISSIONS);
     const [header, details, payment, paymentDetails] = await Promise.all([
       query(
         `SELECT t.*, COALESCE(c.name_1,'') AS cust_name, COALESCE(c.address,'') AS cust_address,
@@ -583,7 +594,7 @@ router.get('/advance-payment/print-forms', async (req, res) => {
   const docNo = safeText(req.query.doc_no);
   if (!docNo) return res.status(400).json({ success: false, msg: 'doc_no is required' });
   try {
-    await assertPermission(query, req.query.user_code || req.query.emp_code, ADVANCE_PAYMENT_VIEW_PERMISSION);
+    await assertAnyPermission(query, req.query.user_code || req.query.emp_code, ADVANCE_PAYMENT_READ_PERMISSIONS);
     const options = await loadPrintFormOptions(docNo);
     if (!options) return res.status(404).json({ success: false, msg: 'document not found' });
     return res.json({ success: true, data: options });
@@ -599,7 +610,7 @@ router.get('/advance-payment/print/render', async (req, res) => {
   if (!docNo) return res.status(400).type('text/plain').send('doc_no is required');
 
   try {
-    await assertPermission(query, user_code || req.query.emp_code, ADVANCE_PAYMENT_VIEW_PERMISSION);
+    await assertAnyPermission(query, user_code || req.query.emp_code, ADVANCE_PAYMENT_READ_PERMISSIONS);
     const [options, printData] = await Promise.all([
       loadPrintFormOptions(docNo),
       loadAdvancePaymentPrintDocument(docNo),
