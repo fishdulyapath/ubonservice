@@ -283,6 +283,25 @@ function normalizePayments(value) {
   };
 }
 
+function appendTigerVoucherToRemark(remark, tigerRows = []) {
+  const voucherLines = [];
+  const seen = new Set();
+  for (const row of Array.isArray(tigerRows) ? tigerRows : []) {
+    const num = safeText(row?.voucher_num || row?.voucher_number);
+    if (!num || seen.has(num)) continue;
+    seen.add(num);
+    const amount = roundMoney(row?.amount ?? row?.pay_amount);
+    const amountText = amount > 0 ? ` มูลค่า ${asAmountText(amount)} บาท` : '';
+    voucherLines.push({ num, line: `Tiger Voucher: ${num}${amountText}` });
+  }
+  if (!voucherLines.length) return safeText(remark);
+  const base = safeText(remark);
+  const missing = voucherLines.filter((row) => !base.includes(row.num));
+  if (!missing.length) return base;
+  const line = missing.map((row) => row.line).join(' | ');
+  return base ? `${base} | ${line}` : line;
+}
+
 function normalizeWhtList(value, docDate) {
   const rows = Array.isArray(value) ? value : [];
   return rows
@@ -928,7 +947,7 @@ router.post('/other-expense/save', async (req, res) => {
     const vatType = toInt(payload.vat_type, 0);
     const vatRate = [2, 3].includes(vatType) ? 0 : roundMoney(payload.vat_rate);
     const branchCode = safeText(payload.branch_code);
-    const remark = safeText(payload.remark);
+    const remark = appendTigerVoucherToRemark(payload.remark, payments.tiger);
     const taxDocNo = safeText(payload.tax_doc_no);
     const taxDocDate = normalizeNullableDate(payload.tax_doc_date);
 
@@ -950,8 +969,8 @@ router.post('/other-expense/save', async (req, res) => {
     const whtBaseAmount = roundMoney(whtList.reduce((sum, row) => sum + row.amount, 0));
     if (whtBaseAmount > totals.total_before_vat + 0.01) return res.status(400).json({ success: false, msg: 'withholding tax base is greater than document base' });
     if (whtAmount > totals.total_amount + 0.01) return res.status(400).json({ success: false, msg: 'withholding tax is greater than document total' });
-    if (payments.tiger_amount > 0 && (!payments.tiger_voucher_num || !payments.tiger_voucher_code)) {
-      return res.status(400).json({ success: false, msg: 'tiger voucher number and code are required' });
+    if (payments.tiger_amount > 0 && !payments.tiger_voucher_num) {
+      return res.status(400).json({ success: false, msg: 'tiger voucher number is required' });
     }
     const totalNetAmount = roundMoney(totals.total_amount + cardCharge);
     const totalPaid = roundMoney(cashAmount + transferAmount + cardAmount + chequeAmount);

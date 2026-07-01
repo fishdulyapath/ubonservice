@@ -631,7 +631,7 @@ async function loadPaymentRowsForPrint(docNo) {
     total_net_amount: summary.total_net_amount,
     total_amount_pay: summary.total_amount_pay,
     discount_amount: summary.discount_amount,
-    total_discount: summary.total_net_amount,
+    total_discount: summary.discount_amount,
     cash_amount: summary.cash_amount,
     cash: summary.cash_amount,
     tranfer_amount: summary.tranfer_amount,
@@ -651,7 +651,7 @@ async function loadArDebtPaymentPrintDocument(docNo) {
           COALESCE(t.total_net_value,0) AS total_value,
           COALESCE(t.total_net_value,0) AS total_amount,
           COALESCE(t.total_net_value,0) AS total_net_amount,
-          COALESCE(t.total_net_value,0) AS total_after_discount,
+          GREATEST(ROUND(COALESCE(t.total_net_value,0) - COALESCE(cb.discount_amount,0), 2), 0) AS total_after_discount,
           COALESCE(cb.total_amount_pay, t.total_net_value, 0) AS total_amount_pay,
           COALESCE(cb.cash_amount,0) AS cash_amount,
           COALESCE(cb.tranfer_amount,0) AS tranfer_amount,
@@ -661,6 +661,8 @@ async function loadArDebtPaymentPrintDocument(docNo) {
           COALESCE(cb.total_income_amount,0) AS total_income_amount,
           COALESCE(cb.petty_cash_amount,0) AS petty_cash_amount,
           COALESCE(cb.discount_amount,0) AS discount_amount,
+          COALESCE(cb.discount_amount,0) AS total_discount,
+          COALESCE(t.discount_word,'') AS discount_word,
           COALESCE(df.name_1,'') AS doc_format_name,
           COALESCE(df.form_code,'') AS form_code,
           COALESCE(ar.name_1,'') AS name_1,
@@ -1099,6 +1101,8 @@ router.get('/ar-debt-payment/list', async (req, res) => {
       `SELECT t.doc_no, t.doc_date, t.doc_time, t.doc_format_code, t.cust_code,
               COALESCE(c.name_1,'') AS cust_name, COALESCE(t.sale_code,'') AS sale_code,
               COALESCE(t.total_net_value,0) AS total_net_value,
+              COALESCE(cb.total_amount, t.total_net_value, 0) AS total_amount,
+              GREATEST(ROUND(COALESCE(t.total_net_value,0) - COALESCE(cb.discount_amount,0), 2), 0) AS total_after_discount,
               COALESCE(t.last_status,0) AS last_status, COALESCE(t.used_status,0) AS used_status,
               COALESCE(t.doc_success,0) AS doc_success, COALESCE(t.remark,'') AS remark,
               COALESCE(cb.cash_amount,0) AS cash_amount,
@@ -1109,6 +1113,7 @@ router.get('/ar-debt-payment/list', async (req, res) => {
               COALESCE(cb.deposit_amount,0) AS deposit_amount,
               COALESCE(cb.petty_cash_amount,0) AS petty_cash_amount,
               COALESCE(cb.discount_amount,0) AS discount_amount,
+              COALESCE(t.discount_word,'') AS discount_word,
               COALESCE(cb.total_income_amount,0) AS total_income_amount,
               COALESCE(cb.total_income_other,0) AS total_income_other,
               COALESCE(cb.total_expense_other,0) AS total_expense_other,
@@ -1538,9 +1543,13 @@ router.get('/ar-debt-payment/detail', async (req, res) => {
     const [header, details, refs, payment, paymentDetails, vatSale] = await Promise.all([
       query(
         `SELECT t.*, COALESCE(c.name_1,'') AS cust_name, COALESCE(c.address,'') AS cust_address,
-                COALESCE(c.telephone,'') AS cust_telephone
+                COALESCE(c.telephone,'') AS cust_telephone,
+                COALESCE(cb.total_amount, t.total_net_value, 0) AS total_amount,
+                COALESCE(cb.discount_amount,0) AS discount_amount,
+                GREATEST(ROUND(COALESCE(t.total_net_value,0) - COALESCE(cb.discount_amount,0), 2), 0) AS total_after_discount
          FROM ap_ar_trans t
          LEFT JOIN ar_customer c ON c.code = t.cust_code
+         LEFT JOIN cb_trans cb ON cb.doc_no = t.doc_no AND cb.trans_flag = t.trans_flag
          WHERE t.doc_no = $1 AND t.trans_flag = $2
          LIMIT 1`,
         [docNo, TRANS_FLAG],
@@ -1682,6 +1691,7 @@ router.post('/ar-debt-payment/save', async (req, res) => {
     const requestUserCode = safeText(payload.emp_code) || safeText(payload.creator_code);
     const creatorCode = requestUserCode || 'smlstaff';
     const remark = safeText(payload.remark);
+    const discountWord = safeText(payload.discount_word || payload.payments?.discount_word);
 
     if (!custCode) return res.status(400).json({ success: false, msg: 'cust_code is required' });
     if (!details.length) return res.status(400).json({ success: false, msg: 'details is empty' });
@@ -1892,13 +1902,13 @@ router.post('/ar-debt-payment/save', async (req, res) => {
         `INSERT INTO ap_ar_trans (
           trans_type, trans_flag, doc_date, doc_no, cust_code, sale_code, remark,
           total_net_value, doc_time, doc_format_code, last_status, used_status,
-          doc_success, creator_code, create_datetime, branch_code, is_cancel
+          doc_success, creator_code, create_datetime, branch_code, is_cancel, discount_word
         ) VALUES (
-          $1,$2,$3::date,$4,$5,$6,$7,$8,$9,$10,0,0,0,$11,NOW(),$12,0
+          $1,$2,$3::date,$4,$5,$6,$7,$8,$9,$10,0,0,0,$11,NOW(),$12,0,$13
         )`,
         [
           TRANS_TYPE, TRANS_FLAG, docDate, savedDocNo, custCode, saleCode,
-          remark, totalNetValue, docTime, savedDocFormatCode, creatorCode, branchCode,
+          remark, totalNetValue, docTime, savedDocFormatCode, creatorCode, branchCode, discountWord,
         ],
       );
 

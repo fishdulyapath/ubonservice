@@ -64,22 +64,57 @@ async function callTiger(path, { method = 'GET', body } = {}) {
 }
 
 function loadTigerVoucherConfig() {
-  const username = String(process.env.TIGER_VOUCHER_USERNAME || '').trim();
-  const password = String(process.env.TIGER_VOUCHER_PASSWORD || '').trim();
-  const mobile = String(process.env.TIGER_VOUCHER_MOBILE || '').trim();
   const baseUrl = String(process.env.TIGER_VOUCHER_BASE_URL || 'https://api.tigercashbox.com/api').trim().replace(/\/$/, '');
-  if (!username || !password || !baseUrl) return null;
-  return { username, password, mobile, baseUrl };
+  if (!baseUrl) return null;
+  return { baseUrl };
 }
 
-function todayVoucherDate() {
-  const now = new Date();
-  return `${String(now.getDate()).padStart(2, '0')}-${String(now.getMonth() + 1).padStart(2, '0')}-${now.getFullYear()}`;
+const BANGKOK_OFFSET_MS = 7 * 60 * 60 * 1000;
+
+function bangkokParts(date = new Date()) {
+  const shifted = new Date(date.getTime() + BANGKOK_OFFSET_MS);
+  return {
+    year: shifted.getUTCFullYear(),
+    month: shifted.getUTCMonth() + 1,
+    day: shifted.getUTCDate(),
+    hour: shifted.getUTCHours(),
+    minute: shifted.getUTCMinutes(),
+    second: shifted.getUTCSeconds(),
+  };
 }
 
-function currentVoucherTime() {
-  const now = new Date();
-  return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+function daysInMonth(year, month) {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+function addBangkokMonths(date, months) {
+  const p = bangkokParts(date);
+  const zeroBasedMonth = p.month - 1 + months;
+  const targetYear = p.year + Math.floor(zeroBasedMonth / 12);
+  const targetMonthIndex = ((zeroBasedMonth % 12) + 12) % 12;
+  const targetDay = Math.min(p.day, daysInMonth(targetYear, targetMonthIndex + 1));
+  return new Date(Date.UTC(targetYear, targetMonthIndex, targetDay, p.hour, p.minute, p.second) - BANGKOK_OFFSET_MS);
+}
+
+function formatBangkokVoucherDate(date) {
+  const p = bangkokParts(date);
+  return `${String(p.day).padStart(2, '0')}-${String(p.month).padStart(2, '0')}-${p.year}`;
+}
+
+function formatBangkokVoucherTime(date) {
+  const p = bangkokParts(date);
+  return `${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')}:${String(p.second).padStart(2, '0')}`;
+}
+
+function defaultVoucherWindow() {
+  const start = new Date();
+  const expire = addBangkokMonths(start, 1);
+  return {
+    start_date: formatBangkokVoucherDate(start),
+    start_time: formatBangkokVoucherTime(start),
+    expire_date: formatBangkokVoucherDate(expire),
+    expire_time: formatBangkokVoucherTime(expire),
+  };
 }
 
 async function tigerVoucherRequest(url, { method = 'POST', token = '', form } = {}) {
@@ -90,7 +125,7 @@ async function tigerVoucherRequest(url, { method = 'POST', token = '', form } = 
   let data;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
   if (!res.ok) {
-    const msg = data?.message || data?.msg || `Tiger voucher API ${res.status}`;
+    const msg = data?.error || data?.message || data?.msg || `Tiger voucher API ${res.status}`;
     const err = new Error(msg);
     err.status = res.status;
     err.data = data;
@@ -117,7 +152,10 @@ function findValueDeep(value, names) {
 }
 
 function normalizeTigerVoucherResponse(data) {
-  const voucherNum = findValueDeep(data, ['voucher_num', 'voucher_number', 'voucherNo', 'voucher_no', 'number']);
+  const resultVoucher = Array.isArray(data?.result)
+    ? String(data.result[0] ?? '').trim()
+    : '';
+  const voucherNum = resultVoucher || findValueDeep(data, ['voucher_num', 'voucher_number', 'voucherNo', 'voucher_no', 'number']);
   const voucherCode = findValueDeep(data, ['voucher_code', 'voucherCode', 'code', 'pin', 'password']);
   return {
     raw: data,
@@ -133,18 +171,21 @@ function tigerVoucherPayload(payload = {}) {
     err.status = 400;
     throw err;
   }
+  const window = defaultVoucherWindow();
+  const approveRequired = payload.approve_required ?? payload.approved_required ?? 0;
   return {
     amount: String(Math.round(amount * 100) / 100),
     number_of_voucher: String(payload.number_of_voucher || 1),
-    start_date: String(payload.start_date || todayVoucherDate()),
-    expire_date: String(payload.expire_date || payload.start_date || todayVoucherDate()),
+    start_date: window.start_date,
+    expire_date: window.expire_date,
     note: String(payload.note || ''),
     ref_num: String(payload.ref_num || ''),
     category: String(payload.category || 'other-expense'),
     authen_required: String(payload.authen_required ?? 1),
-    start_time: String(payload.start_time || currentVoucherTime()),
-    expire_time: String(payload.expire_time || '23:59:59'),
-    approved_required: String(payload.approved_required ?? 1),
+    start_time: window.start_time,
+    expire_time: window.expire_time,
+    approve_required: String(approveRequired),
+    approved_required: String(approveRequired),
   };
 }
 
@@ -156,31 +197,41 @@ async function createTigerVoucher(payload = {}) {
     throw err;
   }
 
+  const auth = payload.auth && typeof payload.auth === 'object' ? payload.auth : {};
+  const username = String(auth.username || '').trim();
+  const password = String(auth.password || '');
+  const mobile = String(auth.mobile || '').trim();
+  if (!username || !password) {
+    const err = new Error('กรุณาเข้าสู่ระบบ Tiger');
+    err.status = 400;
+    throw err;
+  }
+
   const loginForm = new FormData();
-  loginForm.append('username', cfg.username);
-  loginForm.append('password', cfg.password);
-  if (cfg.mobile) loginForm.append('mobile', cfg.mobile);
-  const loginData = await tigerVoucherRequest(`${cfg.baseUrl}/tigerpay/login`, { form: loginForm });
+  loginForm.append('username', username);
+  loginForm.append('password', password);
+  if (mobile) loginForm.append('mobile', mobile);
+  const loginData = await tigerVoucherRequest(`${cfg.baseUrl}/tigerQR/login`, { form: loginForm });
   const token = loginData?.success?.token
     || loginData?.token
     || loginData?.data?.token
     || loginData?.access_token
     || loginData?.data?.access_token;
   if (!token) {
-    const err = new Error('Tiger voucher login did not return token');
+    const err = new Error('เข้าสู่ระบบ Tiger ไม่สำเร็จ');
     err.status = 502;
     err.data = loginData;
     throw err;
   }
 
-  const voucherPayload = tigerVoucherPayload(payload);
+  const voucherPayload = tigerVoucherPayload(payload.voucher && typeof payload.voucher === 'object' ? payload.voucher : payload);
   const form = new FormData();
   Object.entries(voucherPayload).forEach(([key, value]) => form.append(key, value));
 
   const data = await tigerVoucherRequest(`${cfg.baseUrl}/voucher/create`, { token, form });
   const normalized = normalizeTigerVoucherResponse(data);
-  if (!normalized.voucher_num && !normalized.voucher_code) {
-    const err = new Error('Tiger voucher response did not include voucher number or code');
+  if (!normalized.voucher_num) {
+    const err = new Error('Tiger voucher response did not include voucher number');
     err.status = 502;
     err.data = data;
     throw err;
@@ -375,22 +426,6 @@ router.put('/tiger/orders/:id', async (req, res) => {
 // POST /service/v1/tiger/vouchers
 router.post('/tiger/vouchers', async (req, res) => {
   try {
-    if (tigerMockEnabled()) {
-      const amount = Number(req.body?.amount || 0);
-      if (!Number.isFinite(amount) || amount <= 0) {
-        return res.status(400).json({ success: false, msg: 'amount must be greater than zero' });
-      }
-      const suffix = String(Date.now()).slice(-8);
-      return res.json({
-        success: true,
-        data: {
-          voucher_num: `MOCK-V${suffix}`,
-          voucher_code: `MOCK-C${suffix}`,
-          amount,
-          mock: true,
-        },
-      });
-    }
     const data = await createTigerVoucher(req.body || {});
     return res.json({ success: true, data });
   } catch (ex) {
