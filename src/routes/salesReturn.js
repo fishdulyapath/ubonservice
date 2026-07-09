@@ -79,6 +79,13 @@ function toPositiveInt(value, fallback = 80, max = 300) {
   return Math.min(num, max);
 }
 
+function normalizeSaleKind(value) {
+  const text = safeText(value).toLowerCase();
+  if (["cash", "sale_cash", "ขายสด", "สด", "1", "3"].includes(text)) return "cash";
+  if (["credit", "sale_credit", "ขายเชื่อ", "เชื่อ", "0", "2"].includes(text)) return "credit";
+  return "";
+}
+
 function toNumber(value, fallback = 0) {
   const num = Number(value);
   return Number.isFinite(num) ? num : fallback;
@@ -250,6 +257,13 @@ function buildSaleLineFilters(params) {
   if (custCode) {
     values.push(custCode);
     where.push(`t.cust_code = $${values.length}`);
+  }
+
+  const saleKind = normalizeSaleKind(params.sale_kind || params.sale_type || params.document_type);
+  if (saleKind === "cash") {
+    where.push("COALESCE(t.inquiry_type, 1) IN (1, 3)");
+  } else if (saleKind === "credit") {
+    where.push("COALESCE(t.inquiry_type, 1) IN (0, 2)");
   }
 
   const itemCode = safeText(params.item_code);

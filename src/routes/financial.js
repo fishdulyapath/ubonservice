@@ -24,20 +24,77 @@ router.get('/getCustomerCredit', async (req, res) => {
           COALESCE(d.logistic_area,'') AS logistic_area,
           COALESCE(d.credit_day,0)::int AS credit_day,
           COALESCE(d.pay_bill_date,0)::int AS pay_bill_date,
-          COALESCE(d.group_main,'') AS group_main
+          COALESCE(d.group_main,'') AS group_main,
+          COALESCE(d.credit_money,0)::numeric AS credit_money,
+          COALESCE(d.credit_money_max,0)::numeric AS credit_money_max,
+          COALESCE(d.credit_status,0)::int AS credit_status,
+          COALESCE(d.close_over_credit_warning,0)::int AS close_over_credit_warning
         FROM ar_customer c
         LEFT JOIN ar_customer_detail d ON d.ar_code = c.code
         WHERE c.code = $1
         LIMIT 1
       ),
+      ar_balance AS (
+        SELECT COALESCE(SUM(balance_amount),0)::numeric AS balance_amount
+        FROM (
+          SELECT cust_code, doc_date, doc_no,
+            COALESCE(total_amount,0)
+              - (SELECT COALESCE(SUM(COALESCE(sum_pay_money,0)),0)
+                 FROM ap_ar_trans_detail
+                 WHERE COALESCE(last_status,0)=0
+                   AND trans_flag IN (239)
+                   AND ic_trans.doc_no=ap_ar_trans_detail.billing_no
+                   AND ic_trans.doc_date=ap_ar_trans_detail.billing_date
+                   AND doc_date <= date(NOW())) AS balance_amount
+          FROM ic_trans
+          WHERE COALESCE(last_status,0)=0
+            AND trans_flag IN (44,250)
+            AND inquiry_type IN (0,2)
+            AND doc_date <= date(NOW())
+          UNION ALL
+          SELECT cust_code, doc_date, doc_no,
+            COALESCE(total_amount,0)
+              - (SELECT COALESCE(SUM(COALESCE(sum_pay_money,0)),0)
+                 FROM ap_ar_trans_detail
+                 WHERE COALESCE(last_status,0)=0
+                   AND trans_flag IN (239)
+                   AND ic_trans.doc_no=ap_ar_trans_detail.billing_no
+                   AND ic_trans.doc_date=ap_ar_trans_detail.billing_date
+                   AND doc_date <= date(NOW())) AS balance_amount
+          FROM ic_trans
+          WHERE COALESCE(last_status,0)=0
+            AND trans_flag IN (46,93,99,95,101,254)
+            AND doc_date <= date(NOW())
+          UNION ALL
+          SELECT cust_code, doc_date, doc_no,
+            -1 * (COALESCE(total_amount,0)
+              + (SELECT COALESCE(SUM(COALESCE(sum_pay_money,0)),0)
+                 FROM ap_ar_trans_detail
+                 WHERE COALESCE(last_status,0)=0
+                   AND trans_flag IN (239)
+                   AND ic_trans.doc_no=ap_ar_trans_detail.billing_no
+                   AND ic_trans.doc_date=ap_ar_trans_detail.billing_date
+                   AND doc_date <= date(NOW()))) AS balance_amount
+          FROM ic_trans
+          WHERE COALESCE(last_status,0)=0
+            AND ((trans_flag=48 AND inquiry_type IN (0,2,4)) OR trans_flag IN (97,103,252))
+            AND doc_date <= date(NOW())
+        ) AS ar_docs
+        WHERE COALESCE(doc_no,'') <> ''
+          AND cust_code = $1
+      ),
       calc AS (
-        SELECT base.*, opt.use_credit_pay_bill_calc, cp.day_to_due, cp.month_to_due
+        SELECT base.*, opt.use_credit_pay_bill_calc, cp.day_to_due, cp.month_to_due, ar_balance.balance_amount AS credit_balance
         FROM base
         CROSS JOIN opt
+        CROSS JOIN ar_balance
         LEFT JOIN ar_credit_pay_bill cp ON cp.credit_day = base.credit_day
       )
       SELECT
         user_code, user_name, address, telephone, website, logistic_area, credit_day, group_main,
+        credit_money, credit_money_max, credit_status, close_over_credit_warning,
+        COALESCE(credit_balance,0)::numeric AS credit_balance,
+        (COALESCE(credit_money,0) - COALESCE(credit_balance,0))::numeric AS credit_available,
         CASE
           WHEN use_credit_pay_bill_calc = 1 AND day_to_due IS NOT NULL THEN
             (date_trunc('month', ${baseDateExpr})::date
@@ -54,18 +111,24 @@ router.get('/getCustomerCredit', async (req, res) => {
       FROM calc
     `;
     const result = await query(sql, params);
-    const obj = result.rows.length > 0 ? {
-      code: result.rows[0].user_code,
-      name: result.rows[0].user_name,
-      credit_day: result.rows[0].credit_day,
-      credit_date: result.rows[0].credit_date,
-    } : {};
+    const row = result.rows[0];
+    const obj = row ? {
+      code: row.user_code,
+      name: row.user_name,
+      credit_day: Number(row.credit_day || 0),
+      credit_date: row.credit_date,
+      credit_money: Number(row.credit_money || 0),
+      credit_money_max: Number(row.credit_money_max || 0),
+      credit_status: Number(row.credit_status || 0),
+      close_over_credit_warning: Number(row.close_over_credit_warning || 0),
+      credit_balance: Number(row.credit_balance || 0),
+      credit_available: Number(row.credit_available || 0),
+    } : null;
     return res.json({ success: true, data: obj });
   } catch (ex) {
     return res.status(400).json({ ERROR: ex.message });
   }
 });
-
 // GET /service/v1/getAdvancePayment
 router.get('/getAdvancePayment', async (req, res) => {
   const { cust_code = '' } = req.query;

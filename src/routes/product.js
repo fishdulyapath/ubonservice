@@ -5,6 +5,7 @@ const { getProductPriceLocalx } = require("../utils/priceHelper");
 const { randomInt, randomUUID } = require("crypto");
 
 const PRODUCT_CODE_PATTERN = /^[A-Z0-9_-]+$/;
+const PRODUCT_CODE_FORMAT_SCREEN = "IC";
 const EAN13_INTERNAL_PREFIX = "20";
 const ADJUST_STOCK_SQL_DEBUG = String(process.env.DEBUG_ADJUST_STOCK_SQL || "").trim() === "1";
 
@@ -92,6 +93,23 @@ async function ensureProductUnitUse(client, icCode, unitCode) {
   );
 }
 
+async function upsertProductInventoryDetail(client, icCode, purchasePoint, minimumQty, maximumQty, whCode, shelfCode) {
+  const c = String(icCode || "").trim();
+  if (!c) return;
+  const params = [c, purchasePoint, minimumQty, maximumQty, whCode, shelfCode];
+  const updateResult = await client.query(
+    `UPDATE ic_inventory_detail SET purchase_point=$2::numeric, minimum_qty=$3::numeric, maximum_qty=$4::numeric,` +
+      ` start_sale_wh=$5::text, start_sale_shelf=$6::text WHERE ic_code=$1::text`,
+    params,
+  );
+  if (updateResult.rowCount > 0) return;
+  await client.query(
+    `INSERT INTO ic_inventory_detail (ic_code, purchase_point, minimum_qty, maximum_qty, start_sale_wh, start_sale_shelf)` +
+      ` SELECT $1::text,$2::numeric,$3::numeric,$4::numeric,$5::text,$6::text` +
+      ` WHERE NOT EXISTS (SELECT 1 FROM ic_inventory_detail WHERE ic_code=$1::text)`,
+    params,
+  );
+}
 async function syncProductUnitType(client, icCode) {
   const c = String(icCode || "").trim();
   if (!c) return;
@@ -133,7 +151,114 @@ function generateEan13Candidate() {
   const base12 = `${EAN13_INTERNAL_PREFIX}${randomBody}`;
   return `${base12}${ean13CheckDigit(base12)}`;
 }
+function productCodeDateParts(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const d = match ? new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])) : new Date();
+  const yyyy = String(d.getFullYear()).padStart(4, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return { yyyy, yy: yyyy.slice(-2), mm, dd };
+}
 
+function escapeRegexLiteral(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function escapeLikePattern(value) {
+  return String(value || "").replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+function compileProductItemCodeFormat(format, formatCode, docDate, runningNumber = null) {
+  const formatText = String(format || "@####").trim() || "@####";
+  const prefixCode = String(formatCode || "").trim().toUpperCase();
+  const date = productCodeDateParts(docDate);
+  const tokens = [
+    ["YYYY", date.yyyy], ["yyyy", date.yyyy],
+    ["YY", date.yy], ["yy", date.yy],
+    ["MM", date.mm], ["mm", date.mm],
+    ["DD", date.dd], ["dd", date.dd],
+    ["ปปปป", date.yyyy], ["ปป", date.yy], ["ดด", date.mm], ["วว", date.dd],
+  ];
+
+  let generated = "";
+  let regex = "^";
+  let prefixBeforeRunning = "";
+  let runningWidth = 0;
+  let hasRunning = false;
+
+  for (let i = 0; i < formatText.length;) {
+    if (formatText[i] === "#") {
+      let width = 1;
+      while (formatText[i + width] === "#") width += 1;
+      if (!hasRunning) {
+        runningWidth = width;
+        hasRunning = true;
+        regex += `([0-9]{${width}})`;
+      } else {
+        regex += `[0-9]{${width}}`;
+      }
+      generated += runningNumber == null ? "" : String(runningNumber).padStart(width, "0");
+      i += width;
+      continue;
+    }
+
+    let replacement = "";
+    let matched = "";
+    if (formatText[i] === "@") {
+      matched = "@";
+      replacement = prefixCode;
+    } else {
+      for (const [token, value] of tokens) {
+        if (formatText.startsWith(token, i)) {
+          matched = token;
+          replacement = value;
+          break;
+        }
+      }
+    }
+    if (!matched) {
+      matched = formatText[i];
+      replacement = matched;
+    }
+
+    generated += replacement;
+    regex += escapeRegexLiteral(replacement);
+    if (!hasRunning) prefixBeforeRunning += replacement;
+    i += matched.length;
+  }
+
+  regex += "$";
+  return { generated, regex, prefixBeforeRunning, runningWidth };
+}
+
+async function findNextProductItemCode(formatRow, docDate) {
+  const formatCode = String(formatRow?.code || "").trim().toUpperCase();
+  const format = String(formatRow?.format || "@####").trim() || "@####";
+  const compiled = compileProductItemCodeFormat(format, formatCode, docDate);
+  if (!compiled.runningWidth) throw httpError("รูปแบบรหัสสินค้าต้องมี # สำหรับเลข running", 400);
+
+  const result = await query(
+    `SELECT code FROM ic_inventory WHERE code LIKE $1 ESCAPE '\\' AND code ~ $2 ORDER BY code DESC LIMIT 5000`,
+    [`${escapeLikePattern(compiled.prefixBeforeRunning)}%`, compiled.regex],
+  );
+  const jsRegex = new RegExp(compiled.regex);
+  let maxRunning = 0;
+  for (const row of result.rows) {
+    const match = String(row.code || "").match(jsRegex);
+    const running = Number(match?.[1] || 0);
+    if (Number.isFinite(running) && running > maxRunning) maxRunning = running;
+  }
+
+  for (let nextRunning = maxRunning + 1; nextRunning < maxRunning + 1001; nextRunning += 1) {
+    const candidate = compileProductItemCodeFormat(format, formatCode, docDate, nextRunning).generated;
+    const exists = await query(`SELECT 1 FROM ic_inventory WHERE code=$1::text LIMIT 1`, [candidate]);
+    if (!exists.rows.length) {
+      return { code: candidate, running: nextRunning, running_width: compiled.runningWidth, format_code: formatCode, format };
+    }
+  }
+  throw httpError("ไม่สามารถหารหัสสินค้าถัดไปได้", 500);
+}
 async function resolveBasketPricingContext(custCode) {
   if (!custCode || !String(custCode).trim()) {
     return { saleType: null, vatType: null, vatRate: null };
@@ -1365,6 +1490,44 @@ router.get("/getProductDesignList", makeMasterListRoute("ic_design"));
 // GET /service/v1/getProductModelList
 router.get("/getProductModelList", makeMasterListRoute("ic_model"));
 
+// GET /service/v1/getProductItemCodeFormats
+router.get("/getProductItemCodeFormats", async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT code, COALESCE(name_1,'') AS name_1, COALESCE(format,'') AS format
+       FROM erp_doc_format
+       WHERE screen_code = $1
+       ORDER BY code`,
+      [PRODUCT_CODE_FORMAT_SCREEN],
+    );
+    return res.json({ success: true, data: result.rows });
+  } catch (ex) {
+    console.error("getProductItemCodeFormats error:", ex.message);
+    return res.status(500).json({ success: false, message: ex.message });
+  }
+});
+
+// GET /service/v1/generateProductItemCode?format_code=&doc_date=
+router.get("/generateProductItemCode", async (req, res) => {
+  const formatCode = String(req.query.format_code || req.query.code || "").trim().toUpperCase();
+  const docDate = String(req.query.doc_date || "").trim();
+  if (!formatCode) return res.status(400).json({ success: false, message: "กรุณาเลือกรูปแบบรหัสสินค้า" });
+  try {
+    const formatRes = await query(
+      `SELECT code, COALESCE(name_1,'') AS name_1, COALESCE(format,'') AS format
+       FROM erp_doc_format
+       WHERE screen_code = $1 AND code = $2
+       LIMIT 1`,
+      [PRODUCT_CODE_FORMAT_SCREEN, formatCode],
+    );
+    if (!formatRes.rows.length) return res.status(404).json({ success: false, message: "ไม่พบรูปแบบรหัสสินค้า" });
+    const nextCode = await findNextProductItemCode(formatRes.rows[0], docDate);
+    return res.json({ success: true, data: { ...nextCode, name_1: formatRes.rows[0].name_1 } });
+  } catch (ex) {
+    console.error("generateProductItemCode error:", ex.message);
+    return res.status(ex.statusCode || 500).json({ success: false, message: ex.message });
+  }
+});
 // GET /service/v1/getUnitManageList
 router.get("/getUnitManageList", async (req, res) => {
   const s = (req.query.search || "").trim();
@@ -1493,10 +1656,22 @@ router.get("/getPurchaseStockReorderList", async (req, res) => {
     maximum_qty: "maximum_qty",
     suggest_qty: "suggest_qty",
     reached_reorder_point: "reached_reorder_point",
+    last_purchase_price: "last_purchase_price",
+    last_purchase_cust_code: "last_purchase_cust_code",
+    last_purchase_cust_name: "last_purchase_cust_name",
   };
   const sortCol = sortWhitelist[sort_field] || "available_qty";
   const sortDir = sort_order === "desc" ? "DESC" : "ASC";
-  const stockSortFields = new Set(["real_balance_qty", "cart_qty", "available_qty", "suggest_qty", "reached_reorder_point"]);
+  const stockSortFields = new Set([
+    "real_balance_qty",
+    "cart_qty",
+    "available_qty",
+    "suggest_qty",
+    "reached_reorder_point",
+    "last_purchase_price",
+    "last_purchase_cust_code",
+    "last_purchase_cust_name",
+  ]);
 
   const whereParams = [];
   const whereParts = [
@@ -1559,6 +1734,26 @@ router.get("/getPurchaseStockReorderList", async (req, res) => {
            SELECT string_agg(item_code, ',') AS codes
            FROM candidates
          ),
+         last_purchase AS (
+           SELECT
+             c.item_code,
+             c.unit_code,
+             COALESCE(lp.price,0)::numeric AS last_purchase_price,
+             COALESCE(lp.cust_code,'') AS last_purchase_cust_code,
+             COALESCE(ap.name_1,'') AS last_purchase_cust_name
+           FROM candidates c
+           LEFT JOIN LATERAL (
+             SELECT d.price, d.cust_code
+             FROM ic_trans_detail d
+             WHERE d.trans_flag = 12
+               AND COALESCE(d.last_status,0) = 0
+               AND d.item_code = c.item_code
+               AND d.unit_code = c.unit_code
+             ORDER BY d.doc_date DESC, d.doc_time DESC
+             LIMIT 1
+           ) lp ON true
+           LEFT JOIN ap_supplier ap ON ap.code = lp.cust_code
+         ),
          stock AS (
            SELECT s.ic_code, SUM(s.balance_qty)::numeric AS real_balance_qty
            FROM item_code_list icl
@@ -1593,10 +1788,14 @@ router.get("/getPurchaseStockReorderList", async (req, res) => {
              (COALESCE(s.real_balance_qty,0) - COALESCE(cart.cart_qty,0))::numeric AS available_qty,
              c.purchase_point,
              c.minimum_qty,
-             c.maximum_qty
+             c.maximum_qty,
+             COALESCE(lp.last_purchase_price,0)::numeric AS last_purchase_price,
+             COALESCE(lp.last_purchase_cust_code,'') AS last_purchase_cust_code,
+             COALESCE(lp.last_purchase_cust_name,'') AS last_purchase_cust_name
            FROM candidates c
            LEFT JOIN stock s ON s.ic_code = c.item_code
            LEFT JOIN cart ON cart.item_code = c.item_code
+           LEFT JOIN last_purchase lp ON lp.item_code = c.item_code AND lp.unit_code = c.unit_code
          )
          SELECT
            *,
@@ -1643,6 +1842,7 @@ router.get("/getPurchaseStockReorderList", async (req, res) => {
         minimum_qty: Number(row.minimum_qty || 0),
         maximum_qty: Number(row.maximum_qty || 0),
         suggest_qty: Number(row.suggest_qty || 0),
+        last_purchase_price: Number(row.last_purchase_price || 0),
         reached_reorder_point: row.reached_reorder_point === true || row.reached_reorder_point === "true",
       }));
       return res.json({ success: true, data: rows, totalCount, totalSuggestQty });
@@ -1667,6 +1867,26 @@ router.get("/getPurchaseStockReorderList", async (req, res) => {
        item_code_list AS (
          SELECT string_agg(item_code, ',') AS codes
          FROM candidates
+       ),
+       last_purchase AS (
+         SELECT
+           c.item_code,
+           c.unit_code,
+           COALESCE(lp.price,0)::numeric AS last_purchase_price,
+           COALESCE(lp.cust_code,'') AS last_purchase_cust_code,
+           COALESCE(ap.name_1,'') AS last_purchase_cust_name
+         FROM candidates c
+         LEFT JOIN LATERAL (
+           SELECT d.price, d.cust_code
+           FROM ic_trans_detail d
+           WHERE d.trans_flag = 12
+             AND COALESCE(d.last_status,0) = 0
+             AND d.item_code = c.item_code
+             AND d.unit_code = c.unit_code
+           ORDER BY d.doc_date DESC, d.doc_time DESC
+           LIMIT 1
+         ) lp ON true
+         LEFT JOIN ap_supplier ap ON ap.code = lp.cust_code
        ),
        stock AS (
          SELECT s.ic_code, SUM(s.balance_qty)::numeric AS real_balance_qty
@@ -1702,10 +1922,14 @@ router.get("/getPurchaseStockReorderList", async (req, res) => {
            (COALESCE(s.real_balance_qty,0) - COALESCE(cart.cart_qty,0))::numeric AS available_qty,
            c.purchase_point,
            c.minimum_qty,
-           c.maximum_qty
+           c.maximum_qty,
+           COALESCE(lp.last_purchase_price,0)::numeric AS last_purchase_price,
+           COALESCE(lp.last_purchase_cust_code,'') AS last_purchase_cust_code,
+           COALESCE(lp.last_purchase_cust_name,'') AS last_purchase_cust_name
          FROM candidates c
          LEFT JOIN stock s ON s.ic_code = c.item_code
          LEFT JOIN cart ON cart.item_code = c.item_code
+         LEFT JOIN last_purchase lp ON lp.item_code = c.item_code AND lp.unit_code = c.unit_code
        ),
        reorder AS (
          SELECT
@@ -1747,6 +1971,7 @@ router.get("/getPurchaseStockReorderList", async (req, res) => {
       minimum_qty: Number(row.minimum_qty || 0),
       maximum_qty: Number(row.maximum_qty || 0),
       suggest_qty: Number(row.suggest_qty || 0),
+      last_purchase_price: Number(row.last_purchase_price || 0),
       reached_reorder_point: row.reached_reorder_point === true || row.reached_reorder_point === "true",
     }));
     return res.json({ success: true, data: rows, totalCount, totalSuggestQty });
@@ -1869,17 +2094,7 @@ router.post("/updateProductItemMain", async (req, res) => {
       await ensureWarehouseShelfRowsExist(client, warehouseShelves);
       await ensureProductUnitUse(client, c, String(unit_standard).trim());
 
-      await client.query(
-        `INSERT INTO ic_inventory_detail (ic_code, purchase_point, minimum_qty, maximum_qty, start_sale_wh, start_sale_shelf)` +
-          ` VALUES ($1::text,$2::numeric,$3::numeric,$4::numeric,$5::text,$6::text)` +
-          ` ON CONFLICT (ic_code) DO UPDATE SET` +
-          ` purchase_point = EXCLUDED.purchase_point,` +
-          ` minimum_qty = EXCLUDED.minimum_qty,` +
-          ` maximum_qty = EXCLUDED.maximum_qty,` +
-          ` start_sale_wh = EXCLUDED.start_sale_wh,` +
-          ` start_sale_shelf = EXCLUDED.start_sale_shelf`,
-        [c, purchasePoint, minimumQty, maximumQty, whCode, shelfCode],
-      );
+      await upsertProductInventoryDetail(client, c, purchasePoint, minimumQty, maximumQty, whCode, shelfCode);
       await replaceProductWarehouseShelves(client, c, warehouseShelves);
       await syncProductUnitType(client, c);
     });
@@ -1974,17 +2189,7 @@ router.post("/createProductItemMain", async (req, res) => {
       await ensureWarehouseShelfRowsExist(client, warehouseShelves);
       await ensureProductUnitUse(client, c, unitStd);
 
-      await client.query(
-        `INSERT INTO ic_inventory_detail (ic_code, purchase_point, minimum_qty, maximum_qty, start_sale_wh, start_sale_shelf)` +
-          ` VALUES ($1::text,$2::numeric,$3::numeric,$4::numeric,$5::text,$6::text)` +
-          ` ON CONFLICT (ic_code) DO UPDATE SET` +
-          ` purchase_point = EXCLUDED.purchase_point,` +
-          ` minimum_qty = EXCLUDED.minimum_qty,` +
-          ` maximum_qty = EXCLUDED.maximum_qty,` +
-          ` start_sale_wh = EXCLUDED.start_sale_wh,` +
-          ` start_sale_shelf = EXCLUDED.start_sale_shelf`,
-        [c, purchasePoint, minimumQty, maximumQty, whCode, shelfCode],
-      );
+      await upsertProductInventoryDetail(client, c, purchasePoint, minimumQty, maximumQty, whCode, shelfCode);
       await replaceProductWarehouseShelves(client, c, warehouseShelves);
       await syncProductUnitType(client, c);
     });
