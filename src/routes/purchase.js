@@ -544,13 +544,13 @@ async function updatePOStatuses(client, newPoDocs, oldPoDocs) {
   for (const poDocNo of affected) {
     const status = await client.query(
       `WITH po_items AS (
-         SELECT item_code, unit_code, SUM(qty) AS po_qty
+         SELECT item_code, unit_code, COALESCE(is_permium,0) AS is_permium, SUM(qty) AS po_qty
          FROM ic_trans_detail
          WHERE doc_no = $1 AND trans_flag = $2
-         GROUP BY item_code, unit_code
+         GROUP BY item_code, unit_code, COALESCE(is_permium,0)
        ),
        pu_items AS (
-         SELECT d.item_code, d.unit_code, SUM(d.qty) AS pu_qty
+         SELECT d.item_code, d.unit_code, COALESCE(d.is_permium,0) AS is_permium, SUM(d.qty) AS pu_qty
          FROM ic_trans_detail d
          JOIN ap_ar_trans_detail ref
            ON ref.doc_no = d.doc_no
@@ -558,7 +558,7 @@ async function updatePOStatuses(client, newPoDocs, oldPoDocs) {
           AND ref.trans_flag IN ($3,310)
          WHERE d.trans_flag IN ($3,310)
            AND COALESCE(d.ref_doc_no,'') = $1
-         GROUP BY d.item_code, d.unit_code
+         GROUP BY d.item_code, d.unit_code, COALESCE(d.is_permium,0)
        )
        SELECT
          COALESCE(SUM(COALESCE(pu.pu_qty,0)),0) AS pu_qty,
@@ -567,7 +567,8 @@ async function updatePOStatuses(client, newPoDocs, oldPoDocs) {
        FROM po_items po
        LEFT JOIN pu_items pu
          ON pu.item_code = po.item_code
-        AND pu.unit_code = po.unit_code`,
+        AND pu.unit_code = po.unit_code
+        AND pu.is_permium = po.is_permium`,
       [poDocNo, PO_TRANS_FLAG, PU_TRANS_FLAG],
     );
     const row = status.rows[0] || {};
@@ -1501,7 +1502,7 @@ router.get('/getDocPoDetail', async (req, res) => {
           COALESCE(po.divide_value,1) AS divide_value,
           COALESCE(po.ratio,1) AS ratio,
           COALESCE(inv.tax_type,0) AS tax_type,
-          COALESCE(MAX(po.is_permium),0) AS is_permium,
+          COALESCE(po.is_permium,0) AS is_permium,
           COALESCE(det.maximum_qty,0) AS maximum_qty,
           COALESCE(det.minimum_qty,0) AS minimum_qty,
           CASE WHEN COALESCE(SUM(pu.qty),0) > 0 THEN 1 ELSE 0 END AS updateable
@@ -1511,6 +1512,7 @@ router.get('/getDocPoDetail', async (req, res) => {
          ON pu.doc_no = ref.doc_no
         AND pu.item_code = po.item_code
         AND pu.unit_code = po.unit_code
+        AND COALESCE(pu.is_permium,0) = COALESCE(po.is_permium,0)
         AND pu.trans_flag IN (${PU_TRANS_FLAG},310)
        LEFT JOIN ic_inventory inv ON inv.code = po.item_code
        LEFT JOIN ic_inventory_detail det ON det.ic_code = po.item_code
