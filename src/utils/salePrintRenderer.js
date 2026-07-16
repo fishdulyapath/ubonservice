@@ -152,6 +152,12 @@ function coordScale(options = {}) {
   return Number.isFinite(scale) && scale > 0 ? scale : COORD_SCALE;
 }
 
+function fontScale(options = {}) {
+  const scale = Number(options.fontScale);
+  if (Number.isFinite(scale) && scale > 0) return scale;
+  return options.csharpPrintTypography ? 1 : coordScale(options);
+}
+
 function toPt(value, fallback = 0, options = {}) {
   return toNumber(value, fallback) * coordScale(options);
 }
@@ -200,7 +206,7 @@ function parseFont(objectBlock, fallback = null, options = {}) {
   const fontName = firstTag(fontBlock, 'Name') || firstTag(objectBlock, 'FontName');
   const fontSize = firstTag(fontBlock, 'Size') || firstTag(objectBlock, 'FontSize');
   const fontStyle = (firstTag(fontBlock, 'Style') || firstTag(objectBlock, 'FontStyle')).toLowerCase();
-  const scale = coordScale(options);
+  const scale = fontScale(options);
   return {
     name: fontName || fallback?.name || DEFAULT_FONT,
     size: fontSize === '' ? (fallback?.size || Math.max(6, 10 * scale)) : Math.max(6, toNumber(fontSize, 10) * scale),
@@ -464,6 +470,7 @@ function getRawValue(fieldName, queryRule, data, row) {
   if (row && Object.prototype.hasOwnProperty.call(row, key)) return row[key];
 
   const rule = normalizeQueryRule(queryRule);
+  if (data.header && Object.prototype.hasOwnProperty.call(data.header, key)) return data.header[key];
   if (rule === 'B') return '';
   if (rule === 'C') return data.company?.[key] ?? '';
   if (['F', 'G', 'I'].includes(rule)) {
@@ -764,7 +771,7 @@ function renderTableObject(object, data, pageRows, pageMeta) {
   const rowHeight = Math.max(14, object.lineSpace || 18);
   const columns = tableColumns(object);
   const visibleHeader = columns.some((column) => tableHeaderText(column));
-  const headerHeight = tableHeaderHeight(object, columns);
+  const headerHeight = tableHeaderHeight(object, columns, pageMeta);
   const borderWidth = object.border.width.toFixed(2);
   const borderColor = object.border.color;
 
@@ -775,7 +782,7 @@ function renderTableObject(object, data, pageRows, pageMeta) {
   const header = visibleHeader ? columns.map((column) => {
     const text = htmlWithLineBreaks(tableHeaderText(column));
     const padding = `${column.padding.top.toFixed(2)}pt ${column.padding.right.toFixed(2)}pt ${column.padding.bottom.toFixed(2)}pt ${column.padding.left.toFixed(2)}pt`;
-    return `<div class="${tableCellClass(column, 'sml-table-header-cell')}" data-min-font-pt="${TABLE_MIN_FONT_PT}" style="left:${column.left.toFixed(2)}pt;top:0;width:${column.width.toFixed(2)}pt;height:${headerHeight.toFixed(2)}pt;text-align:${cssAlign(column.headerAlign)};justify-content:${cssJustify(column.headerAlign)};align-items:${cssVAlign(column.headerAlign)};${fontCss(column.font, tableHeaderFontOptions(column))};line-height:${TABLE_HEADER_LINE_HEIGHT};padding:${padding};"><span class="sml-table-cell-content">${text}</span></div>`;
+    return `<div class="${tableCellClass(column, 'sml-table-header-cell')}" data-min-font-pt="${TABLE_MIN_FONT_PT}" style="left:${column.left.toFixed(2)}pt;top:0;width:${column.width.toFixed(2)}pt;height:${headerHeight.toFixed(2)}pt;text-align:${cssAlign(column.headerAlign)};justify-content:${cssJustify(column.headerAlign)};align-items:${cssVAlign(column.headerAlign)};${fontCss(column.font, tableHeaderFontOptions(pageMeta))};line-height:${TABLE_HEADER_LINE_HEIGHT};padding:${padding};"><span class="sml-table-cell-content">${text}</span></div>`;
   }).join('') : '';
 
   const headerLine = visibleHeader
@@ -784,7 +791,7 @@ function renderTableObject(object, data, pageRows, pageMeta) {
 
   let bodyTop = headerHeight;
   const body = pageRows.map((row) => {
-    const rowUnits = Math.max(1, row.__printLineUnits || estimateTableRowUnits(row, columns, data));
+    const rowUnits = Math.max(1, row.__printLineUnits || estimateTableRowUnits(row, columns, data, pageMeta));
     const top = bodyTop;
     const height = rowHeight * rowUnits;
     bodyTop += height;
@@ -794,7 +801,7 @@ function renderTableObject(object, data, pageRows, pageMeta) {
       const text = htmlWithLineBreaks(value);
       const textAlign = tableBodyAlign(column, pageMeta);
       const justifyContent = tableBodyJustify(column, pageMeta);
-      return `<div class="${tableCellClass(column)}" data-min-font-pt="${TABLE_MIN_FONT_PT}" style="left:${column.left.toFixed(2)}pt;top:${top.toFixed(2)}pt;width:${column.width.toFixed(2)}pt;height:${height.toFixed(2)}pt;text-align:${textAlign};justify-content:${justifyContent};align-items:${cssVAlign(column.align)};${fontCss(column.font, tableBodyFontOptions(column))};line-height:${TABLE_BODY_LINE_HEIGHT};padding:${padding};"><span class="sml-table-cell-content">${text}</span></div>`;
+      return `<div class="${tableCellClass(column)}" data-min-font-pt="${TABLE_MIN_FONT_PT}" style="left:${column.left.toFixed(2)}pt;top:${top.toFixed(2)}pt;width:${column.width.toFixed(2)}pt;height:${height.toFixed(2)}pt;text-align:${textAlign};justify-content:${justifyContent};align-items:${cssVAlign(column.align)};${fontCss(column.font, tableBodyFontOptions(column, pageMeta))};line-height:${TABLE_BODY_LINE_HEIGHT};padding:${padding};"><span class="sml-table-cell-content">${text}</span></div>`;
     }).join('');
     return cells;
   }).join('');
@@ -836,11 +843,11 @@ function primaryDetailTable(page) {
     || page.objects.find((object) => object.toolType === 'Table');
 }
 
-function maxRowsForPage(page) {
+function maxRowsForPage(page, formOptions = {}) {
   const table = primaryDetailTable(page);
   if (!table) return 0;
   if (table.rowPerPage > 0) return table.rowPerPage;
-  const headerHeight = tableHeaderHeight(table, tableColumns(table));
+  const headerHeight = tableHeaderHeight(table, tableColumns(table), { formOptions });
   const rowHeight = Math.max(14, table.lineSpace || 18);
   return Math.max(1, Math.floor((table.height - headerHeight) / rowHeight));
 }
@@ -877,7 +884,12 @@ function isNumericTableColumn(column) {
   return /(^|_)(qty|quantity|price|amount|discount|sum|total|vat|value|rate|balance|credit|cash|card|change|cost|fee|charge)(_|$)/i.test(fieldName);
 }
 
-function tableHeaderFontOptions() {
+function useCSharpPrintTypography(pageMeta) {
+  return !!pageMeta?.formOptions?.csharpPrintTypography;
+}
+
+function tableHeaderFontOptions(pageMeta) {
+  if (useCSharpPrintTypography(pageMeta)) return { minSizePt: TABLE_MIN_FONT_PT };
   return {
     sizeDeltaPt: TABLE_HEADER_FONT_DELTA_PT,
     maxSizePt: TABLE_HEADER_MAX_FONT_PT,
@@ -885,7 +897,8 @@ function tableHeaderFontOptions() {
   };
 }
 
-function tableBodyFontOptions(column) {
+function tableBodyFontOptions(column, pageMeta) {
+  if (useCSharpPrintTypography(pageMeta)) return { minSizePt: TABLE_MIN_FONT_PT };
   return {
     sizeDeltaPt: DETAIL_ITEM_FONT_DELTA_PT,
     maxSizePt: isNumericTableColumn(column) ? TABLE_DETAIL_MAX_FONT_PT : TABLE_DETAIL_TEXT_MAX_FONT_PT,
@@ -893,12 +906,12 @@ function tableBodyFontOptions(column) {
   };
 }
 
-function tableHeaderFontSizePt(column) {
-  return resolveFontSizePt(column.font, tableHeaderFontOptions(column));
+function tableHeaderFontSizePt(column, pageMeta) {
+  return resolveFontSizePt(column.font, tableHeaderFontOptions(pageMeta));
 }
 
-function tableBodyFontSizePt(column) {
-  return resolveFontSizePt(column.font, tableBodyFontOptions(column));
+function tableBodyFontSizePt(column, pageMeta) {
+  return resolveFontSizePt(column.font, tableBodyFontOptions(column, pageMeta));
 }
 
 function htmlWithLineBreaks(value) {
@@ -913,37 +926,37 @@ function tableCellClass(column, extraClass = '') {
   ].filter(Boolean).join(' ');
 }
 
-function estimateHeaderLineCount(column) {
+function estimateHeaderLineCount(column, pageMeta) {
   const text = String(tableHeaderText(column) || '').replace(/\\n/g, '\n').trim();
   if (!text) return 1;
-  const fontSize = tableHeaderFontSizePt(column);
+  const fontSize = tableHeaderFontSizePt(column, pageMeta);
   const availableWidth = Math.max(8, column.width - column.padding.left - column.padding.right);
   const charsPerLine = Math.max(3, Math.floor(availableWidth / (fontSize * 0.5)));
   return Math.max(1, ...text.split('\n').map((line) => Math.max(1, Math.ceil(line.length / charsPerLine))));
 }
 
-function tableHeaderHeight(object, columns) {
+function tableHeaderHeight(object, columns, pageMeta) {
   const visibleHeader = columns.some((column) => tableHeaderText(column));
   if (!visibleHeader) return 0;
   const baseHeight = Math.max(18, Math.min(42, object.height * 0.13));
-  const maxLines = Math.min(3, Math.max(...columns.map(estimateHeaderLineCount)));
-  const maxFontSize = Math.max(...columns.map(tableHeaderFontSizePt));
+  const maxLines = Math.min(3, Math.max(...columns.map((column) => estimateHeaderLineCount(column, pageMeta))));
+  const maxFontSize = Math.max(...columns.map((column) => tableHeaderFontSizePt(column, pageMeta)));
   const neededHeight = Math.ceil((maxFontSize * TABLE_HEADER_LINE_HEIGHT * maxLines) + 4);
   return Math.max(baseHeight, Math.min(42, neededHeight));
 }
 
-function estimateCellLineCount(value, column) {
+function estimateCellLineCount(value, column, pageMeta) {
   const text = String(value ?? '').replace(/\r/g, '').trim();
   if (!text) return 1;
   if (isNumericTableColumn(column)) return 1;
-  const fontSize = tableBodyFontSizePt(column);
+  const fontSize = tableBodyFontSizePt(column, pageMeta);
   const availableWidth = Math.max(8, column.width - column.padding.left - column.padding.right);
   const charsPerLine = Math.max(4, Math.floor(availableWidth / (fontSize * 0.44)));
   return Math.max(1, ...text.split('\n').map((line) => Math.max(1, Math.ceil(line.length / charsPerLine))));
 }
 
-function estimateTableRowUnits(row, columns, data) {
-  const units = columns.map((column) => estimateCellLineCount(resolveTableCell(column, data, row), column));
+function estimateTableRowUnits(row, columns, data, pageMeta) {
+  const units = columns.map((column) => estimateCellLineCount(resolveTableCell(column, data, row), column, pageMeta));
   return Math.max(1, Math.min(4, Math.max(...units)));
 }
 
@@ -1084,9 +1097,11 @@ function renderSalePrintHtml({
   coordinateScale = COORD_SCALE,
   csharpTextAlignment = false,
   advancePaymentMethodChecks = false,
+  csharpPrintTypography = false,
+  fontScale: printFontScale,
   pageSize = 'A4',
 }) {
-  const rendererOptions = { coordinateScale, csharpTextAlignment, advancePaymentMethodChecks };
+  const rendererOptions = { coordinateScale, csharpTextAlignment, advancePaymentMethodChecks, csharpPrintTypography, fontScale: printFontScale };
   const printPageSize = /^[a-z0-9 ._-]+$/i.test(String(pageSize || '')) ? String(pageSize || 'A4') : 'A4';
   const forms = formRows.map((form) => parseFormDesign(form, rendererOptions)).filter((form) => form.pages.length);
   const pages = forms.map((form) => renderForm(form, data)).join('\n');
@@ -1231,6 +1246,7 @@ ${pages || '<div style="padding:24px">ไม่พบแบบฟอร์มส
     }
   }
   function fitSmlPrintText() {
+    if (${csharpPrintTypography ? 'true' : 'false'}) return;
     document.querySelectorAll('.sml-text').forEach(function (el) {
       var content = el.querySelector('.sml-text-content');
       shrinkContentToFit(el, content, { minSize: 7, fitWidth: true, fitHeight: false });

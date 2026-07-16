@@ -598,6 +598,7 @@ async function loadPaymentRowsForPrint(docNo) {
 
   const labels = [];
   const amounts = [];
+  const advanceNumbers = [];
   const addPayment = (label, amount) => {
     const text = asAmountText(amount);
     if (!text) return;
@@ -652,7 +653,7 @@ async function loadArDebtPaymentPrintDocument(docNo) {
           COALESCE(t.total_net_value,0) AS total_amount,
           COALESCE(t.total_net_value,0) AS total_net_amount,
           GREATEST(ROUND(COALESCE(t.total_net_value,0) - COALESCE(cb.discount_amount,0), 2), 0) AS total_after_discount,
-          COALESCE(cb.total_amount_pay, t.total_net_value, 0) AS total_amount_pay,
+          COALESCE(NULLIF(cb.total_amount_pay,0), t.total_net_value, 0) AS total_amount_pay,
           COALESCE(cb.cash_amount,0) AS cash_amount,
           COALESCE(cb.tranfer_amount,0) AS tranfer_amount,
           COALESCE(cb.tranfer_amount,0) AS transfer_amount,
@@ -661,6 +662,44 @@ async function loadArDebtPaymentPrintDocument(docNo) {
           COALESCE(cb.total_income_amount,0) AS total_income_amount,
           COALESCE(cb.petty_cash_amount,0) AS petty_cash_amount,
           COALESCE(cb.discount_amount,0) AS discount_amount,
+          COALESCE((
+            SELECT SUM(
+              GREATEST(
+                ROUND(COALESCE(h.total_amount,0) - COALESCE(used.used_amount,0), 2),
+                0
+              )
+            )
+            FROM ic_trans h
+            LEFT JOIN LATERAL (
+              SELECT SUM(COALESCE(d.amount,0)) AS used_amount
+              FROM cb_trans_detail d
+              WHERE COALESCE(d.last_status,0) = 0
+                AND d.doc_type = 5
+                AND d.trans_number = h.doc_no
+            ) used ON true
+            WHERE h.trans_flag IN (40,9040)
+              AND COALESCE(h.last_status,0) = 0
+              AND COALESCE(h.is_doc_copy,0) <> 1
+              AND h.cust_code = t.cust_code
+          ),0) AS total_advance_balance,
+          COALESCE((
+            SELECT string_agg(DISTINCT NULLIF(d.trans_number,''), ', ' ORDER BY NULLIF(d.trans_number,''))
+            FROM cb_trans_detail d
+            WHERE d.doc_no = t.doc_no
+              AND d.trans_flag = t.trans_flag
+              AND d.doc_type = 5
+              AND COALESCE(d.last_status,0) = 0
+              AND COALESCE(d.trans_number,'') <> ''
+          ),'') AS trans_numbers,
+          COALESCE((
+            SELECT string_agg(DISTINCT NULLIF(d.trans_number,''), ', ' ORDER BY NULLIF(d.trans_number,''))
+            FROM cb_trans_detail d
+            WHERE d.doc_no = t.doc_no
+              AND d.trans_flag = t.trans_flag
+              AND d.doc_type = 5
+              AND COALESCE(d.last_status,0) = 0
+              AND COALESCE(d.trans_number,'') <> ''
+          ),'') AS advance_payment_doc_no,
           COALESCE(cb.discount_amount,0) AS total_discount,
           COALESCE(t.discount_word,'') AS discount_word,
           COALESCE(df.name_1,'') AS doc_format_name,
@@ -1667,6 +1706,7 @@ router.get('/ar-debt-payment/print/render', async (req, res) => {
       autoPrint: String(auto_print) !== '0',
       coordinateScale: 0.72,
       csharpTextAlignment: true,
+      csharpPrintTypography: true,
       pageSize: 'Letter',
     });
     res.setHeader('Cache-Control', 'no-store');
