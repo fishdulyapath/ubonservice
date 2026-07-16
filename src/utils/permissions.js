@@ -8,6 +8,7 @@ const PERMISSIONS = [
   { key: 'sales.cash.view', label: 'ประวัติขายเงินสด: เข้าหน้าจอ' },
   { key: 'sales.credit.view', label: 'ประวัติขายเงินเชื่อ: เข้าหน้าจอ' },
   { key: 'sales.product_history.view', label: 'ประวัติการขายตามสินค้า: เข้าหน้าจอ' },
+  { key: 'sales.cancel', label: 'ประวัติการขาย: ยกเลิกเอกสารขาย' },
   { key: 'sales.return.view', label: 'รับคืนสินค้า/ลดหนี้: เข้าหน้าจอ' },
   { key: 'sales.return.create', label: 'รับคืนสินค้า/ลดหนี้: สร้างเอกสาร' },
   { key: 'sales.return.print', label: 'รับคืนสินค้า/ลดหนี้: พิมพ์เอกสาร' },
@@ -43,6 +44,8 @@ const PERMISSIONS = [
 ];
 
 const ALL_PERMISSION_KEYS = PERMISSIONS.map((p) => p.key);
+const DEFAULT_DENIED_PERMISSION_KEYS = new Set(['sales.cancel']);
+const DEFAULT_PERMISSION_KEYS = ALL_PERMISSION_KEYS.filter((key) => !DEFAULT_DENIED_PERMISSION_KEYS.has(key));
 
 async function getEmployeePermissions(query, userCode) {
   if (!userCode) return ALL_PERMISSION_KEYS;
@@ -55,13 +58,13 @@ async function getEmployeePermissions(query, userCode) {
        ORDER BY permission_key`,
       [userCode],
     );
-    if (result.rows.length === 0) return ALL_PERMISSION_KEYS;
+    if (result.rows.length === 0) return DEFAULT_PERMISSION_KEYS;
     return result.rows
       .filter((r) => r.is_allowed === true)
       .map((r) => r.permission_key)
       .filter((key) => ALL_PERMISSION_KEYS.includes(key));
   } catch (ex) {
-    if (ex.code === '42P01') return ALL_PERMISSION_KEYS;
+    if (ex.code === '42P01') return DEFAULT_PERMISSION_KEYS;
     throw ex;
   }
 }

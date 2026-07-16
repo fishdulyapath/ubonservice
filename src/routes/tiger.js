@@ -368,6 +368,35 @@ async function markTigerPendingPaid(client, row, { amount: amountInput, source =
   };
 }
 
+
+async function markTigerPendingCanceled(client, row, { amount: amountInput, source = 'tiger' } = {}) {
+  const meta = parseTigerMeta(row.tiger_status_note);
+  const amount = Number(amountInput ?? meta.amount ?? row.tiger_pending_amount ?? 0);
+  const now = new Date().toISOString();
+  const nextMeta = {
+    ...meta,
+    status: 'cancel',
+    amount: Number.isFinite(amount) ? amount : 0,
+    last_checked: now,
+    canceled_at: now,
+    mock: source === 'mock',
+  };
+
+  await client.query(
+    `UPDATE ic_trans
+     SET send_sms = 0,
+         remark_5 = $1
+     WHERE doc_no = $2
+       AND trans_flag = 44
+       AND COALESCE(send_sms,0) = 1`,
+    [tigerMetaText(nextMeta), row.doc_no],
+  );
+  return {
+    ...pendingRow({ ...row, tiger_status_note: tigerMetaText(nextMeta) }),
+    tiger_status: 'cancel',
+    tiger_amount: nextMeta.amount,
+  };
+}
 // GET /service/v1/tiger/config — บอก frontend ว่าระบบ Tiger เปิดใช้งานหรือไม่
 router.get('/tiger/config', async (req, res) => {
   try {
@@ -560,6 +589,17 @@ router.post('/tiger/pending/check-next', async (req, res) => {
         checked: true,
         paid: true,
         data: paidData,
+      });
+    }
+
+    if (status === 'cancel' || status === 'cancelled') {
+      const cancelData = await markTigerPendingCanceled(client, row, { amount, source: 'tiger' });
+      return res.json({
+        success: true,
+        checked: true,
+        paid: false,
+        canceled: true,
+        data: cancelData,
       });
     }
 

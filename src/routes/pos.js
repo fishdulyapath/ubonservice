@@ -8,7 +8,164 @@ const { getEmployeePermissions } = require('../utils/permissions');
 
 const uuidv4 = () => crypto.randomUUID();
 const SOLD_OUT_PURCHASE_INFO_PERMISSION = 'sold_out.purchase_info.view';
+const SALES_CANCEL_PERMISSION = 'sales.cancel';
 
+
+function safeText(value) {
+  return String(value ?? '').trim();
+}
+
+function envFlag(...names) {
+  return names.some((name) => ['true', '1', 'yes', 'on'].includes(String(process.env[name] || '').trim().toLowerCase()));
+}
+
+function tigerMockEnabled() {
+  return envFlag('TIGER_MOCK', 'TIGER_PENDING_MOCK', 'VITE_TIGER_MOCK', 'VITE_TIGER_PENDING_MOCK');
+}
+
+function canQueryTigerOrderId(value) {
+  return /^[1-9]\d*$/.test(String(value || '').trim());
+}
+
+function isMockTigerOrderId(value) {
+  return /^MOCK-/i.test(String(value || '').trim());
+}
+
+function parseTigerMeta(text) {
+  try {
+    const obj = JSON.parse(text || '{}');
+    return obj && typeof obj === 'object' ? obj : {};
+  } catch {
+    return {};
+  }
+}
+
+function tigerMetaText(meta) {
+  const text = JSON.stringify(meta);
+  if (text.length <= 255) return text;
+  return JSON.stringify({
+    status: meta.status || '',
+    amount: meta.amount || 0,
+    last_checked: meta.last_checked || '',
+    cancel_doc_no: meta.cancel_doc_no || '',
+  });
+}
+
+function tigerStatusFromResponse(data) {
+  const payload = data?.data || data || {};
+  return String(payload.status || data?.status || '').toLowerCase();
+}
+
+async function loadTigerConfigForSaleCancel(client) {
+  const envEndPoint = safeText(process.env.TIGER_API_URL || process.env.TIGER_END_POINT);
+  const envAppId = safeText(process.env.TIGER_APP_ID);
+  const envApiKey = safeText(process.env.TIGER_API_KEY || process.env.TIGER_X_API_KEY);
+  if (envEndPoint && envAppId && envApiKey) {
+    return { appId: envAppId, endPoint: envEndPoint, apiKey: envApiKey };
+  }
+
+  const result = await client.query(
+    'SELECT tiger_app_id, tiger_end_point, tiger_x_api_key FROM erp_option LIMIT 1',
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  const appId = safeText(row.tiger_app_id);
+  const endPoint = safeText(row.tiger_end_point);
+  const apiKey = safeText(row.tiger_x_api_key);
+  if (!appId || !endPoint || !apiKey) return null;
+  return { appId, endPoint, apiKey };
+}
+
+async function cancelTigerOrderForSale(client, tigerOrderId) {
+  const id = safeText(tigerOrderId);
+  if (!id) return null;
+  if (isMockTigerOrderId(id) && tigerMockEnabled()) return { id, status: 'cancel', mock: true };
+  if (!canQueryTigerOrderId(id)) {
+    const err = new Error(`invalid tiger order id: ${id}`);
+    err.status = 400;
+    throw err;
+  }
+
+  const cfg = await loadTigerConfigForSaleCancel(client);
+  if (!cfg) {
+    const err = new Error('Tiger not configured');
+    err.status = 503;
+    throw err;
+  }
+
+  const url = `${cfg.endPoint.replace(/\/$/, '')}/orders/${encodeURIComponent(id)}`;
+  const headers = {
+    'app-id': cfg.appId,
+    'x-api-key': cfg.apiKey,
+    'Content-Type': 'application/json',
+  };
+  const tigerRes = await fetch(url, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify({ status: 'cancel' }),
+  });
+  const text = await tigerRes.text();
+  let data;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!tigerRes.ok) {
+    const err = new Error((data && data.message) || `Tiger API ${tigerRes.status}`);
+    err.status = tigerRes.status;
+    err.data = data;
+    throw err;
+  }
+
+  const putStatus = tigerStatusFromResponse(data);
+  if (['cancel', 'cancelled'].includes(putStatus)) return data;
+
+  const checkRes = await fetch(url, { method: 'GET', headers });
+  const checkText = await checkRes.text();
+  let checkData;
+  try { checkData = checkText ? JSON.parse(checkText) : null; } catch { checkData = checkText; }
+  if (!checkRes.ok) {
+    const err = new Error((checkData && checkData.message) || `Tiger status API ${checkRes.status}`);
+    err.status = checkRes.status;
+    err.data = { cancel_response: data, status_response: checkData };
+    throw err;
+  }
+
+  return {
+    status: tigerStatusFromResponse(checkData),
+    cancel_response: data,
+    status_response: checkData,
+  };
+}
+
+async function verifySaleCancelUser(client, username, password) {
+  const userCode = safeText(username);
+  if (!userCode || !String(password || '')) {
+    const err = new Error('username and password are required');
+    err.status = 400;
+    throw err;
+  }
+
+  const userRes = await client.query(
+    `SELECT code AS user_code, name_1 AS user_name
+     FROM erp_user
+     WHERE UPPER(code) = UPPER($1) AND password = $2
+     ORDER BY code
+     LIMIT 1`,
+    [userCode, password || ''],
+  );
+  if (userRes.rows.length === 0) {
+    const err = new Error('invalid username or password');
+    err.status = 401;
+    throw err;
+  }
+
+  const user = userRes.rows[0];
+  const permissions = await getEmployeePermissions(client.query.bind(client), user.user_code);
+  if (!permissions.includes(SALES_CANCEL_PERMISSION)) {
+    const err = new Error(`permission denied: ${SALES_CANCEL_PERMISSION}`);
+    err.status = 403;
+    throw err;
+  }
+  return user;
+}
 function activeProductCondition(alias = 'd') {
   return `COALESCE(${alias}.is_hold_sale,0) <> 1 AND COALESCE(${alias}.is_hold_purchase,0) <> 1`;
 }
@@ -195,6 +352,39 @@ async function resolveSaleDocNo(client, docFormatCode, transFlag) {
 }
 
 // ── GET /service/v1/getBranchList ──────────────────────────────────────────
+
+async function refreshSaleInventoryBalanceQty(client, itemCodes = []) {
+  const uniqueCodes = [...new Set((itemCodes || []).map((code) => safeText(code)).filter(Boolean))];
+  for (const itemCode of uniqueCodes) {
+    const balanceRes = await client.query(
+      `SELECT COALESCE(SUM(balance_qty), 0) AS new_balance
+       FROM sml_ic_function_stock_balance_warehouse_location('NOW()', $1, '', '')`,
+      [itemCode],
+    );
+    await client.query(
+      'UPDATE ic_inventory SET balance_qty = $1 WHERE code = $2',
+      [roundMoney(balanceRes.rows[0]?.new_balance || 0), itemCode],
+    );
+  }
+}
+
+async function resolveCancelSaleDocNo(client) {
+  const result = await client.query(
+    `SELECT code, name_1, format, COALESCE(form_code,'') AS form_code
+     FROM erp_doc_format
+     WHERE screen_code = 'SIC' AND code = 'SIC'
+     LIMIT 1`,
+  );
+  const docFormat = result.rows[0];
+  if (!docFormat) throw new Error('cancel sale doc_format_code not found: SIC');
+  const pattern = buildDocPattern(docFormat.format || '@-YYMM####', docFormat.code);
+  const docNo = await resolveDocNoFromPattern(client, pattern, 45);
+  return {
+    doc_no: docNo,
+    doc_format_code: docFormat.code,
+    form_code: docFormat.form_code || '',
+  };
+}
 async function resolveCustomerCredit(client, custCode, docDate, inquiryType) {
   if (![0, 2].includes(Number(inquiryType))) {
     return { credit_day: null, credit_date: null };
@@ -1290,7 +1480,7 @@ router.get('/getDocSaleHistory', async (req, res) => {
       const clauses = tokens.map((tok) => {
         params.push(`%${tok}%`);
         const idx = params.length;
-        return `(ict.doc_no ILIKE $${idx} OR ict.cust_code ILIKE $${idx} OR ar.name_1 ILIKE $${idx})`;
+        return `(ict.doc_no ILIKE $${idx} OR cancel_doc.doc_no ILIKE $${idx} OR ict.cust_code ILIKE $${idx} OR ar.name_1 ILIKE $${idx})`;
       });
       whereExtra = clauses.length ? ` AND (${clauses.join(' AND ')})` : '';
     } else if (from_date.trim() && to_date.trim()) {
@@ -1307,6 +1497,10 @@ router.get('/getDocSaleHistory', async (req, res) => {
         COALESCE(ict.send_sms,0) AS send_sms,
         COALESCE(ict.remark_3,'') AS tiger_order_id,
         COALESCE(ict.remark_5,'') AS tiger_status_note,
+        COALESCE(ict.last_status,0) AS last_status,
+        cancel_doc.doc_no AS cancel_doc_no,
+        cancel_doc.doc_date AS cancel_doc_date,
+        COALESCE(cancel_doc.remark,'') AS cancel_remark,
         cb.cash_amount, cb.tranfer_amount, cb.card_amount, cb.wallet_amount, cb.deposit_amount,
         cb.total_credit_charge,
         COALESCE(NULLIF(cb.total_net_amount,0), ict.total_amount, 0) AS total_net_amount,
@@ -1316,8 +1510,16 @@ router.get('/getDocSaleHistory', async (req, res) => {
       LEFT JOIN ar_customer ar ON ar.code = ict.cust_code
       LEFT JOIN cb_trans cb ON cb.doc_no = ict.doc_no AND cb.trans_flag = 44
       LEFT JOIN erp_doc_format df ON df.screen_code = 'SI' AND df.code = ict.doc_format_code
+      LEFT JOIN LATERAL (
+        SELECT c.doc_no, c.doc_date, c.remark
+        FROM ic_trans c
+        WHERE c.trans_flag = 45
+          AND c.doc_ref = ict.doc_no
+          AND COALESCE(c.last_status,0) = 0
+        ORDER BY c.create_datetime DESC, c.doc_no DESC
+        LIMIT 1
+      ) cancel_doc ON true
       WHERE ict.trans_flag = 44
-        AND ict.last_status = 0
         ${saleKindWhere}
         ${whereExtra}
       ORDER BY ict.create_datetime DESC
@@ -1351,6 +1553,7 @@ router.get('/getProductSaleHistory', async (req, res) => {
         const idx = params.length;
         return `(
           t.doc_no ILIKE $${idx}
+          OR cancel_doc.doc_no ILIKE $${idx}
           OR t.cust_code ILIKE $${idx}
           OR ar.name_1 ILIKE $${idx}
           OR EXISTS (
@@ -1386,6 +1589,10 @@ router.get('/getProductSaleHistory', async (req, res) => {
         COALESCE(t.send_sms,0) AS send_sms,
         COALESCE(t.remark_3,'') AS tiger_order_id,
         COALESCE(t.remark_5,'') AS tiger_status_note,
+        COALESCE(t.last_status,0) AS last_status,
+        cancel_doc.doc_no AS cancel_doc_no,
+        cancel_doc.doc_date AS cancel_doc_date,
+        COALESCE(cancel_doc.remark,'') AS cancel_remark,
         cb.cash_amount,
         cb.tranfer_amount,
         cb.card_amount,
@@ -1399,8 +1606,16 @@ router.get('/getProductSaleHistory', async (req, res) => {
       LEFT JOIN ar_customer ar ON ar.code = t.cust_code
       LEFT JOIN cb_trans cb ON cb.doc_no = t.doc_no AND cb.trans_flag = 44
       LEFT JOIN erp_doc_format df ON df.screen_code = 'SI' AND df.code = t.doc_format_code
+      LEFT JOIN LATERAL (
+        SELECT c.doc_no, c.doc_date, c.remark
+        FROM ic_trans c
+        WHERE c.trans_flag = 45
+          AND c.doc_ref = t.doc_no
+          AND COALESCE(c.last_status,0) = 0
+        ORDER BY c.create_datetime DESC, c.doc_no DESC
+        LIMIT 1
+      ) cancel_doc ON true
       WHERE t.trans_flag = 44
-        AND COALESCE(t.last_status,0) = 0
         AND EXISTS (
           SELECT 1
           FROM ic_trans_detail d
@@ -1429,7 +1644,7 @@ router.get('/getDocSaleHistoryDetail', async (req, res) => {
   try {
     const [headerRes, itemsRes, promotionTableRes] = await Promise.all([
       query(
-        `SELECT t.inquiry_type, t.vat_type, t.vat_rate,
+        `SELECT t.doc_no, t.doc_date, t.doc_time, t.inquiry_type, t.vat_type, t.vat_rate,
             COALESCE(t.doc_format_code,'') AS doc_format_code,
             COALESCE(df.name_1,'') AS doc_format_name,
             COALESCE(df.form_code,'') AS form_code,
@@ -1438,6 +1653,10 @@ router.get('/getDocSaleHistoryDetail', async (req, res) => {
             COALESCE(t.send_sms,0) AS send_sms,
             COALESCE(t.remark_3,'') AS tiger_order_id,
             COALESCE(t.remark_5,'') AS tiger_status_note,
+        COALESCE(t.last_status,0) AS last_status,
+        cancel_doc.doc_no AS cancel_doc_no,
+        cancel_doc.doc_date AS cancel_doc_date,
+        COALESCE(cancel_doc.remark,'') AS cancel_remark,
             COALESCE(NULLIF(cb.total_net_amount,0), t.total_amount, 0) AS total_net_amount,
             cb.total_net_amount AS payment_net_amount,
             COALESCE(cb.cash_amount, 0) AS cash_amount,
@@ -1449,6 +1668,15 @@ router.get('/getDocSaleHistoryDetail', async (req, res) => {
          FROM ic_trans t
          LEFT JOIN cb_trans cb ON cb.doc_no = t.doc_no AND cb.trans_flag = 44
          LEFT JOIN erp_doc_format df ON df.screen_code = 'SI' AND df.code = t.doc_format_code
+         LEFT JOIN LATERAL (
+           SELECT c.doc_no, c.doc_date, c.remark
+           FROM ic_trans c
+           WHERE c.trans_flag = 45
+             AND c.doc_ref = t.doc_no
+             AND COALESCE(c.last_status,0) = 0
+           ORDER BY c.create_datetime DESC, c.doc_no DESC
+           LIMIT 1
+         ) cancel_doc ON true
          WHERE t.trans_flag = 44 AND t.doc_no = $1 LIMIT 1`,
         [doc_no]
       ),
@@ -1494,6 +1722,173 @@ router.get('/getDocSaleHistoryDetail', async (req, res) => {
     });
   } catch (ex) {
     return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
+// ── POST /service/v1/sales/cancel ───────────────────────────────────────────
+router.post('/sales/cancel', async (req, res) => {
+  const payload = req.body || {};
+  const docNo = safeText(payload.doc_no);
+  const reason = safeText(payload.reason || payload.remark);
+  const username = safeText(payload.username || payload.user_code);
+  const password = String(payload.password || '');
+
+  if (!docNo) return res.status(400).json({ success: false, msg: 'doc_no is required' });
+  if (!reason) return res.status(400).json({ success: false, msg: 'reason is required' });
+  if (!username || !password) return res.status(400).json({ success: false, msg: 'username and password are required' });
+
+  try {
+    const result = await withTransaction(async (client) => {
+      const verifiedUser = await verifySaleCancelUser(client, username, password);
+      const saleRes = await client.query(
+        `SELECT t.doc_no, t.doc_date, t.doc_time, t.cust_code, t.branch_code,
+                t.member_code, t.pos_id, t.sale_shift_id, t.vat_rate, t.vat_type,
+                t.inquiry_type, t.doc_format_code, COALESCE(t.last_status,0) AS last_status,
+                COALESCE(t.send_sms,0) AS send_sms,
+                COALESCE(t.remark_3,'') AS tiger_order_id,
+                COALESCE(t.remark_5,'') AS tiger_status_note,
+                GREATEST(
+                  COALESCE(cb.total_net_amount, t.total_amount, 0)
+                  - COALESCE(cb.cash_amount, 0)
+                  - COALESCE(cb.tranfer_amount, 0)
+                  - COALESCE(cb.card_amount, 0)
+                  - COALESCE(cb.wallet_amount, 0),
+                  0
+                ) AS tiger_pending_amount
+         FROM ic_trans t
+         LEFT JOIN cb_trans cb ON cb.doc_no = t.doc_no AND cb.trans_flag = 44
+         WHERE t.trans_flag = 44 AND t.doc_no = $1
+         LIMIT 1
+         FOR UPDATE OF t`,
+        [docNo],
+      );
+      const sale = saleRes.rows[0];
+      if (!sale) {
+        const err = new Error('sale document not found');
+        err.status = 404;
+        throw err;
+      }
+      if (Number(sale.last_status || 0) === 1) {
+        const err = new Error('sale document is already cancelled');
+        err.status = 409;
+        throw err;
+      }
+
+      const existingCancel = await client.query(
+        `SELECT doc_no
+         FROM ic_trans
+         WHERE trans_flag = 45
+           AND doc_ref = $1
+           AND COALESCE(last_status,0) = 0
+         ORDER BY create_datetime DESC, doc_no DESC
+         LIMIT 1`,
+        [docNo],
+      );
+      if (existingCancel.rows.length > 0) {
+        const err = new Error(`sale document already has cancel document: ${existingCancel.rows[0].doc_no}`);
+        err.status = 409;
+        throw err;
+      }
+
+      let tigerCancelStatus = '';
+      let tigerCancelData = null;
+      const hasTigerPending = Number(sale.send_sms || 0) === 1 && safeText(sale.tiger_order_id);
+      if (hasTigerPending) {
+        tigerCancelData = await cancelTigerOrderForSale(client, sale.tiger_order_id);
+        tigerCancelStatus = tigerStatusFromResponse(tigerCancelData);
+        if (!['cancel', 'cancelled'].includes(tigerCancelStatus)) {
+          const err = new Error(`Tiger cancel did not confirm cancel status: ${tigerCancelStatus}`);
+          err.status = 409;
+          err.data = tigerCancelData;
+          throw err;
+        }
+      }
+
+      const now = new Date();
+      const pad = (value) => String(value).padStart(2, '0');
+      const docDate = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+      const docTime = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+      const cancelDoc = await resolveCancelSaleDocNo(client);
+      const cancelDocNo = cancelDoc.doc_no;
+
+      await client.query(
+        `INSERT INTO ic_trans (
+          doc_date, doc_time, doc_no, tax_doc_date, tax_doc_no,
+          vat_rate, creator_code, cust_code, trans_flag, trans_type,
+          inquiry_type, vat_type, total_amount, pos_id, is_pos,
+          member_code, branch_code, doc_ref, sale_shift_id, remark,
+          doc_format_code, last_status, used_status, doc_success,
+          total_value, total_before_vat, total_after_vat, total_except_vat, total_vat_value
+        )
+        SELECT
+          $2::date, $3, $4, $2::date, $4,
+          COALESCE(vat_rate,0), $5, cust_code, 45, 2,
+          COALESCE(inquiry_type,0), COALESCE(vat_type,0), 0, COALESCE(pos_id,''), 0,
+          COALESCE(member_code,''), COALESCE(branch_code,''), doc_no, COALESCE(sale_shift_id,''), $6,
+          'SIC', 0, 0, 0,
+          0, 0, 0, 0, 0
+        FROM ic_trans
+        WHERE trans_flag = 44 AND doc_no = $1`,
+        [docNo, docDate, docTime, cancelDocNo, verifiedUser.user_code, reason],
+      );
+
+      await client.query(
+        'UPDATE ic_trans SET last_status = 1 WHERE trans_flag = 44 AND doc_no = $1',
+        [docNo],
+      );
+      await client.query(
+        'UPDATE cb_trans SET status = 1 WHERE doc_no = $1 AND trans_flag = 44',
+        [docNo],
+      );
+      await client.query(
+        'UPDATE ic_trans_detail SET last_status = 1 WHERE doc_no = $1 AND trans_flag = 44',
+        [docNo],
+      );
+      await client.query(
+        'UPDATE cb_trans_detail SET last_status = 1 WHERE doc_no = $1',
+        [docNo],
+      );
+
+      if (hasTigerPending) {
+        const meta = parseTigerMeta(sale.tiger_status_note);
+        const nextMeta = {
+          ...meta,
+          status: 'cancel',
+          amount: Number(meta.amount || sale.tiger_pending_amount || 0),
+          last_checked: new Date().toISOString(),
+          canceled_at: new Date().toISOString(),
+          cancel_doc_no: cancelDocNo,
+        };
+        await client.query(
+          `UPDATE ic_trans
+           SET send_sms = 0,
+               remark_5 = $2
+           WHERE trans_flag = 44 AND doc_no = $1`,
+          [docNo, tigerMetaText(nextMeta)],
+        );
+      }
+
+      const itemRes = await client.query(
+        `SELECT DISTINCT item_code
+         FROM ic_trans_detail
+         WHERE doc_no = $1 AND trans_flag = 44 AND COALESCE(item_code,'') <> ''`,
+        [docNo],
+      );
+      await refreshSaleInventoryBalanceQty(client, itemRes.rows.map((row) => row.item_code));
+
+      return {
+        doc_no: docNo,
+        cancel_doc_no: cancelDocNo,
+        cancel_doc_date: docDate,
+        cancel_doc_time: docTime,
+        tiger_cancel_status: tigerCancelStatus,
+        tiger_cancel_data: tigerCancelData,
+      };
+    });
+
+    return res.json({ success: true, data: result });
+  } catch (ex) {
+    return res.status(ex.status || 500).json({ success: false, msg: ex.message, data: ex.data });
   }
 });
 

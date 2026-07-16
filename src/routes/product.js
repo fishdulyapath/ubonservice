@@ -342,9 +342,11 @@ router.get("/getProductList", async (req, res) => {
         ` AND (cust_group_1 = '' OR cust_group_1 = (SELECT ar_customer_detail.group_main FROM ar_customer_detail WHERE ar_customer_detail.ar_code='${strCustCode.replace(/'/g, "''")}'))) LIMIT 1),'') != ''`;
     }
 
-    // stockQtyExpr เหมือน Java
+    // ใช้ยอด real-time จาก stock balance function แทน ic_inventory.balance_qty
     const normalStockQtyExpr =
-      `((select balance_qty from ic_inventory where code=b.code) / ` +
+      `((SELECT COALESCE(SUM(balance_qty),0)` +
+      ` FROM sml_ic_function_stock_balance_warehouse_location('NOW()', b.code, '', '')` +
+      ` WHERE balance_qty > 0) / ` +
       `NULLIF( ((select unit_standard_stand_value from ic_inventory where code=b.code) / ` +
       `NULLIF((select unit_standard_divide_value from ic_inventory where code=b.code),0) ), 0))`;
     const setStockQtyExpr =
