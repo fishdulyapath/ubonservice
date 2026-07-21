@@ -1,8 +1,9 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const { query, withTransaction } = require('../db');
 const { safePage, safePageSize } = require('../utils/response');
 const { validateCartStock } = require('../utils/cartStockValidator');
+const { assertBasketAccessFromCartKey } = require('../utils/basketAccess');
 
 async function resolveBasketPricingContext(custCode) {
   if (!custCode || !String(custCode).trim()) {
@@ -46,6 +47,16 @@ router.post('/additemtocart', async (req, res) => {
     // เลียนแบบ Java: loop ทุก item → DELETE เดิม → INSERT ใหม่
     const client = await require('../db').pool.connect();
     try {
+      const checkedCarts = new Set();
+      for (const item of items) {
+        const custCodeForCheck = item?.cust_code || '';
+        const userCodeForCheck = item?.user_code || item?.emp_code || req.get('x-user-code') || '';
+        if (/^BASKET-\d+$/i.test(String(custCodeForCheck)) && !checkedCarts.has(custCodeForCheck)) {
+          await assertBasketAccessFromCartKey(client.query.bind(client), userCodeForCheck, custCodeForCheck, 'can_edit_items');
+          checkedCarts.add(custCodeForCheck);
+        }
+      }
+
       for (const item of items) {
         const cust_code = item.cust_code || '';
         const emp_code = item.emp_code || '';
@@ -90,7 +101,7 @@ router.post('/additemtocart', async (req, res) => {
       client.release();
     }
   } catch (ex) {
-    return res.status(400).json({ ERROR: ex.message });
+    return res.status(ex.statusCode || 400).json({ success: false, ERROR: ex.message, msg: ex.message });
   }
 });
 
@@ -100,7 +111,7 @@ router.get('/getcartitemlist', async (req, res) => {
   const page = safePage(req.query.page);
   const pageSize = safePageSize(req.query.page_size);
   const search = req.query.search;
-
+  const userCode = String(req.query.user_code || req.query.emp_code || req.get('x-user-code') || '').trim();
   const resp = { success: false };
 
   if (!custCode || !custCode.trim()) {
@@ -117,6 +128,7 @@ router.get('/getcartitemlist', async (req, res) => {
   }
 
   try {
+    await assertBasketAccessFromCartKey(query, userCode, custCode, 'can_enter');
     // COUNT
     const countSql = `SELECT COUNT(*) AS total_count FROM staff_cart_order WHERE cust_code = $1${searchCondition}`;
     const countResult = await query(countSql, params);
@@ -167,13 +179,14 @@ router.get('/getcartitemlist', async (req, res) => {
     resp.data = data;
     return res.json(resp);
   } catch (ex) {
-    return res.status(500).json({ error: ex.message });
+    return res.status(ex.statusCode || 500).json({ success: false, error: ex.message, msg: ex.message });
   }
 });
 
 // GET /service/v1/getCartSummary
 router.get('/getCartSummary', async (req, res) => {
   const custCode = req.query.cust_code;
+  const userCode = String(req.query.user_code || req.query.emp_code || req.get('x-user-code') || '').trim();
   const resp = { success: false };
 
   if (!custCode || !custCode.trim()) {
@@ -181,6 +194,7 @@ router.get('/getCartSummary', async (req, res) => {
   }
 
   try {
+    await assertBasketAccessFromCartKey(query, userCode, custCode, 'can_enter');
     const sql = `
       SELECT
         COALESCE(SUM(qty * price), 0) AS total_price,
@@ -263,6 +277,7 @@ router.post('/getcartitemstock', async (req, res) => {
 // price_confirm: item_type!='3' → '0', item_type='3' → price
 router.get('/getcartorder', async (req, res) => {
   const custCode = req.query.cust_code;
+  const userCode = String(req.query.user_code || req.query.emp_code || req.get('x-user-code') || '').trim();
   const page = safePage(req.query.page);
   const pageSize = safePageSize(req.query.page_size);
 
@@ -340,6 +355,8 @@ router.post('/getcartorderprice', async (req, res) => {
     if (typeof body === 'string') body = JSON.parse(body);
 
     const { cust_code, items } = body;
+    const userCode = String(body.user_code || body.emp_code || req.get('x-user-code') || '').trim();
+    await assertBasketAccessFromCartKey(query, userCode, cust_code, 'can_enter');
     const { getProductPriceLocalx } = require('../utils/priceHelper');
     const basketCtx = await resolveBasketPricingContext(cust_code);
 
@@ -411,6 +428,7 @@ router.post('/getcartorderprice', async (req, res) => {
 // เลียนแบบ Java: loop ทุก item คำนวณ price_confirm แล้ว sum
 router.get('/getcartfinalsummary', async (req, res) => {
   const custCode = req.query.cust_code;
+  const userCode = String(req.query.user_code || req.query.emp_code || req.get('x-user-code') || '').trim();
   const saleTypeReq = parseInt(req.query.sale_type, 10);
   const vatTypeReq = parseInt(req.query.vat_type, 10);
   const vatRateReq = parseFloat(req.query.vat_rate);
@@ -478,15 +496,17 @@ router.get('/getcartfinalsummary', async (req, res) => {
 // เลียนแบบ Java: CTE query ตรวจ stock ของทุก item ใน cart
 router.get('/validatecartstock', async (req, res) => {
   const custCode = req.query.cust_code;
+  const userCode = String(req.query.user_code || req.query.emp_code || req.get('x-user-code') || '').trim();
 
   if (!custCode || !custCode.trim()) {
     return res.status(400).json({ error: 'cust_code is required' });
   }
 
   try {
+    await assertBasketAccessFromCartKey(query, userCode, custCode, 'can_enter');
     return res.json(await validateCartStock(query, custCode.trim()));
   } catch (ex) {
-    return res.status(500).json({ error: ex.message });
+    return res.status(ex.statusCode || 500).json({ success: false, error: ex.message, msg: ex.message });
   }
 });
 
@@ -494,8 +514,10 @@ router.get('/validatecartstock', async (req, res) => {
 // เลียนแบบ Java: DELETE WHERE guid_code=? AND cust_code=?
 router.get('/deleteItem', async (req, res) => {
   const { guid_code, cust_code } = req.query;
+  const userCode = String(req.query.user_code || req.query.emp_code || req.get('x-user-code') || '').trim();
   const resp = { success: false };
   try {
+    await assertBasketAccessFromCartKey(query, userCode, cust_code, 'can_edit_items');
     await query(
       `DELETE FROM staff_cart_order WHERE guid_code = $1 AND cust_code = $2`,
       [guid_code || '', cust_code || '']
@@ -503,7 +525,7 @@ router.get('/deleteItem', async (req, res) => {
     resp.success = true;
     return res.json(resp);
   } catch (ex) {
-    return res.status(400).json({ ERROR: ex.message });
+    return res.status(ex.statusCode || 400).json({ success: false, ERROR: ex.message, msg: ex.message });
   }
 });
 
@@ -511,8 +533,10 @@ router.get('/deleteItem', async (req, res) => {
 // เลียนแบบ Java: DELETE WHERE cust_code=?
 router.get('/deleteAllItems', async (req, res) => {
   const { cust_code } = req.query;
+  const userCode = String(req.query.user_code || req.query.emp_code || req.get('x-user-code') || '').trim();
   const resp = { success: false };
   try {
+    await assertBasketAccessFromCartKey(query, userCode, cust_code, 'can_edit_items');
     await query(
       `DELETE FROM staff_cart_order WHERE cust_code = $1`,
       [cust_code || '']

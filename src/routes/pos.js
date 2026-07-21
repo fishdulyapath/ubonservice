@@ -1,10 +1,11 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
 const { query, withTransaction } = require('../db');
 const { calcDiscount, calcVat } = require('../utils/vatHelper');
 const { validateSaleItemsStock } = require('../utils/cartStockValidator');
 const { getEmployeePermissions } = require('../utils/permissions');
+const { assertBasketAccess } = require('../utils/basketAccess');
 
 const uuidv4 = () => crypto.randomUUID();
 const SOLD_OUT_PURCHASE_INFO_PERMISSION = 'sold_out.purchase_info.view';
@@ -877,6 +878,7 @@ async function handleSaveTrans(req, res, options = {}) {
     const shelf_code = obj.shelf_code || '';
     const remark = obj.remark || '';
     const basket_id = obj.basket_id || '';
+    const user_code = String(obj.user_code || obj.current_user_code || obj.login_user_code || req.get('x-user-code') || '').trim();
 
     const inquiry_type = obj.inquiry_type != null ? parseInt(obj.inquiry_type) : 1;
     const vat_type = obj.vat_type != null ? parseInt(obj.vat_type) : 1;
@@ -964,6 +966,9 @@ async function handleSaveTrans(req, res, options = {}) {
     let doc_no;
     let promotion_count = 0;
     await withTransaction(async (client) => {
+      if (basket_id) {
+        await assertBasketAccess(client.query.bind(client), user_code || emp_code, basket_id, 'can_save_sale');
+      }
       const cartKeyForStock = basket_id ? `BASKET-${basket_id}` : '';
       const stockValidation = await validateSaleItemsStock(client, items, {
         excludeCartKey: cartKeyForStock,
@@ -1436,6 +1441,9 @@ async function handleSaveTrans(req, res, options = {}) {
     }
     if (msg.includes('running overflow')) {
       return res.status(409).json({ success: false, msg: 'ERR_DOC_RUNNING_OVERFLOW: ' + msg });
+    }
+    if (ex.statusCode === 403 || msg.includes('permission denied: basket.')) {
+      return res.status(403).json({ success: false, msg });
     }
     if (msg.includes('advance/deposit')) {
       return res.status(400).json({ success: false, msg });

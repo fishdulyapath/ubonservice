@@ -48,6 +48,7 @@ app.use(cors({
     'Accept',
     'Origin',
     'ngrok-skip-browser-warning',
+    'x-user-code',
   ],
 }));
 

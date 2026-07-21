@@ -1,7 +1,8 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const { query, withTransaction } = require('../db');
 const { PERMISSIONS, ALL_PERMISSION_KEYS, getEmployeePermissions } = require('../utils/permissions');
+const { getEmployeeBasketAccess, setEmployeeBasketAccess } = require('../utils/basketAccess');
 
 // POST /service/v1/loginemp
 // Additive endpoint for clients that must not send employee passwords in query strings.
@@ -122,8 +123,19 @@ router.get('/getEmployeePermissions', async (req, res) => {
   }
 });
 
+router.get('/getEmployeeBasketAccess', async (req, res) => {
+  const { user_code = '' } = req.query;
+  if (!user_code.trim()) return res.status(400).json({ success: false, msg: 'user_code is required' });
+  try {
+    const access = await getEmployeeBasketAccess(query, user_code.trim());
+    return res.json({ success: true, data: access });
+  } catch (ex) {
+    return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
 router.post('/setEmployeePermissions', async (req, res) => {
-  const { user_code = '', permissions = [] } = req.body || {};
+  const { user_code = '', permissions = [], basket_access = null, updated_by = '' } = req.body || {};
   const userCode = String(user_code).trim();
   if (!userCode) return res.status(400).json({ success: false, msg: 'user_code is required' });
   if (!Array.isArray(permissions)) return res.status(400).json({ success: false, msg: 'permissions must be an array' });
@@ -139,10 +151,34 @@ router.post('/setEmployeePermissions', async (req, res) => {
           [userCode, key, allowed.has(key)],
         );
       }
+      if (basket_access && typeof basket_access === 'object') {
+        await setEmployeeBasketAccess(client.query.bind(client), {
+          user_code: userCode,
+          allow_all_baskets: basket_access.allow_all_baskets,
+          basket_range_text: basket_access.basket_range_text,
+          other_staff_basket_level: basket_access.other_staff_basket_level,
+          can_edit_other_basket: basket_access.can_edit_other_basket,
+          can_edit_other_items: basket_access.can_edit_other_items,
+          can_save_other_sale: basket_access.can_save_other_sale,
+          updated_by,
+        });
+      }
     });
     return res.json({ success: true });
   } catch (ex) {
     return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
+router.post('/setEmployeeBasketAccess', async (req, res) => {
+  const { user_code = '', updated_by = '' } = req.body || {};
+  const userCode = String(user_code).trim();
+  if (!userCode) return res.status(400).json({ success: false, msg: 'user_code is required' });
+  try {
+    const access = await setEmployeeBasketAccess(query, { ...req.body, user_code: userCode, updated_by });
+    return res.json({ success: true, data: access });
+  } catch (ex) {
+    return res.status(400).json({ success: false, msg: ex.message });
   }
 });
 

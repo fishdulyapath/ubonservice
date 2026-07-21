@@ -1,12 +1,19 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const { query, withTransaction } = require('../db');
 const { successResponse, failResponse } = require('../utils/response');
+const {
+  assertBasketAccess,
+  getEmployeeBasketAccess,
+  resolveBasketAccess,
+} = require('../utils/basketAccess');
 
 // GET /service/v1/getBasketList
 // ดึงรายการตะกร้าทั้งหมด พร้อม item_count และ total_price จาก staff_cart_order
 router.get('/getBasketList', async (req, res) => {
   try {
+    const userCode = String(req.query.user_code || req.query.emp_code || req.get('x-user-code') || '').trim();
+    const employeeAccess = await getEmployeeBasketAccess(query, userCode);
     const sql = `
       SELECT
         b.basket_id, b.cust_code, b.cust_name, b.inquiry_type, b.vat_type, b.vat_rate,
@@ -37,7 +44,21 @@ router.get('/getBasketList', async (req, res) => {
       ORDER BY b.basket_id
     `;
     const result = await query(sql, []);
-    return successResponse(res, result.rows);
+    const rows = await Promise.all(result.rows.map(async (row) => {
+      const access = await resolveBasketAccess(query, userCode, row.basket_id);
+      return {
+        ...row,
+        allow_all_baskets: employeeAccess.allow_all_baskets,
+        is_allowed_basket: access.is_allowed_basket,
+        is_other_staff_basket: access.is_other_staff_basket,
+        access_level: access.access_level,
+        can_enter: access.can_enter,
+        can_edit_basket: access.can_edit_basket,
+        can_edit_items: access.can_edit_items,
+        can_save_sale: access.can_save_sale,
+      };
+    }));
+    return successResponse(res, rows);
   } catch (ex) {
     console.error('getBasketList error:', ex.message);
     return failResponse(res, ex.message, 500);
@@ -67,12 +88,14 @@ router.get('/getSaleDocFormatList', async (req, res) => {
 router.post('/setBasketInfo', async (req, res) => {
   const { basket_id, cust_code = '', cust_name = '', inquiry_type = 1,
     vat_type = 1, vat_rate = 7.0, sale_code = '', sale_name = '', doc_format_code = '' } = req.body;
+  const userCode = String(req.body.user_code || req.body.emp_code || req.get('x-user-code') || '').trim();
 
   if (!basket_id) {
     return failResponse(res, 'basket_id is required', 400);
   }
 
   try {
+    await assertBasketAccess(query, userCode, basket_id, 'can_edit_basket');
     let docFormatRes;
     const docFormatCode = String(doc_format_code || '').trim();
     if (docFormatCode) {
@@ -113,7 +136,7 @@ router.post('/setBasketInfo', async (req, res) => {
     return successResponse(res, null);
   } catch (ex) {
     console.error('setBasketInfo error:', ex.message);
-    return failResponse(res, ex.message, 500);
+    return failResponse(res, ex.message, ex.statusCode || 500);
   }
 });
 
@@ -121,6 +144,7 @@ router.post('/setBasketInfo', async (req, res) => {
 // เคลียร์ตะกร้า — ลบสินค้าทั้งหมดและรีเซ็ต pos_basket กลับ empty
 router.post('/clearBasket', async (req, res) => {
   const { basket_id } = req.body;
+  const userCode = String(req.body.user_code || req.body.emp_code || req.get('x-user-code') || '').trim();
 
   if (!basket_id) {
     return failResponse(res, 'basket_id is required', 400);
@@ -128,6 +152,7 @@ router.post('/clearBasket', async (req, res) => {
 
   try {
     await withTransaction(async (client) => {
+      await assertBasketAccess(client.query.bind(client), userCode, basket_id, 'can_edit_basket');
       await client.query(
         `DELETE FROM staff_cart_order WHERE cust_code = 'BASKET-' || $1::text`,
         [basket_id],
@@ -144,7 +169,7 @@ router.post('/clearBasket', async (req, res) => {
     return successResponse(res, null);
   } catch (ex) {
     console.error('clearBasket error:', ex.message);
-    return failResponse(res, ex.message, 500);
+    return failResponse(res, ex.message, ex.statusCode || 500);
   }
 });
 
