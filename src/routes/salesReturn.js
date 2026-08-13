@@ -11,7 +11,6 @@ const SALES_RETURN_TRANS_FLAG = 48;
 const SALES_RETURN_SCREEN_CODE = 'ST';
 const SALES_RETURN_CREATE_PERMISSION = 'sales.return.create';
 const SALES_RETURN_CASH_HISTORY_PERMISSION = 'sales.return.cash_history.view';
-const SALES_RETURN_CREDIT_HISTORY_PERMISSION = 'sales.return.credit_history.view';
 
 const REQUIRED_SCHEMA = {
   ic_trans: [
@@ -106,9 +105,7 @@ function roundMoney(value) {
 async function requireSalesReturnHistoryPermission(queryFn, userCode, saleKind) {
   const code = safeText(userCode);
   if (!code) throw new Error('user_code or emp_code is required for permission check');
-  const permissionKey = saleKind === 'credit'
-    ? SALES_RETURN_CREDIT_HISTORY_PERMISSION
-    : SALES_RETURN_CASH_HISTORY_PERMISSION;
+  const permissionKey = SALES_RETURN_CASH_HISTORY_PERMISSION;
   const permissions = await getEmployeePermissions(queryFn, code);
   if (!permissions.includes(permissionKey)) {
     throw new Error(`permission denied: ${permissionKey}`);
@@ -794,19 +791,22 @@ async function createSalesReturnPrintLog(docNo, userCode) {
 
 
 router.get('/getSalesReturnHistory', async (req, res) => {
-  const saleKind = normalizeSaleKind(req.query.sale_kind || req.query.kind) || 'cash';
-  const inquiryType = saleKind === 'credit' ? 0 : 1;
+  const saleKind = normalizeSaleKind(req.query.sale_kind || req.query.kind);
+  const inquiryType = saleKind === 'credit' ? 0 : (saleKind === 'cash' ? 1 : null);
   const userCode = req.query.user_code || req.query.emp_code;
   const search = safeText(req.query.search);
   const fromDate = normalizeDate(req.query.fromdate || req.query.from_date);
   const toDate = normalizeDate(req.query.todate || req.query.to_date);
   const limit = toPositiveInt(req.query.limit, 300, 500);
-  const params = [SALES_RETURN_TRANS_FLAG, inquiryType];
+  const params = [SALES_RETURN_TRANS_FLAG];
   const conditions = [
     't.trans_flag = $1',
     'COALESCE(t.last_status,0) = 0',
-    'COALESCE(t.inquiry_type,0) = $2',
   ];
+  if (inquiryType !== null) {
+    params.push(inquiryType);
+    conditions.push('COALESCE(t.inquiry_type,0) = ' + '$' + params.length);
+  }
 
   if (search) {
     params.push(`%${search}%`);

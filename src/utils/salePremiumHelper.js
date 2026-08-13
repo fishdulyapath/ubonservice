@@ -280,7 +280,22 @@ async function listSalePremiumProductsForSale(queryFn = query, options = {}) {
     AND (p.date_end IS NULL OR p.date_end >= $1::date)`;
   if (search) {
     params.push(`%${search}%`);
-    where += ` AND (p.premium_code ILIKE $${params.length} OR p.name_1 ILIKE $${params.length} OR c.ic_code ILIKE $${params.length} OR i.name_1 ILIKE $${params.length})`;
+    const searchParam = params.length;
+    where += ` AND (` +
+      `p.premium_code ILIKE $${searchParam} OR p.name_1 ILIKE $${searchParam}` +
+      ` OR EXISTS (` +
+        `SELECT 1 FROM sml_sale_premium_condition cc` +
+        ` LEFT JOIN ic_inventory ci ON ci.code=cc.ic_code` +
+        ` WHERE cc.premium_code=p.premium_code` +
+        ` AND (cc.ic_code ILIKE $${searchParam} OR ci.name_1 ILIKE $${searchParam})` +
+      `)` +
+      ` OR EXISTS (` +
+        `SELECT 1 FROM sml_sale_premium_free_list ff` +
+        ` LEFT JOIN ic_inventory fi ON fi.code=ff.ic_code` +
+        ` WHERE ff.premium_code=p.premium_code` +
+        ` AND (ff.ic_code ILIKE $${searchParam} OR fi.name_1 ILIKE $${searchParam})` +
+      `)` +
+    `)`;
   }
 
   const rowsRes = await queryFn(

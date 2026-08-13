@@ -27,18 +27,18 @@ function httpError(message, statusCode = 400) {
 
 async function ensureProductExists(client, icCode) {
   const c = String(icCode || "").trim();
-  if (!c) throw httpError("à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²", 400);
+  if (!c) throw httpError("กรุณาระบุรหัสสินค้า", 400);
   const exists = await client.query(`SELECT 1 FROM ic_inventory WHERE code=$1 LIMIT 1`, [c]);
-  if (!exists.rows.length) throw httpError("à¹„à¸¡à¹ˆà¸žà¸šà¸ªà¸´à¸™à¸„à¹‰à¸²", 404);
+  if (!exists.rows.length) throw httpError("ไม่พบสินค้า", 404);
 }
 
 async function ensureWarehouseShelfExists(client, whCode, shelfCode) {
   const wh = String(whCode || "").trim();
   const shelf = String(shelfCode || "").trim();
-  if (!wh) throw httpError("à¸à¸£à¸¸à¸“à¸²à¹€à¸¥à¸·à¸­à¸à¸„à¸¥à¸±à¸‡", 400);
-  if (!shelf) throw httpError("à¸à¸£à¸¸à¸“à¸²à¹€à¸¥à¸·à¸­à¸à¸—à¸µà¹ˆà¹€à¸à¹‡à¸š", 400);
+  if (!wh) throw httpError("กรุณาเลือกคลัง", 400);
+  if (!shelf) throw httpError("กรุณาเลือกที่เก็บ", 400);
   const result = await client.query(`SELECT 1 FROM ic_shelf WHERE whcode=$1::text AND code=$2::text LIMIT 1`, [wh, shelf]);
-  if (!result.rows.length) throw httpError("à¸„à¸¥à¸±à¸‡/à¸—à¸µà¹ˆà¹€à¸à¹‡à¸šà¹„à¸¡à¹ˆà¸–à¸¹à¸à¸•à¹‰à¸­à¸‡", 400);
+  if (!result.rows.length) throw httpError("คลัง/ที่เก็บไม่ถูกต้อง", 400);
 }
 
 function normalizeWarehouseShelfRows(rows, fallbackWhCode = "", fallbackShelfCode = "") {
@@ -134,7 +134,7 @@ async function syncProductUnitType(client, icCode) {
       ` WHERE code=$2::text`,
     [unitCount > 1 ? 1 : 0, c],
   );
-  if (updateResult.rowCount === 0) throw httpError("à¹„à¸¡à¹ˆà¸žà¸šà¸ªà¸´à¸™à¸„à¹‰à¸²", 404);
+  if (updateResult.rowCount === 0) throw httpError("ไม่พบสินค้า", 404);
 }
 
 function ean13CheckDigit(base12) {
@@ -179,7 +179,7 @@ function compileProductItemCodeFormat(format, formatCode, docDate, runningNumber
     ["YY", date.yy], ["yy", date.yy],
     ["MM", date.mm], ["mm", date.mm],
     ["DD", date.dd], ["dd", date.dd],
-    ["à¸›à¸›à¸›à¸›", date.yyyy], ["à¸›à¸›", date.yy], ["à¸”à¸”", date.mm], ["à¸§à¸§", date.dd],
+    ["ปปปป", date.yyyy], ["ปป", date.yy], ["ดด", date.mm], ["วว", date.dd],
   ];
 
   let generated = "";
@@ -237,7 +237,7 @@ async function findNextProductItemCode(formatRow, docDate) {
   const formatCode = String(formatRow?.code || "").trim().toUpperCase();
   const format = String(formatRow?.format || "@####").trim() || "@####";
   const compiled = compileProductItemCodeFormat(format, formatCode, docDate);
-  if (!compiled.runningWidth) throw httpError("à¸£à¸¹à¸›à¹à¸šà¸šà¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²à¸•à¹‰à¸­à¸‡à¸¡à¸µ # à¸ªà¸³à¸«à¸£à¸±à¸šà¹€à¸¥à¸‚ running", 400);
+  if (!compiled.runningWidth) throw httpError("รูปแบบรหัสสินค้าต้องมี # สำหรับเลข running", 400);
 
   const result = await query(
     `SELECT code FROM ic_inventory WHERE code LIKE $1 ESCAPE '\\' AND code ~ $2 ORDER BY code DESC LIMIT 5000`,
@@ -258,7 +258,7 @@ async function findNextProductItemCode(formatRow, docDate) {
       return { code: candidate, running: nextRunning, running_width: compiled.runningWidth, format_code: formatCode, format };
     }
   }
-  throw httpError("à¹„à¸¡à¹ˆà¸ªà¸²à¸¡à¸²à¸£à¸–à¸«à¸²à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²à¸–à¸±à¸”à¹„à¸›à¹„à¸”à¹‰", 500);
+  throw httpError("ไม่สามารถหารหัสสินค้าถัดไปได้", 500);
 }
 async function resolveBasketPricingContext(custCode) {
   if (!custCode || !String(custCode).trim()) {
@@ -287,7 +287,7 @@ async function resolveBasketPricingContext(custCode) {
 }
 
 // GET /service/v1/getProductList
-// à¹€à¸¥à¸µà¸¢à¸™à¹à¸šà¸š Java à¸—à¸¸à¸à¸­à¸¢à¹ˆà¸²à¸‡: dynamic WHERE, pagination à¸”à¹‰à¸§à¸¢ offset/limit
+// เลียนแบบ Java ทุกอย่าง: dynamic WHERE, pagination ด้วย offset/limit
 router.get("/getProductList", async (req, res) => {
   const {
     cust_code: strCustCode = "",
@@ -308,7 +308,7 @@ router.get("/getProductList", async (req, res) => {
   const resp = { success: false };
 
   try {
-    // à¹€à¸¥à¸µà¸¢à¸™à¹à¸šà¸š Java search condition: à¸„à¹‰à¸™à¸«à¸² name_1, code, name_eng_2 + barcode (1 à¸ªà¸´à¸™à¸„à¹‰à¸²à¸¡à¸µà¸«à¸¥à¸²à¸¢à¸šà¸²à¸£à¹Œà¹‚à¸„à¹‰à¸”)
+    // เลียนแบบ Java search condition: ค้นหา name_1, code, name_eng_2 + barcode (1 สินค้ามีหลายบาร์โค้ด)
     let searchWhere = "";
     if (strSearch && strSearch.trim()) {
       const keywords = strSearch.trim().split(" ");
@@ -341,28 +341,38 @@ router.get("/getProductList", async (req, res) => {
       whereFinal +=
         ` AND COALESCE((SELECT ic_code FROM ic_inventory_price WHERE ic_code = b.code` +
         ` AND ((cust_code = '' OR cust_code = '${strCustCode.replace(/'/g, "''")}') ` +
-        ` AND (cust_group_1 = '' OR cust_group_1 = (SELECT ar_customer_detail.group_main FROM ar_customer_detail WHERE ar_customer_detail.ar_code='${strCustCode.replace(/'/g, "''")}'))) LIMIT 1),'') != ''`;
+        ` AND (cust_group_1 = '' OR cust_group_1 = (SELECT MAX(ar_customer_detail.group_main) FROM ar_customer_detail WHERE ar_customer_detail.ar_code='${strCustCode.replace(/'/g, "''")}'))) LIMIT 1),'') != ''`;
     }
 
-    // à¹ƒà¸Šà¹‰à¸¢à¸­à¸” real-time à¸ˆà¸²à¸ stock balance function à¹à¸—à¸™ ic_inventory.balance_qty
+    // Real-time stock from ic_trans_detail using the same balance_qty formula as SML stock function.
+    // Avoid calling the function in product lists because duplicate ic_inventory codes can make it throw.
+    const stockBalanceExprFor = (itemExpr) =>
+      `(SELECT COALESCE(SUM(d.calc_flag * (CASE WHEN (` +
+      `d.trans_flag IN (70,54,60,58,310,12)` +
+      ` OR (d.trans_flag=66 AND d.qty>0)` +
+      ` OR (d.trans_flag=14 AND d.inquiry_type=0)` +
+      ` OR (d.trans_flag=48 AND d.inquiry_type < 2)` +
+      ` OR d.trans_flag IN (56,68,72,44)` +
+      ` OR (d.trans_flag=66 AND d.qty<0)` +
+      ` OR (d.trans_flag=46 AND d.inquiry_type IN (0,2))` +
+      ` OR (d.trans_flag=16 AND d.inquiry_type IN (0,2))` +
+      ` OR (d.trans_flag=311 AND d.inquiry_type=0)` +
+      `) THEN d.qty * (d.stand_value / NULLIF(d.divide_value,0)) ELSE 0 END)),0)` +
+      ` FROM ic_trans_detail d` +
+      ` WHERE d.item_code = ${itemExpr}` +
+      ` AND d.last_status=0` +
+      ` AND d.item_type<>5` +
+      ` AND d.doc_date_calc <= CURRENT_DATE)`;
     const normalStockQtyExpr =
-      `((SELECT COALESCE(SUM(balance_qty),0)` +
-      ` FROM sml_ic_function_stock_balance_warehouse_location('NOW()', b.code, '', '')` +
-      ` WHERE balance_qty > 0) / ` +
-      `NULLIF( ((select unit_standard_stand_value from ic_inventory where code=b.code) / ` +
-      `NULLIF((select unit_standard_divide_value from ic_inventory where code=b.code),0) ), 0))`;
+      `(GREATEST(${stockBalanceExprFor("b.code")},0) / ` +
+      `NULLIF((COALESCE(b.unit_standard_stand_value,1) / ` +
+      `NULLIF(COALESCE(b.unit_standard_divide_value,1),0)), 0))`;
     const setStockQtyExpr =
-      `(SELECT COALESCE(MIN(TRUNC(COALESCE(sb.sum_balance_qty,0) / NULLIF(sd.qty,0), 0)), 0)` +
+      `(SELECT COALESCE(MIN(TRUNC(GREATEST(${stockBalanceExprFor("sd.ic_code")},0) / NULLIF(sd.qty,0), 0)), 0)` +
       ` FROM ic_inventory_set_detail sd` +
-      ` LEFT JOIN LATERAL (` +
-      `   SELECT SUM(balance_qty) AS sum_balance_qty` +
-      `   FROM sml_ic_function_stock_balance_warehouse_location('NOW()', sd.ic_code, '', '')` +
-      `   WHERE balance_qty > 0` +
-      ` ) sb ON TRUE` +
       ` WHERE sd.ic_set_code = b.code)`;
     const stockQtyExpr =
-      `(CASE WHEN COALESCE(b.item_type,0) = 3 THEN COALESCE(${setStockQtyExpr}, 0) ELSE ${normalStockQtyExpr} END)`;
-
+      `(CASE WHEN COALESCE(b.item_type,0) = 1 THEN 0 WHEN COALESCE(b.item_type,0) = 3 THEN COALESCE(${setStockQtyExpr}, 0) ELSE ${normalStockQtyExpr} END)`;
     if (strStock === "1") {
       whereFinal += ` AND (COALESCE(b.item_type,0) = 1 OR ((${stockQtyExpr}) > 0 ))`;
     }
@@ -374,7 +384,7 @@ router.get("/getProductList", async (req, res) => {
       ` WHERE 1=1 ${whereFinal}`;
 
     const orderBy = strSortStockDesc === "1"
-      ? ` ORDER BY COALESCE(b.balance_qty,0) DESC, b.code ASC`
+      ? ` ORDER BY COALESCE((${stockQtyExpr}),0) DESC, b.code ASC`
       : "";
 
     const offsetInt = Math.max(0, parseInt(strOffset, 10) || 0);
@@ -382,7 +392,8 @@ router.get("/getProductList", async (req, res) => {
     let salePremiumRows = [];
     let normalOffset = offsetInt;
     let normalLimit = limitInt;
-    if (strPromotion === "1") {
+    const includeSalePremiumRows = strPromotion === "1" || (strSearch.trim() && !strCategory.trim());
+    if (includeSalePremiumRows) {
       const basketCtxForPremium = await resolveBasketPricingContext(strCustCode);
       const allSalePremiumRows = await listSalePremiumProductsForSale(query, {
         custCode: strCustCode,
@@ -415,14 +426,14 @@ router.get("/getProductList", async (req, res) => {
       `   COALESCE((SELECT ic_code FROM ic_inventory_price WHERE ic_code = b.code` +
       `     AND CURRENT_DATE BETWEEN from_date AND to_date` +
       `     AND ((cust_code = '' OR cust_code = '${strCustCode.replace(/'/g, "''")}')` +
-      `     AND (cust_group_1 = '' OR cust_group_1=(SELECT ar_customer_detail.group_main FROM ar_customer_detail WHERE ar_customer_detail.ar_code='${strCustCode.replace(/'/g, "''")}'))) LIMIT 1),'') != ''` +
+      `     AND (cust_group_1 = '' OR cust_group_1=(SELECT MAX(ar_customer_detail.group_main) FROM ar_customer_detail WHERE ar_customer_detail.ar_code='${strCustCode.replace(/'/g, "''")}'))) LIMIT 1),'') != ''` +
       `   OR EXISTS (SELECT 1 FROM ic_inventory_discount` +
       `     WHERE ic_code = b.code` +
       `       AND CURRENT_DATE BETWEEN from_date AND to_date` +
       `       AND (` +
       `         discount_type = 0` +
       `         OR (discount_type = 2 AND cust_code = '${strCustCode.replace(/'/g, "''")}')` +
-      `         OR (discount_type = 1 AND cust_group_1 = (SELECT group_main FROM ar_customer_detail WHERE ar_code='${strCustCode.replace(/'/g, "''")}'))` +
+      `         OR (discount_type = 1 AND cust_group_1 = (SELECT MAX(group_main) FROM ar_customer_detail WHERE ar_code='${strCustCode.replace(/'/g, "''")}'))` +
       `       ))` +
       ` ) THEN '1' ELSE '0' END AS is_promotion,` +
       ` COALESCE(arc.status,0) AS favorite_item` +
@@ -445,7 +456,7 @@ router.get("/getProductList", async (req, res) => {
     }));
 
 
-    const data = strPromotion === "1" ? [...salePremiumRows, ...normalData] : normalData;
+    const data = includeSalePremiumRows ? [...salePremiumRows, ...normalData] : normalData;
     resp.success = true;
     resp.data = data;
     return res.json(resp);
@@ -576,7 +587,7 @@ router.get("/getProductBarcodeSearch", async (req, res) => {
 });
 
 // GET /service/v1/getProductDetail
-// à¹€à¸¥à¸µà¸¢à¸™à¹à¸šà¸š Java: CTE balance_stock + ic_unit_use + à¹€à¸£à¸µà¸¢à¸ getProductPriceLocalx à¸•à¹ˆà¸­ unit
+// เลียนแบบ Java: CTE balance_stock + ic_unit_use + เรียก getProductPriceLocalx ต่อ unit
 router.get("/getProductDetail", async (req, res) => {
   const {
     cust_code: strCustCode = "",
@@ -672,7 +683,7 @@ router.get("/getProductDetail", async (req, res) => {
           obj.price_type = roworder;
 
           if (strShowPromotion == "1") {
-            // query promotion à¸–à¹‰à¸² type IN (1,2,3) â€” à¹€à¸«à¸¡à¸·à¸­à¸™ Java lines 3490-3524
+            // query promotion ถ้า type IN (1,2,3) — เหมือน Java lines 3490-3524
             if (["1", "2", "3"].includes(type)) {
               const proParams = [r.ic_code, r.unit_code, mode];
               let moreWhere = "";
@@ -680,7 +691,7 @@ router.get("/getProductDetail", async (req, res) => {
                 moreWhere = " AND cust_code=$4";
                 proParams.push(strCustCode);
               } else if (roworder === "4") {
-                moreWhere = " AND cust_group_1=(SELECT group_main FROM ar_customer_detail WHERE ar_code=$4)";
+                moreWhere = " AND cust_group_1=(SELECT MAX(group_main) FROM ar_customer_detail WHERE ar_code=$4)";
                 proParams.push(strCustCode);
               }
               const proResult = await query(
@@ -704,7 +715,7 @@ router.get("/getProductDetail", async (req, res) => {
               }));
             }
 
-            // query discount_promotion à¸ˆà¸²à¸ ic_inventory_discount (à¹„à¸¡à¹ˆ filter qty)
+            // query discount_promotion จาก ic_inventory_discount (ไม่ filter qty)
             const dpResult = await query(
               `SELECT from_qty, to_qty, discount, discount_type, line_number
                FROM ic_inventory_discount
@@ -713,7 +724,7 @@ router.get("/getProductDetail", async (req, res) => {
                  AND (
                    discount_type = 0
                    OR (discount_type = 2 AND cust_code = $3)
-                   OR (discount_type = 1 AND cust_group_1 = (SELECT group_main FROM ar_customer_detail WHERE ar_code = $3))
+                   OR (discount_type = 1 AND cust_group_1 = (SELECT MAX(group_main) FROM ar_customer_detail WHERE ar_code = $3))
                  )
                ORDER BY discount_type DESC, line_number`,
               [r.ic_code, r.unit_code, strCustCode],
@@ -743,7 +754,7 @@ router.get("/getProductDetail", async (req, res) => {
 });
 
 // GET /service/v1/getProductSetDetail
-// à¹€à¸¥à¸µà¸¢à¸™à¹à¸šà¸š Java: CTE set_detail + balance_stock + set_stock + set_price
+// เลียนแบบ Java: CTE set_detail + balance_stock + set_stock + set_price
 router.get("/getProductSetDetail", async (req, res) => {
   const { cust_code: strCustCode = "", item_code: strItemCode = "" } = req.query;
   const resp = { success: false };
@@ -899,7 +910,7 @@ router.get("/getProductSetItem", async (req, res) => {
 });
 
 // GET /service/v1/getProductBalancePrice
-// à¹€à¸¥à¸µà¸¢à¸™à¹à¸šà¸š Java: query ic_inventory_barcode + à¹€à¸£à¸µà¸¢à¸ getProductPriceLocalx
+// เลียนแบบ Java: query ic_inventory_barcode + เรียก getProductPriceLocalx
 router.get("/getProductBalancePrice", async (req, res) => {
   const {
     item_code: strItemCode = "",
@@ -1118,7 +1129,7 @@ router.post("/checkSaleLowCost", async (req, res) => {
   }
 });
 // GET /service/v1/getProductPrice
-// à¸”à¸¶à¸‡à¸£à¸²à¸„à¸²à¸ªà¸´à¸™à¸„à¹‰à¸²à¸•à¸±à¸§à¹€à¸”à¸µà¸¢à¸§à¸œà¹ˆà¸²à¸™ getProductPriceLocalx à¹‚à¸”à¸¢à¸•à¸£à¸‡ â€” à¹ƒà¸Šà¹‰à¸ªà¸³à¸«à¸£à¸±à¸š catalog lazy-price
+// ดึงราคาสินค้าตัวเดียวผ่าน getProductPriceLocalx โดยตรง — ใช้สำหรับ catalog lazy-price
 router.get("/getProductPrice", async (req, res) => {
   const {
     item_code: strItemCode = "",
@@ -1173,7 +1184,7 @@ router.get("/getProductPrice", async (req, res) => {
 });
 
 // GET /service/v1/getCategoryList
-// à¹€à¸¥à¸µà¸¢à¸™à¹à¸šà¸š Java: SELECT code, name_1 FROM ic_category
+// เลียนแบบ Java: SELECT code, name_1 FROM ic_category
 router.get("/getCategoryList", async (req, res) => {
   const resp = { success: false };
   try {
@@ -1189,7 +1200,7 @@ router.get("/getCategoryList", async (req, res) => {
 });
 
 // GET /service/v1/getProductByBarcode
-// à¸„à¹‰à¸™à¸«à¸²à¸ªà¸´à¸™à¸„à¹‰à¸²à¸ˆà¸²à¸à¸šà¸²à¸£à¹Œà¹‚à¸„à¹‰à¸”à¹ƒà¸™ ic_inventory_barcode
+// ค้นหาสินค้าจากบาร์โค้ดใน ic_inventory_barcode
 router.get("/getProductByBarcode", async (req, res) => {
   const {
     barcode: strBarcode = "",
@@ -1249,7 +1260,7 @@ router.get("/getProductByBarcode", async (req, res) => {
 });
 
 // GET /service/v1/getProductByBarcodeDetail
-// à¹ƒà¸Šà¹‰à¸ªà¸³à¸«à¸£à¸±à¸šà¸«à¸™à¹‰à¸²à¸‚à¸²à¸¢ BizSuit: à¸„à¸·à¸™à¸«à¸™à¹ˆà¸§à¸¢/ratio/stock à¸—à¸µà¹ˆà¸œà¸¹à¸à¸à¸±à¸š barcode à¹‚à¸”à¸¢à¸•à¸£à¸‡
+// ใช้สำหรับหน้าขาย BizSuit: คืนหน่วย/ratio/stock ที่ผูกกับ barcode โดยตรง
 router.get("/getProductByBarcodeDetail", async (req, res) => {
   const { barcode: strBarcode = "" } = req.query;
   const resp = { success: false };
@@ -1343,7 +1354,7 @@ router.get("/getProductByBarcodeDetail", async (req, res) => {
 });
 
 // POST /service/v1/adjustStock
-// à¸•à¸£à¸§à¸ˆà¸™à¸±à¸šà¸ªà¸•à¹Šà¸­à¸ (76) + à¸›à¸£à¸±à¸šà¸›à¸£à¸¸à¸‡à¸œà¸¥à¸•à¹ˆà¸²à¸‡: à¹€à¸žà¸´à¹ˆà¸¡ (66) à¸«à¸£à¸·à¸­ à¸¥à¸” (68)
+// ตรวจนับสต๊อก (76) + ปรับปรุงผลต่าง: เพิ่ม (66) หรือ ลด (68)
 router.post("/adjustStock", async (req, res) => {
   const { item_code = "", item_name = "", unit_code = "", barcode = "", wh_code = "", shelf_code = "", branch_code = "", emp_code = "", creator_code = "", qty } = req.body;
   const resp = { success: false };
@@ -1402,7 +1413,7 @@ router.post("/adjustStock", async (req, res) => {
     const doc_date = now.toISOString().slice(0, 10);
     const doc_time = now.toTimeString().slice(0, 5);
 
-    // generate doc_no à¸£à¸¹à¸›à¹à¸šà¸š MSTCYYYYDDMM-#### running 4 à¸«à¸¥à¸±à¸
+    // generate doc_no รูปแบบ MSTCYYYYDDMM-#### running 4 หลัก
     const yyyy = String(now.getFullYear());
     const dd = String(now.getDate()).padStart(2, "0");
     const mm = String(now.getMonth() + 1).padStart(2, "0");
@@ -1411,13 +1422,13 @@ router.post("/adjustStock", async (req, res) => {
     const lastRunning = lastRes.rows.length > 0 ? parseInt(lastRes.rows[0].doc_no.slice(-4), 10) : 0;
     const doc_no = `${prefix}${String(lastRunning + 1).padStart(4, "0")}`;
 
-    // generate doc_no_adj à¸£à¸¹à¸›à¹à¸šà¸š ISYYYYMMDD-#### running 4 à¸«à¸¥à¸±à¸
+    // generate doc_no_adj รูปแบบ ISYYYYMMDD-#### running 4 หลัก
     const adjPrefix = `IS${yyyy}${mm}${dd}-`;
     const lastAdjRes = await runQuery("load-last-adjust-doc", `SELECT doc_no FROM ic_trans WHERE doc_no LIKE $1 ORDER BY doc_no DESC LIMIT 1`, [`${adjPrefix}%`]);
     const lastAdjRunning = lastAdjRes.rows.length > 0 ? parseInt(lastAdjRes.rows[0].doc_no.slice(-4), 10) : 0;
     const doc_no_adj = `${adjPrefix}${String(lastAdjRunning + 1).padStart(4, "0")}`;
 
-    // à¸”à¸¶à¸‡ ratio, stand_value, divide_value à¸ˆà¸²à¸ ic_unit_use
+    // ดึง ratio, stand_value, divide_value จาก ic_unit_use
     const unitRes = await runQuery(`load-unit-use`, `SELECT ratio, stand_value, divide_value FROM ic_unit_use WHERE ic_code = $1 AND code = $2 LIMIT 1`, [item_code, unit_code]);
     const unitRow = unitRes.rows[0] || {};
     if (!unitRes.rows.length) {
@@ -1440,7 +1451,7 @@ router.post("/adjustStock", async (req, res) => {
       });
     }
 
-    // à¸„à¸³à¸™à¸§à¸“à¸¢à¸­à¸”à¸„à¸‡à¹€à¸«à¸¥à¸·à¸­à¸›à¸±à¸ˆà¸ˆà¸¸à¸šà¸±à¸™ (base units) à¹€à¸žà¸·à¹ˆà¸­à¸«à¸² diff
+    // คำนวณยอดคงเหลือปัจจุบัน (base units) เพื่อหา diff
     await syncProductUnitType(pool, item_code);
 
     const balRes = await runQuery(
@@ -1467,14 +1478,14 @@ router.post("/adjustStock", async (req, res) => {
         [doc_no, item_code, item_name, unit_code, barcode, wh_code, shelf_code, doc_time, emp_code, check_qty],
       );
 
-      // 2. ic_trans header (76 = à¸•à¸£à¸§à¸ˆà¸™à¸±à¸š)
+      // 2. ic_trans header (76 = ตรวจนับ)
         await runTxQuery(
           client,
           "insert-ic_trans-76-header",
         `INSERT INTO ic_trans
           (trans_flag, trans_type, doc_no, doc_date, doc_time, doc_format_code,
            remark, branch_code, wh_from, location_from)
-         VALUES (76, 3, $1, $2, $3, 'CO', 'à¸›à¸£à¸±à¸šà¸›à¸£à¸¸à¸‡à¸ªà¸•à¹Šà¸­à¸à¹„à¸¡à¹ˆà¸•à¸£à¸‡', $4, $5, $6)`,
+         VALUES (76, 3, $1, $2, $3, 'CO', 'ปรับปรุงสต๊อกไม่ตรง', $4, $5, $6)`,
         [doc_no, doc_date, doc_time, branch_code, wh_code, shelf_code],
       );
         await runTxQuery(
@@ -1501,7 +1512,7 @@ router.post("/adjustStock", async (req, res) => {
         throw new Error("ic_trans_detail(76): insert failed (rowCount=0)");
       }
 
-      // 4. à¹€à¸­à¸à¸ªà¸²à¸£à¸›à¸£à¸±à¸šà¸œà¸¥à¸•à¹ˆà¸²à¸‡ â€” 66 (à¹€à¸žà¸´à¹ˆà¸¡) à¸«à¸£à¸·à¸­ 68 (à¸¥à¸”) à¹€à¸‰à¸žà¸²à¸°à¹€à¸¡à¸·à¹ˆà¸­ diff != 0
+      // 4. เอกสารปรับผลต่าง — 66 (เพิ่ม) หรือ 68 (ลด) เฉพาะเมื่อ diff != 0
       if (diff_qty !== 0) {
         const adj_flag = diff_qty > 0 ? 66 : 68;
         const adj_calc_flag = diff_qty > 0 ? 1 : -1;
@@ -1559,7 +1570,7 @@ router.post("/adjustStock", async (req, res) => {
         [docNos],
       );
 
-      // 6. à¸­à¸±à¸›à¹€à¸”à¸• balance_qty à¹ƒà¸™ ic_inventory à¸ˆà¸²à¸à¸¢à¸­à¸”à¸ˆà¸£à¸´à¸‡à¸«à¸¥à¸±à¸‡à¸›à¸£à¸±à¸š
+      // 6. อัปเดต balance_qty ใน ic_inventory จากยอดจริงหลังปรับ
       try {
         const newBalRes = await runTxQuery(
           client,
@@ -1634,7 +1645,7 @@ router.get("/getInventoryBalance", async (req, res) => {
 
 // ========== MASTER DATA DROPDOWNS ==========
 
-// helper à¸¥à¸” code à¸‹à¹‰à¸³à¸ªà¸³à¸«à¸£à¸±à¸š master data à¸—à¸µà¹ˆà¸¡à¸µ search filter
+// helper ลด code ซ้ำสำหรับ master data ที่มี search filter
 function makeMasterListRoute(tableName, extraFields = "") {
   return async (req, res) => {
     const s = (req.query.search || "").trim();
@@ -1685,7 +1696,7 @@ router.get("/getProductItemCodeFormats", async (req, res) => {
 router.get("/generateProductItemCode", async (req, res) => {
   const formatCode = String(req.query.format_code || req.query.code || "").trim().toUpperCase();
   const docDate = String(req.query.doc_date || "").trim();
-  if (!formatCode) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¹€à¸¥à¸·à¸­à¸à¸£à¸¹à¸›à¹à¸šà¸šà¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²" });
+  if (!formatCode) return res.status(400).json({ success: false, message: "กรุณาเลือกรูปแบบรหัสสินค้า" });
   try {
     const formatRes = await query(
       `SELECT code, COALESCE(name_1,'') AS name_1, COALESCE(format,'') AS format
@@ -1694,7 +1705,7 @@ router.get("/generateProductItemCode", async (req, res) => {
        LIMIT 1`,
       [PRODUCT_CODE_FORMAT_SCREEN, formatCode],
     );
-    if (!formatRes.rows.length) return res.status(404).json({ success: false, message: "à¹„à¸¡à¹ˆà¸žà¸šà¸£à¸¹à¸›à¹à¸šà¸šà¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²" });
+    if (!formatRes.rows.length) return res.status(404).json({ success: false, message: "ไม่พบรูปแบบรหัสสินค้า" });
     const nextCode = await findNextProductItemCode(formatRes.rows[0], docDate);
     return res.json({ success: true, data: { ...nextCode, name_1: formatRes.rows[0].name_1 } });
   } catch (ex) {
@@ -1721,7 +1732,7 @@ router.get("/getUnitManageList", async (req, res) => {
 // ========== PRODUCT MANAGE LIST ==========
 
 // GET /service/v1/getProductManageList
-// port à¸ˆà¸²à¸ Java getProductManageList â€” parameterized WHERE, sort whitelist, parallel count
+// port จาก Java getProductManageList — parameterized WHERE, sort whitelist, parallel count
 router.get("/getProductManageList", async (req, res) => {
   const { search = "", group = "", groupsub = "", groupsub2 = "", brand = "", category = "", design = "", model = "", sort_field = "", sort_order = "", offset = "0", limit = "20" } = req.query;
 
@@ -2186,12 +2197,12 @@ router.get("/getPurchaseStockReorderList", async (req, res) => {
   }
 });
 
-// ========== PRODUCT ITEM DETAIL (à¸ªà¸³à¸«à¸£à¸±à¸šà¸«à¸™à¹‰à¸²à¹à¸à¹‰à¹„à¸‚) ==========
+// ========== PRODUCT ITEM DETAIL (สำหรับหน้าแก้ไข) ==========
 
 // GET /service/v1/getProductItemDetail?code=
 router.get("/getProductItemDetail", async (req, res) => {
   const code = (req.query.code || "").trim();
-  if (!code) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²" });
+  if (!code) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้า" });
   try {
     const result = await query(
       `SELECT i.code, COALESCE(i.name_1,'') AS name_1, COALESCE(i.name_2,'') AS name_2,` +
@@ -2209,7 +2220,7 @@ router.get("/getProductItemDetail", async (req, res) => {
         ` WHERE i.code = $1 AND ${activeProductCondition("d")}`,
       [code],
     );
-    if (!result.rows.length) return res.status(400).json({ success: false, message: "à¹„à¸¡à¹ˆà¸žà¸šà¸ªà¸´à¸™à¸„à¹‰à¸²" });
+    if (!result.rows.length) return res.status(400).json({ success: false, message: "ไม่พบสินค้า" });
     const warehouseShelfResult = await query(
       `SELECT ws.wh_code, COALESCE(w.name_1,'') AS wh_name,` +
         ` ws.shelf_code, COALESCE(s.name_1,'') AS shelf_name,` +
@@ -2258,12 +2269,12 @@ router.post("/updateProductItemMain", async (req, res) => {
   } = req.body || {};
 
   const c = String(code).trim();
-  if (!c) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²" });
-  if (!String(unit_standard).trim()) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¹€à¸¥à¸·à¸­à¸à¸«à¸™à¹ˆà¸§à¸¢à¸¡à¸²à¸•à¸£à¸à¸²à¸™" });
+  if (!c) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้า" });
+  if (!String(unit_standard).trim()) return res.status(400).json({ success: false, message: "กรุณาเลือกหน่วยมาตรฐาน" });
   const whCode = String(wh_code || start_sale_wh || "").trim();
   const shelfCode = String(shelf_code || start_sale_shelf || "").trim();
-  if (!whCode) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¹€à¸¥à¸·à¸­à¸à¸„à¸¥à¸±à¸‡" });
-  if (!shelfCode) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¹€à¸¥à¸·à¸­à¸à¸—à¸µà¹ˆà¹€à¸à¹‡à¸š" });
+  if (!whCode) return res.status(400).json({ success: false, message: "กรุณาเลือกคลัง" });
+  if (!shelfCode) return res.status(400).json({ success: false, message: "กรุณาเลือกที่เก็บ" });
   const purchasePoint = normalizeStockLevelQty(purchase_point);
   const minimumQty = normalizeStockLevelQty(minimum_qty);
   const maximumQty = normalizeStockLevelQty(maximum_qty);
@@ -2293,7 +2304,7 @@ router.post("/updateProductItemMain", async (req, res) => {
           c,
         ],
       );
-      if (updateResult.rowCount === 0) throw httpError("à¹„à¸¡à¹ˆà¸žà¸šà¸ªà¸´à¸™à¸„à¹‰à¸²", 404);
+      if (updateResult.rowCount === 0) throw httpError("ไม่พบสินค้า", 404);
 
       await ensureWarehouseShelfExists(client, whCode, shelfCode);
       await ensureWarehouseShelfRowsExist(client, warehouseShelves);
@@ -2338,16 +2349,16 @@ router.post("/createProductItemMain", async (req, res) => {
   } = req.body || {};
 
   const c = String(code).trim().toUpperCase();
-  if (!c) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²" });
+  if (!c) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้า" });
   if (!PRODUCT_CODE_PATTERN.test(c)) {
-    return res.status(400).json({ success: false, message: "à¸£à¸¹à¸›à¹à¸šà¸šà¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²à¹„à¸¡à¹ˆà¸–à¸¹à¸à¸•à¹‰à¸­à¸‡ (à¸­à¸™à¸¸à¸à¸²à¸• A-Z, 0-9, -, _)" });
+    return res.status(400).json({ success: false, message: "รูปแบบรหัสสินค้าไม่ถูกต้อง (อนุญาต A-Z, 0-9, -, _)" });
   }
-  if (!String(name_1).trim()) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸Šà¸·à¹ˆà¸­à¸ªà¸´à¸™à¸„à¹‰à¸²" });
-  if (!String(unit_standard).trim()) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¹€à¸¥à¸·à¸­à¸à¸«à¸™à¹ˆà¸§à¸¢à¸¡à¸²à¸•à¸£à¸à¸²à¸™" });
+  if (!String(name_1).trim()) return res.status(400).json({ success: false, message: "กรุณาระบุชื่อสินค้า" });
+  if (!String(unit_standard).trim()) return res.status(400).json({ success: false, message: "กรุณาเลือกหน่วยมาตรฐาน" });
   const whCode = String(wh_code || start_sale_wh || "").trim();
   const shelfCode = String(shelf_code || start_sale_shelf || "").trim();
-  if (!whCode) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¹€à¸¥à¸·à¸­à¸à¸„à¸¥à¸±à¸‡" });
-  if (!shelfCode) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¹€à¸¥à¸·à¸­à¸à¸—à¸µà¹ˆà¹€à¸à¹‡à¸š" });
+  if (!whCode) return res.status(400).json({ success: false, message: "กรุณาเลือกคลัง" });
+  if (!shelfCode) return res.status(400).json({ success: false, message: "กรุณาเลือกที่เก็บ" });
   const purchasePoint = normalizeStockLevelQty(purchase_point);
   const minimumQty = normalizeStockLevelQty(minimum_qty);
   const maximumQty = normalizeStockLevelQty(maximum_qty);
@@ -2357,7 +2368,7 @@ router.post("/createProductItemMain", async (req, res) => {
     await withTransaction(async (client) => {
       const exists = await client.query(`SELECT 1 FROM ic_inventory WHERE code = $1::text LIMIT 1`, [c]);
       if (exists.rows.length) {
-        const err = new Error("à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²à¸™à¸µà¹‰à¸¡à¸µà¸­à¸¢à¸¹à¹ˆà¹à¸¥à¹‰à¸§");
+        const err = new Error("รหัสสินค้านี้มีอยู่แล้ว");
         err.statusCode = 400;
         throw err;
       }
@@ -2411,7 +2422,7 @@ router.post("/createProductItemMain", async (req, res) => {
 // GET /service/v1/generateProductItemBarcode?ic_code=
 router.get("/generateProductItemBarcode", async (req, res) => {
   const ic_code = (req.query.ic_code || "").trim();
-  if (!ic_code) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²" });
+  if (!ic_code) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้า" });
 
   try {
     for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -2419,7 +2430,7 @@ router.get("/generateProductItemBarcode", async (req, res) => {
       const exists = await query(`SELECT 1 FROM ic_inventory_barcode WHERE barcode = $1 LIMIT 1`, [barcode]);
       if (!exists.rows.length) return res.json({ success: true, barcode });
     }
-    return res.status(409).json({ success: false, message: "à¹„à¸¡à¹ˆà¸ªà¸²à¸¡à¸²à¸£à¸–à¸ªà¸£à¹‰à¸²à¸‡à¸šà¸²à¸£à¹Œà¹‚à¸„à¹‰à¸”à¸—à¸µà¹ˆà¹„à¸¡à¹ˆà¸‹à¹‰à¸³à¹„à¸”à¹‰ à¸à¸£à¸¸à¸“à¸²à¸¥à¸­à¸‡à¹ƒà¸«à¸¡à¹ˆà¸­à¸µà¸à¸„à¸£à¸±à¹‰à¸‡" });
+    return res.status(409).json({ success: false, message: "ไม่สามารถสร้างบาร์โค้ดที่ไม่ซ้ำได้ กรุณาลองใหม่อีกครั้ง" });
   } catch (ex) {
     console.error("generateProductItemBarcode error:", ex.message);
     return res.status(500).json({ success: false, message: ex.message });
@@ -2429,7 +2440,7 @@ router.get("/generateProductItemBarcode", async (req, res) => {
 // GET /service/v1/getProductItemBarcodes?ic_code=
 router.get("/getProductItemBarcodes", async (req, res) => {
   const ic_code = (req.query.ic_code || "").trim();
-  if (!ic_code) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²" });
+  if (!ic_code) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้า" });
   try {
     const result = await query(
       `SELECT b.barcode, b.unit_code,` +
@@ -2465,10 +2476,10 @@ router.post("/createProductItemBarcode", async (req, res) => {
   const { ic_code = "", barcode = "", unit_code = "", price = 0, price_member = 0, price_2 = 0, price_member_2 = 0 } = req.body || {};
   const c = String(ic_code).trim();
   const b = String(barcode).trim();
-  if (!c || !b) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²à¹à¸¥à¸°à¸šà¸²à¸£à¹Œà¹‚à¸„à¹‰à¸”" });
+  if (!c || !b) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้าและบาร์โค้ด" });
   try {
     const exists = await query(`SELECT 1 FROM ic_inventory_barcode WHERE barcode = $1 LIMIT 1`, [b]);
-    if (exists.rows.length) return res.status(409).json({ success: false, message: "à¸šà¸²à¸£à¹Œà¹‚à¸„à¹‰à¸”à¸™à¸µà¹‰à¸¡à¸µà¸­à¸¢à¸¹à¹ˆà¹à¸¥à¹‰à¸§" });
+    if (exists.rows.length) return res.status(409).json({ success: false, message: "บาร์โค้ดนี้มีอยู่แล้ว" });
     await query(`INSERT INTO ic_inventory_barcode (ic_code, barcode, unit_code, price, price_member, price_2, price_member_2)` + ` VALUES ($1,$2,$3,$4,$5,$6,$7)`, [
       c,
       b,
@@ -2490,7 +2501,7 @@ router.post("/updateProductItemBarcode", async (req, res) => {
   const { ic_code = "", barcode = "", unit_code = "", price = 0, price_member = 0, price_2 = 0, price_member_2 = 0 } = req.body || {};
   const c = String(ic_code).trim();
   const b = String(barcode).trim();
-  if (!c || !b) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²à¹à¸¥à¸°à¸šà¸²à¸£à¹Œà¹‚à¸„à¹‰à¸”" });
+  if (!c || !b) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้าและบาร์โค้ด" });
   try {
     await query(`UPDATE ic_inventory_barcode SET unit_code=$1, price=$2, price_member=$3, price_2=$4, price_member_2=$5` + ` WHERE barcode=$6 AND ic_code=$7`, [
       String(unit_code).trim(),
@@ -2513,7 +2524,7 @@ router.post("/deleteProductItemBarcode", async (req, res) => {
   const { ic_code = "", barcode = "" } = req.body || {};
   const c = String(ic_code).trim();
   const b = String(barcode).trim();
-  if (!c || !b) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²à¹à¸¥à¸°à¸šà¸²à¸£à¹Œà¹‚à¸„à¹‰à¸”" });
+  if (!c || !b) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้าและบาร์โค้ด" });
   try {
     await query(`DELETE FROM ic_inventory_barcode WHERE barcode=$1 AND ic_code=$2`, [b, c]);
     return res.json({ success: true });
@@ -2528,7 +2539,7 @@ router.post("/deleteProductItemBarcode", async (req, res) => {
 // GET /service/v1/getProductItemUnitUse?ic_code=
 router.get("/getProductItemUnitUse", async (req, res) => {
   const ic_code = (req.query.ic_code || "").trim();
-  if (!ic_code) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²" });
+  if (!ic_code) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้า" });
   try {
     const result = await query(
       `SELECT u.code, COALESCE(u.stand_value,1::numeric) AS stand_value,` +
@@ -2567,7 +2578,7 @@ router.post("/createProductItemUnitUse", async (req, res) => {
   const { ic_code = "", code = "", stand_value = 1, divide_value = 1, row_order = 0, width_length_height = "", weight = "" } = req.body || {};
   const c = String(ic_code).trim();
   const u = String(code).trim();
-  if (!c || !u) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²à¹à¸¥à¸°à¸£à¸«à¸±à¸ªà¸«à¸™à¹ˆà¸§à¸¢à¸™à¸±à¸š" });
+  if (!c || !u) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้าและรหัสหน่วยนับ" });
   const sv = Number(stand_value) || 1;
   const dv = Number(divide_value) || 1;
   const ratio = dv !== 0 ? sv / dv : 0;
@@ -2598,7 +2609,7 @@ router.post("/updateProductItemUnitUse", async (req, res) => {
   const { ic_code = "", code = "", stand_value = 1, divide_value = 1, row_order = 0, width_length_height = "", weight = "" } = req.body || {};
   const c = String(ic_code).trim();
   const u = String(code).trim();
-  if (!c || !u) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²à¹à¸¥à¸°à¸£à¸«à¸±à¸ªà¸«à¸™à¹ˆà¸§à¸¢à¸™à¸±à¸š" });
+  if (!c || !u) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้าและรหัสหน่วยนับ" });
   const sv = Number(stand_value) || 1;
   const dv = Number(divide_value) || 1;
   const ratio = dv !== 0 ? sv / dv : 0;
@@ -2615,7 +2626,7 @@ router.post("/updateProductItemUnitUse", async (req, res) => {
         c,
         u,
       ]);
-      if (updateResult.rowCount === 0) throw httpError("à¹„à¸¡à¹ˆà¸žà¸šà¸«à¸™à¹ˆà¸§à¸¢à¸™à¸±à¸š", 404);
+      if (updateResult.rowCount === 0) throw httpError("ไม่พบหน่วยนับ", 404);
       await syncProductUnitType(client, c);
     });
     return res.json({ success: true });
@@ -2630,12 +2641,12 @@ router.post("/deleteProductItemUnitUse", async (req, res) => {
   const { ic_code = "", code = "" } = req.body || {};
   const c = String(ic_code).trim();
   const u = String(code).trim();
-  if (!c || !u) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²à¹à¸¥à¸°à¸£à¸«à¸±à¸ªà¸«à¸™à¹ˆà¸§à¸¢à¸™à¸±à¸š" });
+  if (!c || !u) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้าและรหัสหน่วยนับ" });
   try {
     await withTransaction(async (client) => {
       await ensureProductExists(client, c);
       const deleteResult = await client.query(`DELETE FROM ic_unit_use WHERE ic_code=$1 AND code=$2`, [c, u]);
-      if (deleteResult.rowCount === 0) throw httpError("à¹„à¸¡à¹ˆà¸žà¸šà¸«à¸™à¹ˆà¸§à¸¢à¸™à¸±à¸š", 404);
+      if (deleteResult.rowCount === 0) throw httpError("ไม่พบหน่วยนับ", 404);
       await syncProductUnitType(client, c);
     });
     return res.json({ success: true });
@@ -2648,10 +2659,10 @@ router.post("/deleteProductItemUnitUse", async (req, res) => {
 // ========== IMAGE MANAGEMENT ==========
 
 // GET /service/v1/getProductImages?item_code=
-// query à¸ˆà¸²à¸ main pool (metadata only) â€” à¸•à¸£à¸‡à¸•à¸²à¸¡ Java
+// query จาก main pool (metadata only) — ตรงตาม Java
 router.get("/getProductImages", async (req, res) => {
   const item_code = (req.query.item_code || "").trim();
-  if (!item_code) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²" });
+  if (!item_code) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้า" });
   try {
     const result = await queryImages(`SELECT image_id, guid_code, image_order FROM images WHERE image_id = $1 ORDER BY image_order ASC`, [item_code]);
     return res.json({ success: true, data: result.rows });
@@ -2662,12 +2673,12 @@ router.get("/getProductImages", async (req, res) => {
 });
 
 // POST /service/v1/saveProductImage
-// dual-pool transaction: main + images â€” à¸•à¸£à¸‡à¸•à¸²à¸¡ Java saveProductImage
+// dual-pool transaction: main + images — ตรงตาม Java saveProductImage
 router.post("/saveProductImage", async (req, res) => {
   const { item_code = "", image_file = "" } = req.body || {};
   const ic = String(item_code).trim();
   const imgData = String(image_file);
-  if (!ic || !imgData) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²à¹à¸¥à¸°à¸£à¸¹à¸›à¸ à¸²à¸ž" });
+  if (!ic || !imgData) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้าและรูปภาพ" });
 
   const base64 = imgData.replace(/^data:[^;]+;base64,/, "");
   const bytes = Buffer.from(base64, "base64");
@@ -2700,11 +2711,11 @@ router.post("/saveProductImage", async (req, res) => {
 });
 
 // POST /service/v1/deleteProductImage
-// dual-pool: à¸¥à¸šà¸—à¸±à¹‰à¸‡ 2 DB
+// dual-pool: ลบทั้ง 2 DB
 router.post("/deleteProductImage", async (req, res) => {
   const { guid_code = "" } = req.body || {};
   const guid = String(guid_code).trim();
-  if (!guid) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸ guid_code" });
+  if (!guid) return res.status(400).json({ success: false, message: "กรุณาระบุ guid_code" });
 
   const clientMain = await pool.connect();
   const clientImg = await poolImages.connect();
@@ -2735,7 +2746,7 @@ router.post("/reorderProductImages", async (req, res) => {
   const { item_code = "", orders = [] } = req.body || {};
   const ic = String(item_code).trim();
   if (!ic || !Array.isArray(orders) || !orders.length) {
-    return res.status(400).json({ success: false, message: "à¸‚à¹‰à¸­à¸¡à¸¹à¸¥à¹„à¸¡à¹ˆà¸„à¸£à¸š" });
+    return res.status(400).json({ success: false, message: "ข้อมูลไม่ครบ" });
   }
 
   const clientMain = await pool.connect();
@@ -2797,7 +2808,7 @@ async function syncInventoryRoworderSequence(client, tableName) {
 
 router.get("/getProductSalePrices", async (req, res) => {
   const ic_code = String(req.query.ic_code || "").trim();
-  if (!ic_code) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²" });
+  if (!ic_code) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้า" });
   try {
     const result = await query(
       `SELECT COALESCE(roworder,0) AS roworder, COALESCE(line_number,0) AS line_number,
@@ -2834,9 +2845,9 @@ router.post("/saveProductSalePrice", async (req, res) => {
   const icCode = String(body.ic_code || "").trim();
   const unitCode = String(body.unit_code || "").trim();
   const roworder = body.roworder === undefined || body.roworder === null || body.roworder === "" ? null : productManageToInt(body.roworder, NaN);
-  if (!icCode || !unitCode) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²à¹à¸¥à¸°à¸«à¸™à¹ˆà¸§à¸¢à¸™à¸±à¸š" });
-  if (!productManageDateText(body.from_date) || !productManageDateText(body.to_date)) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸Šà¹ˆà¸§à¸‡à¸§à¸±à¸™à¸—à¸µà¹ˆ" });
-  if (productManageNumber(body.from_qty, 0) > productManageNumber(body.to_qty, 0)) return res.status(400).json({ success: false, message: "à¸Šà¹ˆà¸§à¸‡à¸ˆà¸³à¸™à¸§à¸™à¹„à¸¡à¹ˆà¸–à¸¹à¸à¸•à¹‰à¸­à¸‡" });
+  if (!icCode || !unitCode) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้าและหน่วยนับ" });
+  if (!productManageDateText(body.from_date) || !productManageDateText(body.to_date)) return res.status(400).json({ success: false, message: "กรุณาระบุช่วงวันที่" });
+  if (productManageNumber(body.from_qty, 0) > productManageNumber(body.to_qty, 0)) return res.status(400).json({ success: false, message: "ช่วงจำนวนไม่ถูกต้อง" });
 
   const priceType = productManageToInt(body.price_type, 1) || 1;
   if (priceType === 1) {
@@ -2845,11 +2856,11 @@ router.post("/saveProductSalePrice", async (req, res) => {
     body.cust_group_2 = "";
   } else if (priceType === 2) {
     body.cust_code = "";
-    if (!String(body.cust_group_1 || "").trim()) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¹€à¸¥à¸·à¸­à¸à¸à¸¥à¸¸à¹ˆà¸¡à¸¥à¸¹à¸à¸„à¹‰à¸² 1" });
+    if (!String(body.cust_group_1 || "").trim()) return res.status(400).json({ success: false, message: "กรุณาเลือกกลุ่มลูกค้า 1" });
   } else if (priceType === 3) {
     body.cust_group_1 = "";
     body.cust_group_2 = "";
-    if (!String(body.cust_code || "").trim()) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¹€à¸¥à¸·à¸­à¸à¸£à¸«à¸±à¸ªà¸¥à¸¹à¸à¸„à¹‰à¸²" });
+    if (!String(body.cust_code || "").trim()) return res.status(400).json({ success: false, message: "กรุณาเลือกรหัสลูกค้า" });
   }
 
   try {
@@ -2913,7 +2924,7 @@ router.post("/saveProductSalePrice", async (req, res) => {
 router.post("/deleteProductSalePrice", async (req, res) => {
   const icCode = String(req.body?.ic_code || "").trim();
   const roworder = productManageToInt(req.body?.roworder, NaN);
-  if (!icCode || !Number.isFinite(roworder)) return res.status(400).json({ success: false, message: "à¸‚à¹‰à¸­à¸¡à¸¹à¸¥à¹„à¸¡à¹ˆà¸„à¸£à¸š" });
+  if (!icCode || !Number.isFinite(roworder)) return res.status(400).json({ success: false, message: "ข้อมูลไม่ครบ" });
   try {
     await query(`DELETE FROM ic_inventory_price WHERE ic_code=$1 AND roworder=$2`, [icCode, roworder]);
     return res.json({ success: true });
@@ -2927,7 +2938,7 @@ router.post("/deleteProductSalePrice", async (req, res) => {
 
 router.get("/getProductDiscountConditions", async (req, res) => {
   const ic_code = String(req.query.ic_code || "").trim();
-  if (!ic_code) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²" });
+  if (!ic_code) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้า" });
   try {
     const result = await query(
       `SELECT COALESCE(roworder,0) AS roworder, COALESCE(line_number,0) AS line_number,
@@ -2959,10 +2970,10 @@ router.post("/saveProductDiscountCondition", async (req, res) => {
   const icCode = String(body.ic_code || "").trim();
   const unitCode = String(body.unit_code || "").trim();
   const roworder = body.roworder === undefined || body.roworder === null || body.roworder === "" ? null : productManageToInt(body.roworder, NaN);
-  if (!icCode || !unitCode) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²à¹à¸¥à¸°à¸«à¸™à¹ˆà¸§à¸¢à¸™à¸±à¸š" });
-  if (!String(body.discount || "").trim()) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸ªà¹ˆà¸§à¸™à¸¥à¸”" });
-  if (!productManageDateText(body.from_date) || !productManageDateText(body.to_date)) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸Šà¹ˆà¸§à¸‡à¸§à¸±à¸™à¸—à¸µà¹ˆ" });
-  if (productManageNumber(body.from_qty, 0) > productManageNumber(body.to_qty, 0)) return res.status(400).json({ success: false, message: "à¸Šà¹ˆà¸§à¸‡à¸ˆà¸³à¸™à¸§à¸™à¹„à¸¡à¹ˆà¸–à¸¹à¸à¸•à¹‰à¸­à¸‡" });
+  if (!icCode || !unitCode) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้าและหน่วยนับ" });
+  if (!String(body.discount || "").trim()) return res.status(400).json({ success: false, message: "กรุณาระบุส่วนลด" });
+  if (!productManageDateText(body.from_date) || !productManageDateText(body.to_date)) return res.status(400).json({ success: false, message: "กรุณาระบุช่วงวันที่" });
+  if (productManageNumber(body.from_qty, 0) > productManageNumber(body.to_qty, 0)) return res.status(400).json({ success: false, message: "ช่วงจำนวนไม่ถูกต้อง" });
 
   const discountType = productManageToInt(body.discount_type, 0) || 0;
   if (discountType === 0) {
@@ -2971,11 +2982,11 @@ router.post("/saveProductDiscountCondition", async (req, res) => {
     body.cust_group_2 = "";
   } else if (discountType === 1) {
     body.cust_code = "";
-    if (!String(body.cust_group_1 || "").trim()) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¹€à¸¥à¸·à¸­à¸à¸à¸¥à¸¸à¹ˆà¸¡à¸¥à¸¹à¸à¸„à¹‰à¸² 1" });
+    if (!String(body.cust_group_1 || "").trim()) return res.status(400).json({ success: false, message: "กรุณาเลือกกลุ่มลูกค้า 1" });
   } else if (discountType === 2) {
     body.cust_group_1 = "";
     body.cust_group_2 = "";
-    if (!String(body.cust_code || "").trim()) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¹€à¸¥à¸·à¸­à¸à¸£à¸«à¸±à¸ªà¸¥à¸¹à¸à¸„à¹‰à¸²" });
+    if (!String(body.cust_code || "").trim()) return res.status(400).json({ success: false, message: "กรุณาเลือกรหัสลูกค้า" });
   }
 
   try {
@@ -3032,7 +3043,7 @@ router.post("/saveProductDiscountCondition", async (req, res) => {
 router.post("/deleteProductDiscountCondition", async (req, res) => {
   const icCode = String(req.body?.ic_code || "").trim();
   const roworder = productManageToInt(req.body?.roworder, NaN);
-  if (!icCode || !Number.isFinite(roworder)) return res.status(400).json({ success: false, message: "à¸‚à¹‰à¸­à¸¡à¸¹à¸¥à¹„à¸¡à¹ˆà¸„à¸£à¸š" });
+  if (!icCode || !Number.isFinite(roworder)) return res.status(400).json({ success: false, message: "ข้อมูลไม่ครบ" });
   try {
     await query(`DELETE FROM ic_inventory_discount WHERE ic_code=$1 AND roworder=$2`, [icCode, roworder]);
     return res.json({ success: true });
@@ -3046,7 +3057,7 @@ router.post("/deleteProductDiscountCondition", async (req, res) => {
 // GET /service/v1/getProductPriceFormulas?ic_code=
 router.get("/getProductPriceFormulas", async (req, res) => {
   const ic_code = (req.query.ic_code || "").trim();
-  if (!ic_code) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²" });
+  if (!ic_code) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้า" });
   try {
     const result = await query(
       `SELECT ic_code, unit_code, sale_type, tax_type,` +
@@ -3086,7 +3097,7 @@ router.post("/saveProductPriceFormula", async (req, res) => {
   } = req.body || {};
   const c = String(ic_code).trim();
   const uc = String(unit_code).trim();
-  if (!c || !uc) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²à¹à¸¥à¸°à¸«à¸™à¹ˆà¸§à¸¢à¸™à¸±à¸š" });
+  if (!c || !uc) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้าและหน่วยนับ" });
   const st = parseInt(sale_type) || 0;
   const tt = parseInt(tax_type) || 0;
   const toStr = (v) => String(v ?? "").trim();
@@ -3122,7 +3133,7 @@ router.post("/deleteProductPriceFormula", async (req, res) => {
   const { ic_code = "", unit_code = "", sale_type = 0, tax_type = 0 } = req.body || {};
   const c = String(ic_code).trim();
   const uc = String(unit_code).trim();
-  if (!c || !uc) return res.status(400).json({ success: false, message: "à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²à¹à¸¥à¸°à¸«à¸™à¹ˆà¸§à¸¢à¸™à¸±à¸š" });
+  if (!c || !uc) return res.status(400).json({ success: false, message: "กรุณาระบุรหัสสินค้าและหน่วยนับ" });
   try {
     await query(`DELETE FROM ic_inventory_price_formula WHERE ic_code=$1 AND unit_code=$2 AND sale_type=$3 AND tax_type=$4 AND currency_code=''`, [
       c,

@@ -13,7 +13,7 @@ router.get('/getCustomerList', async (req, res) => {
       where = ` AND (code ILIKE $1 OR name_1 ILIKE $1)`;
     }
     const sql = `SELECT code AS user_code, name_1 AS user_name, address, telephone,
-      COALESCE((SELECT tax_id FROM ar_customer_detail WHERE ar_code=code),'') AS tax_id
+      COALESCE((SELECT MAX(tax_id) FROM ar_customer_detail WHERE ar_code=code),'') AS tax_id
       FROM ar_customer WHERE 1=1 ${where} LIMIT 50`;
     const result = await query(sql, params);
     const data = result.rows.map(r => ({
@@ -70,8 +70,8 @@ router.get('/getCustomerCRM', async (req, res) => {
       SELECT code AS user_code, name_1 AS user_name,
         COALESCE(address,'') AS address, COALESCE(telephone,'') AS telephone,
         COALESCE(website,'') AS website,
-        COALESCE((SELECT logistic_area FROM ar_customer_detail WHERE ar_code=code),'') AS logistic_area,
-        COALESCE((SELECT group_main FROM ar_customer_detail WHERE ar_code=code),'') AS group_main
+        COALESCE((SELECT MAX(logistic_area) FROM ar_customer_detail WHERE ar_code=code),'') AS logistic_area,
+        COALESCE((SELECT MAX(group_main) FROM ar_customer_detail WHERE ar_code=code),'') AS group_main
       FROM ar_customer WHERE 1=1 ${where}
       LIMIT $${paramIdx} OFFSET $${paramIdx + 1}
     `;

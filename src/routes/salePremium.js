@@ -33,6 +33,41 @@ async function employeeHasPermission(queryFn, userCode, permissionKey) {
   return permissions.includes(permissionKey);
 }
 
+function normalizePremiumCodePrefix(value) {
+  const text = safeText(value).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  return text || 'PRO';
+}
+
+async function generateNextPremiumCode(queryFn, prefixValue = 'PRO') {
+  const prefix = normalizePremiumCodePrefix(prefixValue);
+  await ensureSalePremiumSchema(queryFn);
+
+  const result = await queryFn(
+    'SELECT premium_code FROM sml_sale_premium WHERE UPPER(premium_code) LIKE $1',
+    [prefix + '%'],
+  );
+  const pattern = new RegExp('^' + prefix + '(\\d+)$', 'i');
+  let maxNo = 0;
+  let width = 3;
+  for (const row of result.rows) {
+    const code = safeText(row.premium_code).toUpperCase();
+    const match = code.match(pattern);
+    if (!match) continue;
+    const no = Number(match[1]);
+    if (!Number.isFinite(no)) continue;
+    maxNo = Math.max(maxNo, no);
+    width = Math.max(width, match[1].length);
+  }
+
+  for (let nextNo = maxNo + 1; nextNo < maxNo + 1000; nextNo += 1) {
+    const numberText = String(nextNo).padStart(width, '0');
+    const candidate = (prefix + numberText).slice(0, 25);
+    const dup = await queryFn('SELECT 1 FROM sml_sale_premium WHERE premium_code=$1 LIMIT 1', [candidate]);
+    if (!dup.rows[0]) return candidate;
+  }
+  throw new Error('cannot generate premium_code');
+}
+
 router.get('/sale-premium/list', async (req, res) => {
   try {
     await ensureSalePremiumSchema(query);
@@ -61,6 +96,20 @@ router.get('/sale-premium/list', async (req, res) => {
       params,
     );
     return res.json({ success: true, data: result.rows });
+  } catch (ex) {
+    return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
+router.get('/sale-premium/next-code', async (req, res) => {
+  try {
+    const userCode = safeText(req.query.user_code || req.query.emp_code);
+    if (!(await employeeHasPermission(query, userCode, SALE_PREMIUM_MANAGE_PERMISSION))) {
+      return res.status(403).json({ success: false, msg: `permission denied: ${SALE_PREMIUM_MANAGE_PERMISSION}` });
+    }
+    const prefix = normalizePremiumCodePrefix(req.query.prefix || 'PRO');
+    const premiumCode = await generateNextPremiumCode(query, prefix);
+    return res.json({ success: true, data: { premium_code: premiumCode, prefix } });
   } catch (ex) {
     return res.status(500).json({ success: false, msg: ex.message });
   }

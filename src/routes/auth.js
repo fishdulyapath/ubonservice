@@ -83,7 +83,7 @@ router.get('/logincus', async (req, res) => {
         address,
         telephone,
         COALESCE(
-          (SELECT tax_id FROM ar_customer_detail WHERE ar_code = code),
+          (SELECT MAX(tax_id) FROM ar_customer_detail WHERE ar_code = code),
           ''
         ) AS tax_id
       FROM ar_customer

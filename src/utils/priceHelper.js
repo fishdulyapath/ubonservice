@@ -166,12 +166,12 @@ async function getProductPriceLocalx(
           `SELECT roworder, sale_price1, sale_price2, price_mode, price_type
            FROM ic_inventory_price
            WHERE ic_code=$1 AND unit_code=$2 AND price_type=2
-             AND cust_group_1=(SELECT group_main FROM ar_customer_detail WHERE ar_code=$3)
+             AND cust_group_1=(SELECT MAX(group_main) FROM ar_customer_detail WHERE ar_code=$3)
              AND (
-               cust_group_2=(SELECT group_sub_1 FROM ar_customer_detail WHERE ar_code=$3)
-               OR cust_group_2=(SELECT group_sub_1 FROM ar_customer_detail WHERE ar_code=$3)
-               OR cust_group_2=(SELECT group_sub_3 FROM ar_customer_detail WHERE ar_code=$3)
-               OR cust_group_2=(SELECT group_sub_4 FROM ar_customer_detail WHERE ar_code=$3)
+               cust_group_2=(SELECT MAX(group_sub_1) FROM ar_customer_detail WHERE ar_code=$3)
+               OR cust_group_2=(SELECT MAX(group_sub_1) FROM ar_customer_detail WHERE ar_code=$3)
+               OR cust_group_2=(SELECT MAX(group_sub_3) FROM ar_customer_detail WHERE ar_code=$3)
+               OR cust_group_2=(SELECT MAX(group_sub_4) FROM ar_customer_detail WHERE ar_code=$3)
                OR COALESCE(cust_group_2,'')=''
              )
              AND ($4::date BETWEEN from_date AND to_date)
@@ -424,12 +424,12 @@ async function getProductPriceLocalx(
         const dq9 = await client.query(
           `SELECT roworder, discount FROM ic_inventory_discount
            WHERE ic_code=$1 AND unit_code=$2 AND discount_type=1
-             AND cust_group_1=(SELECT group_main FROM ar_customer_detail WHERE ar_code=$3)
+             AND cust_group_1=(SELECT MAX(group_main) FROM ar_customer_detail WHERE ar_code=$3)
              AND (
-               cust_group_2=(SELECT group_sub_1 FROM ar_customer_detail WHERE ar_code=$3)
-               OR cust_group_2=(SELECT group_sub_1 FROM ar_customer_detail WHERE ar_code=$3)
-               OR cust_group_2=(SELECT group_sub_3 FROM ar_customer_detail WHERE ar_code=$3)
-               OR cust_group_2=(SELECT group_sub_4 FROM ar_customer_detail WHERE ar_code=$3)
+               cust_group_2=(SELECT MAX(group_sub_1) FROM ar_customer_detail WHERE ar_code=$3)
+               OR cust_group_2=(SELECT MAX(group_sub_1) FROM ar_customer_detail WHERE ar_code=$3)
+               OR cust_group_2=(SELECT MAX(group_sub_3) FROM ar_customer_detail WHERE ar_code=$3)
+               OR cust_group_2=(SELECT MAX(group_sub_4) FROM ar_customer_detail WHERE ar_code=$3)
                OR COALESCE(cust_group_2,'')=''
              )
              AND ($4::date BETWEEN from_date AND to_date)

@@ -58,7 +58,7 @@ app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 app.use(express.text({ type: 'text/*', limit: '1mb' }));
 
-// Routes â€” base path: /service/v1
+// Routes — base path: /service/v1
 app.use('/service/v1', authRoutes);
 app.use('/service/v1', cartRoutes);
 app.use('/service/v1', productRoutes);
