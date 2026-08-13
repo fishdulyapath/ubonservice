@@ -625,6 +625,7 @@ async function loadPaymentRowsForPrint(docNo) {
   }
 
   const summary = cbRes.rows[0] || {};
+  const totalPaidAmount = toNumber(summary.total_amount_pay) || toNumber(summary.total_net_amount) || toNumber(summary.total_amount);
   return [{
     trans_number: labels.join('\n'),
     amount: amounts.join('\n'),
@@ -632,15 +633,15 @@ async function loadPaymentRowsForPrint(docNo) {
     total_net_amount: summary.total_net_amount,
     total_amount_pay: summary.total_amount_pay,
     discount_amount: summary.discount_amount,
-    total_discount: summary.discount_amount,
+    total_discount: totalPaidAmount,
     cash_amount: summary.cash_amount,
-    cash: summary.cash_amount,
+    cash: '',
     tranfer_amount: summary.tranfer_amount,
     transfer_amount: summary.tranfer_amount,
-    tranfer: summary.tranfer_amount,
-    transfer: summary.tranfer_amount,
+    tranfer: '',
+    transfer: '',
     chq_amount: summary.chq_amount,
-    chq: summary.chq_amount,
+    chq: '',
     card_amount: summary.card_amount,
   }];
 }
@@ -700,7 +701,7 @@ async function loadArDebtPaymentPrintDocument(docNo) {
               AND COALESCE(d.last_status,0) = 0
               AND COALESCE(d.trans_number,'') <> ''
           ),'') AS advance_payment_doc_no,
-          COALESCE(cb.discount_amount,0) AS total_discount,
+          COALESCE(NULLIF(cb.total_amount_pay,0), t.total_net_value, 0) AS total_discount,
           COALESCE(t.discount_word,'') AS discount_word,
           COALESCE(df.name_1,'') AS doc_format_name,
           COALESCE(df.form_code,'') AS form_code,
@@ -746,12 +747,12 @@ async function loadArDebtPaymentPrintDocument(docNo) {
           remark
        FROM (
          SELECT d.*, CASE d.bill_type
-                    WHEN 44 THEN 'Credit sale'
-                    WHEN 46 THEN 'Debit note'
-                    WHEN 48 THEN 'Credit note'
-                    WHEN 93 THEN 'Opening debt'
-                    WHEN 95 THEN 'Opening debit note'
-                    WHEN 97 THEN 'Opening credit note'
+                    WHEN 44 THEN 'ขายเชื่อ'
+                    WHEN 46 THEN 'เพิ่มหนี้'
+                    WHEN 48 THEN 'ลดหนี้'
+                    WHEN 93 THEN 'ตั้งหนี้ยกมา'
+                    WHEN 95 THEN 'เพิ่มหนี้ยกมา'
+                    WHEN 97 THEN 'ลดหนี้ยกมา'
                     ELSE d.bill_type::text
                   END AS bill_type_name
          FROM ap_ar_trans_detail d
@@ -775,11 +776,11 @@ async function loadArDebtPaymentPrintDocument(docNo) {
     details: detailsRes.rows || [],
     payments,
     campaigns: [{
-      cash: header.cash_amount,
-      chq: header.chq_amount,
-      tranfer: header.tranfer_amount,
-      transfer: header.tranfer_amount,
-      card: header.card_amount,
+      cash: '',
+      chq: '',
+      tranfer: '',
+      transfer: '',
+      card: '',
     }],
   };
 }
@@ -1707,7 +1708,7 @@ router.get('/ar-debt-payment/print/render', async (req, res) => {
       coordinateScale: 0.72,
       csharpTextAlignment: true,
       csharpPrintTypography: true,
-      pageSize: 'Letter',
+      pageSize: 'A4',
     });
     res.setHeader('Cache-Control', 'no-store');
     return res.status(200).type('html').send(html);

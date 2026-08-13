@@ -2,9 +2,18 @@
 const router = express.Router();
 const { query, withTransaction } = require('../db');
 const { safePage, safePageSize } = require('../utils/response');
-const { validateCartStock } = require('../utils/cartStockValidator');
+const { validateCartStock, validateSaleItemsStock } = require('../utils/cartStockValidator');
 const { assertBasketAccessFromCartKey } = require('../utils/basketAccess');
+const { expandSalePremiumItemForSave } = require('../utils/salePremiumHelper');
 
+async function ensureSalePremiumCartColumns(queryFn = query) {
+  await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sale_premium_code VARCHAR(25) DEFAULT ''`);
+  await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sale_premium_name VARCHAR(255) DEFAULT ''`);
+  await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sale_premium_data TEXT DEFAULT ''`);
+}
+function parseJsonText(value) {
+  try { return value ? JSON.parse(value) : null; } catch { return null; }
+}
 async function resolveBasketPricingContext(custCode) {
   if (!custCode || !String(custCode).trim()) {
     return { saleType: null, vatType: null, vatRate: null };
@@ -47,6 +56,7 @@ router.post('/additemtocart', async (req, res) => {
     // เลียนแบบ Java: loop ทุก item → DELETE เดิม → INSERT ใหม่
     const client = await require('../db').pool.connect();
     try {
+      await ensureSalePremiumCartColumns(client.query.bind(client));
       const checkedCarts = new Set();
       for (const item of items) {
         const custCodeForCheck = item?.cust_code || '';
@@ -74,6 +84,9 @@ router.post('/additemtocart', async (req, res) => {
         const divide_value = item.divide_value !== undefined ? item.divide_value.toString() : '1';
         const ratio = item.ratio !== undefined ? item.ratio.toString() : '1';
         const remark = item.remark || '';
+        const sale_premium_code = item.sale_premium_code || '';
+        const sale_premium_name = item.sale_premium_name || '';
+        const sale_premium_data = typeof item.sale_premium_data === 'string' ? item.sale_premium_data : JSON.stringify(item.sale_premium_data || null);
 
         // DELETE เดิมก่อน (เหมือน Java)
         await client.query(
@@ -87,11 +100,11 @@ router.post('/additemtocart', async (req, res) => {
           `INSERT INTO staff_cart_order
            (item_type, cust_code, guid_code, item_code, item_name, unit_code, barcode,
             qty, price, wh_code, shelf_code, creator_code, create_datetime,
-            stand_value, divide_value, ratio, remark)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13,$14,$15,$16)`,
+            stand_value, divide_value, ratio, remark, sale_premium_code, sale_premium_name, sale_premium_data)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13,$14,$15,$16,$17,$18,$19)`,
           [item_type, cust_code, guid_code, item_code, item_name, unit_code, barcode,
            qty, price, wh_code, shelf_code, emp_code,
-           stand_value, divide_value, ratio, remark]
+           stand_value, divide_value, ratio, remark, sale_premium_code, sale_premium_name, sale_premium_data]
         );
       }
       resp.success = true;
@@ -129,6 +142,7 @@ router.get('/getcartitemlist', async (req, res) => {
 
   try {
     await assertBasketAccessFromCartKey(query, userCode, custCode, 'can_enter');
+    await ensureSalePremiumCartColumns(query);
     // COUNT
     const countSql = `SELECT COUNT(*) AS total_count FROM staff_cart_order WHERE cust_code = $1${searchCondition}`;
     const countResult = await query(countSql, params);
@@ -139,7 +153,7 @@ router.get('/getcartitemlist', async (req, res) => {
       SELECT sco.cust_code, sco.guid_code, sco.item_code, sco.item_name, sco.unit_code,
              sco.item_type, sco.barcode, sco.qty, sco.price, sco.wh_code, sco.shelf_code,
              sco.creator_code, sco.create_datetime, sco.stand_value, sco.divide_value,
-             sco.ratio, sco.remark, 0 AS balance_qty,
+             sco.ratio, sco.remark, sco.sale_premium_code, sco.sale_premium_name, sco.sale_premium_data, 0 AS balance_qty,
              COALESCE(i.tax_type, 0) AS tax_type
       FROM staff_cart_order sco
       LEFT JOIN ic_inventory i ON i.code = sco.item_code
@@ -168,6 +182,9 @@ router.get('/getcartitemlist', async (req, res) => {
       divide_value: r.divide_value,
       ratio: r.ratio,
       remark: r.remark,
+      sale_premium_code: r.sale_premium_code || '',
+      sale_premium_name: r.sale_premium_name || '',
+      sale_premium_data: parseJsonText(r.sale_premium_data),
       balance_qty: 0,
       tax_type: Number(r.tax_type ?? 0),
     }));
@@ -290,6 +307,7 @@ router.get('/getcartorder', async (req, res) => {
   const offset = (page - 1) * pageSize;
 
   try {
+    await ensureSalePremiumCartColumns(query);
     // COUNT
     const countResult = await query(
       'SELECT COUNT(*) AS total_count FROM staff_cart_order WHERE cust_code = $1',
@@ -312,7 +330,7 @@ router.get('/getcartorder', async (req, res) => {
 
     const data = result.rows.map(r => {
       // price_confirm: ถ้า item_type != '3' → '0', ถ้า '3' → price (เหมือน Java)
-      const priceConfirm = String(r.item_type) !== '3' ? '0' : r.price;
+      const priceConfirm = ['3', '4'].includes(String(r.item_type)) ? r.price : '0';
       return {
         tax_type: r.tax_type,
         cust_code: r.cust_code,
@@ -332,6 +350,9 @@ router.get('/getcartorder', async (req, res) => {
         divide_value: r.divide_value,
         ratio: r.ratio,
         price_confirm: priceConfirm,
+        sale_premium_code: r.sale_premium_code || '',
+        sale_premium_name: r.sale_premium_name || '',
+        sale_premium_data: parseJsonText(r.sale_premium_data),
       };
     });
 
@@ -376,7 +397,7 @@ router.post('/getcartorderprice', async (req, res) => {
       const o = { item_code: itemCode, unit_code: unitCode };
       try {
         let priceConfirm = 0;
-        if (itemType !== '3') {
+        if (!['3', '4'].includes(itemType)) {
           let vatType = parseInt(it.vat_type, 10);
           if (Number.isNaN(vatType)) vatType = Number.isNaN(bodyVatType) ? basketCtx.vatType : bodyVatType;
           if (Number.isNaN(vatType)) vatType = parseInt(it.tax_type, 10);
@@ -457,7 +478,7 @@ router.get('/getcartfinalsummary', async (req, res) => {
       totalQty += qty;
 
       let priceConfirm = 0;
-      if (String(r.item_type) !== '3') {
+      if (!['3', '4'].includes(String(r.item_type))) {
         try {
           const saleType = Number.isNaN(saleTypeReq) ? (Number.isNaN(basketCtx.saleType) ? 0 : basketCtx.saleType) : saleTypeReq;
           const vatType = Number.isNaN(vatTypeReq)
@@ -504,7 +525,25 @@ router.get('/validatecartstock', async (req, res) => {
 
   try {
     await assertBasketAccessFromCartKey(query, userCode, custCode, 'can_enter');
-    return res.json(await validateCartStock(query, custCode.trim()));
+    await ensureSalePremiumCartColumns(query);
+    const cartRes = await query(
+      `SELECT c.*, COALESCE(i.tax_type,0) AS tax_type
+         FROM staff_cart_order c
+         LEFT JOIN ic_inventory i ON i.code=c.item_code
+        WHERE c.cust_code=$1`,
+      [custCode.trim()],
+    );
+    const detailItems = [];
+    for (const item of cartRes.rows) {
+      const itemType = String(item?.item_type ?? '0');
+      if (item?.sale_premium_code || itemType === '4') {
+        const expanded = await expandSalePremiumItemForSave(query, item, { custCode: '' });
+        detailItems.push(...expanded);
+      } else {
+        detailItems.push(item);
+      }
+    }
+    return res.json(await validateSaleItemsStock(query, detailItems, { excludeCartKey: custCode.trim() }));
   } catch (ex) {
     return res.status(ex.statusCode || 500).json({ success: false, error: ex.message, msg: ex.message });
   }
@@ -558,3 +597,13 @@ function safeBigDecimal(s) {
 }
 
 module.exports = router;
+
+
+
+
+
+
+
+
+
+

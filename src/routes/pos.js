@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
 const { query, withTransaction } = require('../db');
@@ -6,6 +6,7 @@ const { calcDiscount, calcVat } = require('../utils/vatHelper');
 const { validateSaleItemsStock } = require('../utils/cartStockValidator');
 const { getEmployeePermissions } = require('../utils/permissions');
 const { assertBasketAccess } = require('../utils/basketAccess');
+const { expandSalePremiumItemForSave } = require('../utils/salePremiumHelper');
 
 const uuidv4 = () => crypto.randomUUID();
 const SOLD_OUT_PURCHASE_INFO_PERMISSION = 'sold_out.purchase_info.view';
@@ -14,6 +15,18 @@ const SALES_CANCEL_PERMISSION = 'sales.cancel';
 
 function safeText(value) {
   return String(value ?? '').trim();
+}
+
+function normalizeDbDocTime(value) {
+  const text = safeText(value);
+  if (!text) return '';
+
+  const hhmm = text.match(/(?:T|\s|^)(\d{1,2}):(\d{2})(?::\d{2}(?:\.\d+)?)?/);
+  if (hhmm) {
+    return `${String(hhmm[1]).padStart(2, '0')}:${hhmm[2]}`.slice(0, 5);
+  }
+
+  return text.slice(0, 5);
 }
 
 function envFlag(...names) {
@@ -206,7 +219,7 @@ async function querySaleAdvanceDepositBalances(queryFn, custCode, docNos = []) {
     `SELECT x.doc_no, x.doc_date, x.doc_time, x.cust_code, x.trans_flag,
             CASE WHEN x.trans_flag IN (110,9110) THEN 6 ELSE 5 END AS doc_type,
             CASE WHEN x.trans_flag IN (110,9110) THEN 'deposit' ELSE 'advance' END AS payment_kind,
-            CASE WHEN x.trans_flag IN (110,9110) THEN 'เงินมัดจำ' ELSE 'เงินล่วงหน้า' END AS type_label,
+            CASE WHEN x.trans_flag IN (110,9110) THEN '\u0E40\u0E07\u0E34\u0E19\u0E21\u0E31\u0E14\u0E08\u0E33' ELSE '\u0E40\u0E07\u0E34\u0E19\u0E25\u0E48\u0E27\u0E07\u0E2B\u0E19\u0E49\u0E32' END AS type_label,
             COALESCE(x.remark,'') AS remark,
             COALESCE(x.total_amount,0) AS total_amount,
             COALESCE(x.used_amount,0) AS used_amount,
@@ -245,9 +258,9 @@ async function querySaleAdvanceDepositBalances(queryFn, custCode, docNos = []) {
   return result.rows;
 }
 
-// ── helper: buildDocPattern ────────────────────────────────────────────────
-// แปลง doc_format จาก pos_id table เป็น pattern จริง
-// เช่น "@-yyyy-####" + posId="MPOS01" → "MPOS01-2026-####"
+// -- helper: buildDocPattern ------------------------------------------------
+// Convert erp_doc_format pattern to a concrete document pattern.
+// Example: "@-yyyy-####" + posId="MPOS01" -> "MPOS01-2026-####"
 function buildDocPattern(docFormat, posId) {
   if (!docFormat || docFormat.trim() === '') return posId + '-####';
   const now = new Date();
@@ -257,10 +270,10 @@ function buildDocPattern(docFormat, posId) {
   const day = String(now.getDate()).padStart(2, '0');
   return docFormat
     .replace(/@/g, posId)
-    .replace(/ปปปป/g, year4)
-    .replace(/ปป/g, year2)
-    .replace(/ดด/g, month)
-    .replace(/วว/g, day)
+    .replace(/\u0E1B\u0E1B\u0E1B\u0E1B/g, year4)
+    .replace(/\u0E1B\u0E1B/g, year2)
+    .replace(/\u0E14\u0E14/g, month)
+    .replace(/\u0E27\u0E27/g, day)
     .replace(/yyyy/g, year4)
     .replace(/YYYY/g, year4)
     .replace(/yy/g, year2)
@@ -303,9 +316,9 @@ async function resolveDocNoFromPattern(client, pattern, transFlag) {
   return prefix + String(nextRunning).padStart(runLen, '0') + suffix;
 }
 
-// ── helper: resolveDocNo ────────────────────────────────────────────────────
-// Query ic_trans → หา max running number → คืน doc_no ถัดไป
-// ต้องเรียกภายใน transaction (client) เพื่อ consistency
+// -- helper: resolveDocNo ----------------------------------------------------
+// Find the next running document number from ic_trans.
+// Call inside a transaction for consistency.
 async function resolveDocNo(client, posId, transFlag) {
   const posRes = await client.query(
     'SELECT doc_format FROM pos_id WHERE pos_id = $1 LIMIT 1',
@@ -352,7 +365,7 @@ async function resolveSaleDocNo(client, docFormatCode, transFlag) {
   };
 }
 
-// ── GET /service/v1/getBranchList ──────────────────────────────────────────
+// -- GET /service/v1/getBranchList ------------------------------------------
 
 async function refreshSaleInventoryBalanceQty(client, itemCodes = []) {
   const uniqueCodes = [...new Set((itemCodes || []).map((code) => safeText(code)).filter(Boolean))];
@@ -450,7 +463,7 @@ router.get('/getBranchList', async (req, res) => {
   }
 });
 
-// ── GET /service/v1/getWarehouseList ───────────────────────────────────────
+// -- GET /service/v1/getWarehouseList ---------------------------------------
 router.get('/getWarehouseList', async (req, res) => {
   try {
     const result = await query('SELECT code, name_1 FROM ic_warehouse ORDER BY code');
@@ -460,7 +473,7 @@ router.get('/getWarehouseList', async (req, res) => {
   }
 });
 
-// ── GET /service/v1/getShelfList ───────────────────────────────────────────
+// -- GET /service/v1/getShelfList -------------------------------------------
 router.get('/getShelfList', async (req, res) => {
   const { wh_code = '' } = req.query;
   try {
@@ -481,7 +494,7 @@ router.get('/getShelfList', async (req, res) => {
   }
 });
 
-// ── GET /service/v1/getPOSList ─────────────────────────────────────────────
+// -- GET /service/v1/getPOSList ---------------------------------------------
 router.get('/getPOSList', async (req, res) => {
   try {
     const result = await query(`
@@ -503,7 +516,7 @@ router.get('/getPOSList', async (req, res) => {
   }
 });
 
-// ── GET /service/v1/getErpOption ───────────────────────────────────────────
+// -- GET /service/v1/getErpOption -------------------------------------------
 router.get('/getErpOption', async (req, res) => {
   try {
     const result = await query('SELECT vat_type, vat_rate, discout_type FROM erp_option LIMIT 1');
@@ -513,8 +526,8 @@ router.get('/getErpOption', async (req, res) => {
   }
 });
 
-// ── GET /service/v1/getDashboardTopProducts ────────────────────────────────
-// สินค้าขายดีประจำวัน 10 รายการ (จาก ic_trans_detail JOIN ic_trans, trans_flag=44)
+// -- GET /service/v1/getDashboardTopProducts --------------------------------
+// Daily top-selling products from ic_trans_detail joined with ic_trans.
 router.get('/getDashboardTopProducts', async (req, res) => {
   const { date = '' } = req.query;
   const targetDate = date || new Date().toISOString().slice(0, 10);
@@ -539,8 +552,8 @@ router.get('/getDashboardTopProducts', async (req, res) => {
   }
 });
 
-// ── GET /service/v1/getDashboardSoldOut ───────────────────────────────────
-// สินค้าขายหมด: รายการที่ขายในวันที่เลือก ยอดคงเหลือ (net) - ตะกร้า <= 0
+// -- GET /service/v1/getDashboardSoldOut -----------------------------------
+// Sold-out products: sold quantity minus current stock/reserved cart qty.
 router.get('/getDashboardSoldOut', async (req, res) => {
   const { date = '', from_date = '', to_date = '', user_code = '' } = req.query;
   const today = new Date().toISOString().slice(0, 10);
@@ -559,6 +572,7 @@ router.get('/getDashboardSoldOut', async (req, res) => {
          COALESCE(last_pu.price, 0)::numeric                               AS last_purchase_price,
          COALESCE(last_pu.doc_no, '')                                       AS last_purchase_doc_no,
          COALESCE(last_pu.doc_date::text, '')                               AS last_purchase_doc_date,
+         COALESCE(last_pu.qty, 0)::numeric                                   AS last_purchase_qty,
          COALESCE(last_pu.supplier_code, '')                                AS last_purchase_supplier_code,
          COALESCE(last_pu.supplier_name, '')                                AS last_purchase_supplier_name`
       : '';
@@ -569,6 +583,7 @@ router.get('/getDashboardSoldOut', async (req, res) => {
              d.price,
              d.doc_no,
              d.doc_date,
+             d.qty,
              t.cust_code AS supplier_code,
              ap.name_1 AS supplier_name
            FROM ic_trans_detail d
@@ -582,8 +597,8 @@ router.get('/getDashboardSoldOut', async (req, res) => {
              AND d.item_code = st.item_code
            ORDER BY
              d.doc_date DESC,
+             COALESCE(d.doc_time, t.doc_time, '') DESC,
              d.doc_no DESC,
-             COALESCE(t.doc_time, '') DESC,
              d.line_number DESC
            LIMIT 1
          ) last_pu ON true`
@@ -655,8 +670,8 @@ router.get('/getDashboardSoldOut', async (req, res) => {
   }
 });
 
-// ── GET /service/v1/getDashboardTopCustomers ───────────────────────────────
-// ลูกค้าดีเด่นประจำเดือน 5 คน (ยอดสั่งซื้อสูงสุด, trans_flag=44)
+// -- GET /service/v1/getDashboardTopCustomers -------------------------------
+// Top 5 customers by monthly sales amount.
 router.get('/getDashboardTopCustomers', async (req, res) => {
   try {
     const result = await query(
@@ -682,8 +697,8 @@ router.get('/getDashboardTopCustomers', async (req, res) => {
   }
 });
 
-// ── GET /service/v1/getDashboardTopSalesmen ────────────────────────────────
-// พนักงานขายดีเด่นประจำเดือน 5 คน (ยอดขายสูงสุด, trans_flag=44)
+// -- GET /service/v1/getDashboardTopSalesmen --------------------------------
+// Top 5 salespeople by monthly sales amount.
 router.get('/getDashboardTopSalesmen', async (req, res) => {
   try {
     const result = await query(
@@ -711,7 +726,7 @@ router.get('/getDashboardTopSalesmen', async (req, res) => {
   }
 });
 
-// ── GET /service/v1/getLastDocNo ───────────────────────────────────────────
+// -- GET /service/v1/getLastDocNo -------------------------------------------
 router.get('/getLastDocNo', async (req, res) => {
   const { pos_id, doc_format_code, trans_flag } = req.query;
   if (!pos_id && !doc_format_code) {
@@ -775,7 +790,7 @@ router.get('/getLastDocNo', async (req, res) => {
   }
 });
 
-// ── GET /service/v1/getPassBookList ───────────────────────────────────────
+// -- GET /service/v1/getPassBookList ---------------------------------------
 router.get('/getPassBookList', async (req, res) => {
   try {
     const result = await query(`
@@ -792,7 +807,7 @@ router.get('/getPassBookList', async (req, res) => {
   }
 });
 
-// ── GET /service/v1/getCreditTypeList ─────────────────────────────────────
+// -- GET /service/v1/getCreditTypeList -------------------------------------
 router.get('/getCreditTypeList', async (req, res) => {
   try {
     const result = await query('SELECT code, name_1, charge_rate FROM erp_credit_type ORDER BY code');
@@ -867,7 +882,7 @@ async function handleSaveTrans(req, res, options = {}) {
     if (typeof obj === 'string') obj = JSON.parse(obj);
 
     const doc_date = obj.doc_date || '';
-    const doc_time = obj.doc_time || '';
+    const doc_time = normalizeDbDocTime(obj.doc_time);
     let doc_format_code = String(obj.doc_format_code || '').trim();
     let form_code = String(obj.form_code || '').trim();
     const cust_code = obj.cust_code || 'AR0269';
@@ -925,8 +940,8 @@ async function handleSaveTrans(req, res, options = {}) {
       return res.status(400).json({ success: false, msg: 'advance/deposit payment_detail is required' });
     }
 
-    // ── ค่า VAT/discount: ใช้ค่าที่ frontend คำนวณมาแล้ว (มี breakdown vat/no-vat ถูกต้อง)
-    //    ถ้าไม่ได้ส่งมา (backwards compat) → fallback คำนวณเองด้วย calcVat
+    // VAT/discount values: prefer frontend-calculated totals when provided.
+    // Fallback to backend calculation for older clients.
     const hasClientCalc =
       obj.total_before_vat != null && obj.total_vat_value != null && obj.total_amount != null;
     let total_disc, before_vat, vat_value, after_vat, total_amount;
@@ -943,13 +958,13 @@ async function handleSaveTrans(req, res, options = {}) {
       );
     }
 
-    // ── คำนวณ payment amounts ────────────────────────────────────────────────
-    // หลักการใหม่: ปัดเศษเป็น "ชนิดการจ่ายเงิน" — จ่ายจริง + ปัดเศษ = ยอดสุทธิ
-    //   total_net_amount  = ยอดสุทธิ (ไม่บวกปัดเศษ)
-    //   cash_amount_raw   = เงินสดที่ลูกค้าจ่ายจริง
-    //   rounded_amount    = ปัดเศษ (frontend ส่งมา; เก็บลง total_income_amount เช่นกัน)
+    // Payment amount calculation.
+    // Rounding is treated as an income/payment component.
+    // total_net_amount is the final net amount before change.
+    // cash_amount_raw is the actual cash received.
+    // rounded_amount is also stored in total_income_amount.
     //   total_amount_pay  = cash + transfer + card + wallet + deposit + rounding/income
-    //   money_change      = total_amount_pay − ยอดสุทธิ (ถ้ามี)
+    // money_change is total paid minus net amount.
     const card_with_charge = card_amount_dbl + total_credit_charge_dbl;
     const total_income_amount = total_income_amount_dbl || rounded_amount_dbl;
     const cash_amount_in_db = cash_amount_raw;
@@ -969,8 +984,25 @@ async function handleSaveTrans(req, res, options = {}) {
       if (basket_id) {
         await assertBasketAccess(client.query.bind(client), user_code || emp_code, basket_id, 'can_save_sale');
       }
+      const detailItems = [];
+      for (const item of items) {
+        const itemTypeForExpand = String(item?.item_type ?? '0');
+        if (item?.sale_premium_code || itemTypeForExpand === '4') {
+          const expanded = await expandSalePremiumItemForSave(client.query.bind(client), item, {
+            custCode: cust_code,
+            saleType: inquiry_type,
+            vatType: vat_type,
+            vatRate: vat_rate,
+            docDate: doc_date,
+          });
+          detailItems.push(...expanded);
+        } else {
+          detailItems.push(item);
+        }
+      }
+
       const cartKeyForStock = basket_id ? `BASKET-${basket_id}` : '';
-      const stockValidation = await validateSaleItemsStock(client, items, {
+      const stockValidation = await validateSaleItemsStock(client, detailItems, {
         excludeCartKey: cartKeyForStock,
       });
       if (!stockValidation.is_valid) {
@@ -1062,7 +1094,7 @@ async function handleSaveTrans(req, res, options = {}) {
         ]
       );
 
-      // 3.5 INSERT gl_journal_vat_sale (1 row ต่อเอกสาร — สำหรับรายงานภาษีขาย)
+      // 3.5 INSERT gl_journal_vat_sale (one row per sale document).
       const arNameRow = await client.query(
         'SELECT COALESCE(name_1, $2) AS name_1 FROM ar_customer WHERE code = $1 LIMIT 1',
         [cust_code, '']
@@ -1131,6 +1163,7 @@ async function handleSaveTrans(req, res, options = {}) {
         taxType = Number(item.tax_type ?? 0),
         discount = item.discount || '',
         discountAmount = parseFloat(item.discount_amount || 0),
+        isPermium = Number(item.is_permium ?? item.isPermium ?? 0) === 1 ? 1 : 0,
       }) => {
         const tax = calcLineVat(sumAmount, price, taxType);
         await client.query(
@@ -1140,8 +1173,8 @@ async function handleSaveTrans(req, res, options = {}) {
             item_code,item_name,unit_code,qty,price,sum_amount,line_number,remark,
             wh_code,shelf_code,stand_value,divide_value,ratio,doc_time,doc_date_calc,
             discount,discount_amount,barcode,calc_flag,
-            tax_type,sum_amount_exclude_vat,total_vat_value,price_exclude_vat
-          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,2,44,$10::date,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$10::date,$27,$28,$29,$30,$31,$32,$33,$34)`,
+            is_permium,tax_type,sum_amount_exclude_vat,total_vat_value,price_exclude_vat
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,2,44,$10::date,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$10::date,$27,$28,$29,$30,$31,$32,$33,$34,$35)`,
           [
             setRefLine,
             parseFloat(setRefPrice || 0),
@@ -1173,6 +1206,7 @@ async function handleSaveTrans(req, res, options = {}) {
             discountAmount,
             item.barcode || '',
             -1,
+            isPermium,
             taxType,
             tax.sumExcludeVat,
             tax.vatValue,
@@ -1182,7 +1216,7 @@ async function handleSaveTrans(req, res, options = {}) {
       };
 
       let detailLineNumber = 0;
-      for (const it of items) {
+      for (const it of detailItems) {
         const itQty = parseFloat(it.qty || 0);
         const itPrice = parseFloat(it.price || 0);
         const itSum = parseFloat(it.sum_amount || 0);
@@ -1257,11 +1291,11 @@ async function handleSaveTrans(req, res, options = {}) {
         const it_sum = parseFloat(it.sum_amount || 0);
         const it_tax_type = Number(it.tax_type ?? 0);
 
-        // คำนวณ base/vat รายบรรทัด ตาม tax_type ของสินค้าและ vat_type ของเอกสาร
-        // tax_type=1 (ยกเว้น): ไม่มี VAT — ใช้ราคา/ยอดเดิม
-        // tax_type=0 + vat_type=1 (รวมใน): แยก VAT ออกจากยอด
-        // tax_type=0 + vat_type=0 (แยกนอก): VAT คิดเพิ่มจากยอด, base=ยอดเดิม
-        // อื่น ๆ (ไม่กระทบ/ศูนย์): ไม่มี VAT
+        // Calculate line VAT/base from item tax_type and document vat_type.
+        // tax_type=1: VAT exempt, keep original price/amount.
+        // tax_type=0 + vat_type=1: VAT included, split VAT from amount.
+        // tax_type=0 + vat_type=0: VAT excluded, calculate VAT on amount.
+        // Other values: no VAT impact.
         let sum_amount_exclude_vat, line_vat_value, price_exclude_vat;
         if (it_tax_type === 1) {
           sum_amount_exclude_vat = it_sum;
@@ -1287,7 +1321,7 @@ async function handleSaveTrans(req, res, options = {}) {
             item_code,item_name,unit_code,qty,price,sum_amount,line_number,remark,
             wh_code,shelf_code,stand_value,divide_value,ratio,doc_time,doc_date_calc,
             discount,discount_amount,barcode,calc_flag,
-            tax_type,sum_amount_exclude_vat,total_vat_value,price_exclude_vat
+            is_permium,tax_type,sum_amount_exclude_vat,total_vat_value,price_exclude_vat
           ) VALUES ($1,$2,2,44,$3::date,$4,$5,$6,$7,$8,$9,$10,$11,$12,'',$13,$14,$15,$16,$17,$18,$3::date,$19,$20,$21,$22,$23,$24,$25,$26)`,
           [
             1, vat_type,
@@ -1355,7 +1389,7 @@ async function handleSaveTrans(req, res, options = {}) {
             ]
           );
         } else if (pay_type === '0') {
-          // โอน
+          // Transfer payment.
           const pb_bank_code = p.bank_code || 'KBANK';
           const pb_bank_branch = p.bank_branch || 'KBANK2';
           const transfer_date = /^\d{4}-\d{2}-\d{2}$/.test(String(p.transfer_date || p.chq_due_date || ''))
@@ -1370,7 +1404,7 @@ async function handleSaveTrans(req, res, options = {}) {
             [44, doc_no, doc_date, doc_time, trans_number, pb_bank_code, pb_bank_branch, pay_amount, cust_code, transfer_date]
           );
         } else if (pay_type === '21') {
-          // บัตรเครดิต
+          // Credit card payment.
           const cc_type = p.credit_card_type || 'NONE';
           const sum_amt = pay_amount + charge;
           await client.query(
@@ -1435,7 +1469,7 @@ async function handleSaveTrans(req, res, options = {}) {
     if (ex.code === 'SALE_STOCK_NOT_ENOUGH') {
       return res.status(409).json({
         success: false,
-        msg: 'สินค้าในตะกร้าสต๊อกไม่พอ',
+        msg: '\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32\u0E43\u0E19\u0E15\u0E30\u0E01\u0E23\u0E49\u0E32\u0E2A\u0E15\u0E4A\u0E2D\u0E01\u0E44\u0E21\u0E48\u0E1E\u0E2D',
         stock_issues: ex.stock_issues || [],
       });
     }
@@ -1452,12 +1486,12 @@ async function handleSaveTrans(req, res, options = {}) {
   }
 }
 
-// ── POST /service/v1/saveTrans ─────────────────────────────────────────────
+// -- POST /service/v1/saveTrans ---------------------------------------------
 router.post('/saveTrans', async (req, res) => {
   return handleSaveTrans(req, res);
 });
 
-// ── POST /service/v1/saveTransAndPro ───────────────────────────────────────
+// -- POST /service/v1/saveTransAndPro ---------------------------------------
 router.post('/saveTransAndPro', async (req, res) => {
   return handleSaveTrans(req, res, { savePromotionDetails: true });
 });
@@ -1466,8 +1500,8 @@ router.post('/savetransandpro', async (req, res) => {
   return handleSaveTrans(req, res, { savePromotionDetails: true });
 });
 
-// ── GET /service/v1/getDocSaleHistory ──────────────────────────────────────
-// ลอกจาก Java: ถ้ามี search → ยกเลิก date filter และค้นด้วย doc_no/cust_code/name_1 แทน
+// -- GET /service/v1/getDocSaleHistory --------------------------------------
+// Match Java behavior: search ignores date range and filters by doc/customer fields.
 router.get('/getDocSaleHistory', async (req, res) => {
   const { search = '', from_date = '', to_date = '', sale_kind = '' } = req.query;
   try {
@@ -1482,8 +1516,8 @@ router.get('/getDocSaleHistory', async (req, res) => {
     }
 
     if (search.trim()) {
-      // แบ่งคำค้นหาเป็น token แต่ละคำ (whitespace) — ทุกคำต้องตรงในบางฟิลด์ (AND)
-      // ทำให้ค้น "อู่ ช่าง เขม" เจอลูกค้าที่ชื่อมีทั้งสามคำ แม้ไม่ได้อยู่ติดกัน
+      // Split search text into whitespace tokens and require every token to match somewhere.
+      // This allows non-contiguous customer name searches.
       const tokens = search.trim().split(/\s+/).filter(Boolean).slice(0, 20);
       const clauses = tokens.map((tok) => {
         params.push(`%${tok}%`);
@@ -1540,8 +1574,8 @@ router.get('/getDocSaleHistory', async (req, res) => {
   }
 });
 
-// ── GET /service/v1/getProductSaleHistory ───────────────────────────────────
-// ประวัติขายระดับเอกสาร: ค้นด้วยสินค้า / ลูกค้า / เลขที่เอกสาร และรวมขายสด+ขายเชื่อ
+// -- GET /service/v1/getProductSaleHistory -----------------------------------
+// Product sale history by document: searchable by item, customer, or document number.
 router.get('/getProductSaleHistory', async (req, res) => {
   const { search = '', from_date = '', to_date = '', item_code = '' } = req.query;
   try {
@@ -1645,7 +1679,7 @@ router.get('/getProductSaleHistory', async (req, res) => {
   }
 });
 
-// ── GET /service/v1/getDocSaleHistoryDetail ────────────────────────────────
+// -- GET /service/v1/getDocSaleHistoryDetail --------------------------------
 router.get('/getDocSaleHistoryDetail', async (req, res) => {
   const { doc_no = '' } = req.query;
   if (!doc_no) return res.status(400).json({ success: false, msg: 'doc_no is required' });
@@ -1733,7 +1767,7 @@ router.get('/getDocSaleHistoryDetail', async (req, res) => {
   }
 });
 
-// ── POST /service/v1/sales/cancel ───────────────────────────────────────────
+// -- POST /service/v1/sales/cancel -------------------------------------------
 router.post('/sales/cancel', async (req, res) => {
   const payload = req.body || {};
   const docNo = safeText(payload.doc_no);
@@ -1901,3 +1935,6 @@ router.post('/sales/cancel', async (req, res) => {
 });
 
 module.exports = router;
+
+
+

@@ -1,4 +1,4 @@
-require('dotenv').config();
+﻿require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const swaggerUi = require('swagger-ui-express');
@@ -25,6 +25,7 @@ const salePrintRoutes = require('./routes/salePrint');
 const purchaseRoutes = require('./routes/purchase');
 const purchasePrintRoutes = require('./routes/purchasePrint');
 const purchasePermiumRoutes = require('./routes/purchasePermium');
+const salePremiumRoutes = require('./routes/salePremium');
 const promotionRoutes = require('./routes/promotion');
 const salesReturnRoutes = require('./routes/salesReturn');
 const advancePaymentRoutes = require('./routes/advancePayment');
@@ -57,7 +58,7 @@ app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 app.use(express.text({ type: 'text/*', limit: '1mb' }));
 
-// Routes — base path: /service/v1
+// Routes â€” base path: /service/v1
 app.use('/service/v1', authRoutes);
 app.use('/service/v1', cartRoutes);
 app.use('/service/v1', productRoutes);
@@ -75,6 +76,7 @@ app.use('/service/v1', salePrintRoutes);
 app.use('/service/v1', purchaseRoutes);
 app.use('/service/v1', purchasePrintRoutes);
 app.use('/service/v1', purchasePermiumRoutes);
+app.use('/service/v1', salePremiumRoutes);
 app.use('/service/v1', promotionRoutes);
 app.use('/service/v1', salesReturnRoutes);
 app.use('/service/v1', advancePaymentRoutes);
@@ -94,3 +96,4 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
+

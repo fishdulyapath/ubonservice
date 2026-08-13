@@ -22,6 +22,100 @@ function pctChange(curr, prev) {
   return ((c - p) / p) * 100;
 }
 
+function boolFlag(value) {
+  if (typeof value === 'boolean') return value;
+  const text = String(value ?? '').trim().toLowerCase();
+  return text === '1' || text === 'true' || text === 'yes' || text === 'on';
+}
+
+async function loadWarningBillOverdueEnabled() {
+  try {
+    const column = await query(
+      `SELECT 1
+       FROM information_schema.columns
+       WHERE table_name = 'erp_option'
+         AND column_name = 'warning_bill_overdue'
+       LIMIT 1`,
+    );
+    if (!column.rowCount) return false;
+
+    const result = await query(
+      `SELECT COALESCE(warning_bill_overdue,0) AS warning_bill_overdue
+       FROM erp_option
+       LIMIT 1`,
+    );
+    return boolFlag(result.rows[0]?.warning_bill_overdue);
+  } catch {
+    return false;
+  }
+}
+
+function arOverdueBillSql() {
+  return `
+    SELECT cust_code AS ar_code,
+           (SELECT name_1 FROM ar_customer WHERE ar_customer.code = xx.cust_code LIMIT 1) AS ar_name,
+           doc_no,
+           TO_CHAR(doc_date, 'YYYY-MM-DD') AS doc_date,
+           ref_doc_no,
+           TO_CHAR(ref_doc_date, 'YYYY-MM-DD') AS ref_doc_date,
+           amount AS total_amount,
+           balance_amount,
+           TO_CHAR(due_date, 'YYYY-MM-DD') AS due_date
+    FROM (
+      SELECT cust_code, doc_date, credit_date AS due_date, doc_no, trans_flag AS doc_type, used_status,
+             doc_ref AS ref_doc_no, doc_ref_date AS ref_doc_date, COALESCE(total_amount,0) AS amount,
+             COALESCE(total_amount,0) - (
+               SELECT COALESCE(SUM(COALESCE(sum_pay_money,0)),0)
+               FROM ap_ar_trans_detail
+               WHERE COALESCE(last_status,0) = 0
+                 AND trans_flag IN (239)
+                 AND ic_trans.doc_no = ap_ar_trans_detail.billing_no
+                 AND ic_trans.doc_date = ap_ar_trans_detail.billing_date
+             ) AS balance_amount
+      FROM ic_trans
+      WHERE COALESCE(last_status,0) = 0
+        AND trans_flag = 44
+        AND (inquiry_type = 0 OR inquiry_type = 2)
+        AND doc_date <= $1::date
+
+      UNION ALL
+
+      SELECT cust_code, doc_date, credit_date AS due_date, doc_no, trans_flag AS doc_type, used_status,
+             '' AS ref_doc_no, NULL AS ref_doc_date, COALESCE(total_amount,0) AS amount,
+             COALESCE(total_amount,0) - (
+               SELECT COALESCE(SUM(COALESCE(sum_pay_money,0)),0)
+               FROM ap_ar_trans_detail
+               WHERE COALESCE(last_status,0) = 0
+                 AND trans_flag IN (239)
+                 AND ic_trans.doc_no = ap_ar_trans_detail.billing_no
+                 AND ic_trans.doc_date = ap_ar_trans_detail.billing_date
+             ) AS balance_amount
+      FROM ic_trans
+      WHERE COALESCE(last_status,0) = 0
+        AND (trans_flag = 46 OR trans_flag = 93 OR trans_flag = 99 OR trans_flag = 95 OR trans_flag = 101)
+        AND doc_date <= $1::date
+
+      UNION ALL
+
+      SELECT cust_code, doc_date, credit_date AS due_date, doc_no, trans_flag AS doc_type, used_status,
+             '' AS ref_doc_no, NULL AS ref_doc_date, -1 * COALESCE(total_amount,0) AS amount,
+             -1 * (COALESCE(total_amount,0) + (
+               SELECT COALESCE(SUM(COALESCE(sum_pay_money,0)),0)
+               FROM ap_ar_trans_detail
+               WHERE COALESCE(last_status,0) = 0
+                 AND trans_flag IN (239)
+                 AND ic_trans.doc_no = ap_ar_trans_detail.billing_no
+                 AND ic_trans.doc_date = ap_ar_trans_detail.billing_date
+             )) AS balance_amount
+      FROM ic_trans
+      WHERE COALESCE(last_status,0) = 0
+        AND ((trans_flag = 48 AND inquiry_type IN (0,2,4)) OR trans_flag = 97 OR trans_flag = 103)
+        AND doc_date <= $1::date
+    ) AS xx
+    WHERE balance_amount <> 0
+      AND (due_date IS NULL OR due_date < $1::date)
+  `;
+}
 function activeProductCondition(alias = 'd') {
   return `COALESCE(${alias}.is_hold_sale,0) <> 1 AND COALESCE(${alias}.is_hold_purchase,0) <> 1`;
 }
@@ -211,6 +305,72 @@ router.get('/getDashboardSummary', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /service/v1/getDashboardArOverdueBills
+// Matches SML ERP startup alert: warning_bill_overdue + overdue AR open balance.
+router.get('/getDashboardArOverdueBills', async (req, res) => {
+  const date = req.query.date || todayDateStr();
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+
+  try {
+    const enabled = await loadWarningBillOverdueEnabled();
+    const emptySummary = {
+      count: 0,
+      total_amount: 0,
+      total_balance: 0,
+      as_of_date: date,
+    };
+
+    if (!enabled) {
+      return res.json({ success: true, enabled: false, data: [], summary: emptySummary });
+    }
+
+    const sourceSql = arOverdueBillSql();
+    const summaryRes = await query(
+      `WITH overdue AS (${sourceSql})
+       SELECT COUNT(*)::int AS count,
+              COALESCE(SUM(total_amount),0)::numeric AS total_amount,
+              COALESCE(SUM(balance_amount),0)::numeric AS total_balance
+       FROM overdue`,
+      [date],
+    );
+    const listRes = await query(
+      `WITH overdue AS (${sourceSql})
+       SELECT ROW_NUMBER() OVER (ORDER BY ar_code, doc_date, doc_no)::int AS line,
+              ar_code,
+              COALESCE(ar_name,'') AS ar_name,
+              doc_no,
+              doc_date,
+              COALESCE(ref_doc_no,'') AS ref_doc_no,
+              ref_doc_date,
+              total_amount,
+              balance_amount,
+              due_date
+       FROM overdue
+       ORDER BY ar_code, doc_date, doc_no
+       LIMIT $2`,
+      [date, limit],
+    );
+
+    const summary = summaryRes.rows[0] || emptySummary;
+    return res.json({
+      success: true,
+      enabled: true,
+      data: listRes.rows.map((row) => ({
+        ...row,
+        total_amount: parseFloat(row.total_amount) || 0,
+        balance_amount: parseFloat(row.balance_amount) || 0,
+      })),
+      summary: {
+        count: parseInt(summary.count, 10) || 0,
+        total_amount: parseFloat(summary.total_amount) || 0,
+        total_balance: parseFloat(summary.total_balance) || 0,
+        as_of_date: date,
+      },
+    });
+  } catch (ex) {
+    return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
 // GET /service/v1/getRecentBills?limit=5
 // บิลล่าสุดสำหรับ Dashboard
 // ─────────────────────────────────────────────────────────────────────────────

@@ -10,6 +10,8 @@ const SALE_TRANS_FLAG = 44;
 const SALES_RETURN_TRANS_FLAG = 48;
 const SALES_RETURN_SCREEN_CODE = 'ST';
 const SALES_RETURN_CREATE_PERMISSION = 'sales.return.create';
+const SALES_RETURN_CASH_HISTORY_PERMISSION = 'sales.return.cash_history.view';
+const SALES_RETURN_CREDIT_HISTORY_PERMISSION = 'sales.return.credit_history.view';
 
 const REQUIRED_SCHEMA = {
   ic_trans: [
@@ -100,6 +102,23 @@ function roundMoney(value) {
   return Math.round(toNumber(value) * 100) / 100;
 }
 
+
+async function requireSalesReturnHistoryPermission(queryFn, userCode, saleKind) {
+  const code = safeText(userCode);
+  if (!code) throw new Error('user_code or emp_code is required for permission check');
+  const permissionKey = saleKind === 'credit'
+    ? SALES_RETURN_CREDIT_HISTORY_PERMISSION
+    : SALES_RETURN_CASH_HISTORY_PERMISSION;
+  const permissions = await getEmployeePermissions(queryFn, code);
+  if (!permissions.includes(permissionKey)) {
+    throw new Error(`permission denied: ${permissionKey}`);
+  }
+}
+
+function isPermissionError(ex) {
+  const msg = String(ex?.message || '');
+  return msg.startsWith('permission denied') || msg.includes('permission check');
+}
 function normalizeArray(value) {
   return Array.isArray(value) ? value : [];
 }
@@ -773,6 +792,92 @@ async function createSalesReturnPrintLog(docNo, userCode) {
   });
 }
 
+
+router.get('/getSalesReturnHistory', async (req, res) => {
+  const saleKind = normalizeSaleKind(req.query.sale_kind || req.query.kind) || 'cash';
+  const inquiryType = saleKind === 'credit' ? 0 : 1;
+  const userCode = req.query.user_code || req.query.emp_code;
+  const search = safeText(req.query.search);
+  const fromDate = normalizeDate(req.query.fromdate || req.query.from_date);
+  const toDate = normalizeDate(req.query.todate || req.query.to_date);
+  const limit = toPositiveInt(req.query.limit, 300, 500);
+  const params = [SALES_RETURN_TRANS_FLAG, inquiryType];
+  const conditions = [
+    't.trans_flag = $1',
+    'COALESCE(t.last_status,0) = 0',
+    'COALESCE(t.inquiry_type,0) = $2',
+  ];
+
+  if (search) {
+    params.push(`%${search}%`);
+    const idx = params.length;
+    conditions.push(`(
+      t.doc_no ILIKE $${idx}
+      OR COALESCE(t.doc_ref,'') ILIKE $${idx}
+      OR COALESCE(t.tax_doc_no,'') ILIKE $${idx}
+      OR COALESCE(t.cust_code,'') ILIKE $${idx}
+      OR COALESCE(ar.name_1,'') ILIKE $${idx}
+    )`);
+  } else {
+    if (fromDate) {
+      params.push(fromDate);
+      conditions.push(`t.doc_date >= $${params.length}::date`);
+    }
+    if (toDate) {
+      params.push(toDate);
+      conditions.push(`t.doc_date <= $${params.length}::date`);
+    }
+  }
+
+  params.push(limit);
+  const limitIndex = params.length;
+
+  try {
+    await requireSalesReturnHistoryPermission(query, userCode, saleKind);
+    const result = await query(
+      `SELECT t.doc_no,
+              t.doc_date,
+              COALESCE(t.doc_time,'') AS doc_time,
+              COALESCE(t.doc_format_code,'') AS doc_format_code,
+              COALESCE(t.cust_code,'') AS cust_code,
+              COALESCE(ar.name_1,'') AS cust_name,
+              COALESCE(t.sale_code,'') AS sale_code,
+              COALESCE(u.name_1, t.sale_code, '') AS sale_name,
+              COALESCE(t.doc_ref,'') AS doc_ref,
+              t.doc_ref_date,
+              COALESCE(t.tax_doc_no,'') AS tax_doc_no,
+              t.tax_doc_date,
+              COALESCE(t.total_value,0) AS total_value,
+              COALESCE(t.total_discount,0) AS total_discount,
+              COALESCE(t.total_before_vat,0) AS total_before_vat,
+              COALESCE(t.total_vat_value,0) AS total_vat_value,
+              COALESCE(t.total_amount,0) AS total_amount,
+              COALESCE(t.balance_amount,0) AS balance_amount,
+              COALESCE(cb.cash_amount,0) AS cash_amount,
+              COALESCE(cb.tranfer_amount,0) AS tranfer_amount,
+              COALESCE(cb.coupon_amount,0) AS coupon_amount,
+              COALESCE(cb.total_amount_pay,0) AS total_amount_pay,
+              COALESCE(t.remark,'') AS remark,
+              COALESCE(t.creator_code,'') AS creator_code,
+              COALESCE(t.inquiry_type,0) AS inquiry_type,
+              CASE COALESCE(t.inquiry_type,0)
+                WHEN 1 THEN 'คืนสินค้า'
+                ELSE 'ลดหนี้'
+              END AS doc_kind_name
+       FROM ic_trans t
+       LEFT JOIN ar_customer ar ON ar.code = t.cust_code
+       LEFT JOIN erp_user u ON UPPER(u.code) = UPPER(t.sale_code)
+       LEFT JOIN cb_trans cb ON cb.doc_no = t.doc_no AND cb.trans_flag = t.trans_flag
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY t.doc_date DESC, COALESCE(t.doc_time,'') DESC, t.doc_no DESC
+       LIMIT $${limitIndex}`,
+      params,
+    );
+    return res.json({ success: true, data: result.rows });
+  } catch (ex) {
+    return res.status(isPermissionError(ex) ? 403 : 500).json({ success: false, msg: ex.message });
+  }
+});
 router.get('/getSalesReturnDetail', async (req, res) => {
   const docNo = safeText(req.query.doc_no);
   if (!docNo) return res.status(400).json({ success: false, msg: 'doc_no is required' });

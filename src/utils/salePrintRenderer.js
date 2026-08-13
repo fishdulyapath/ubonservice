@@ -158,6 +158,13 @@ function fontScale(options = {}) {
   return options.csharpPrintTypography ? 1 : coordScale(options);
 }
 
+function paperWidthPt(pageSize) {
+  const text = String(pageSize || '').toLowerCase();
+  if (text.includes('letter')) return 612;
+  if (text.includes('a4')) return 595.28;
+  return null;
+}
+
 function toPt(value, fallback = 0, options = {}) {
   return toNumber(value, fallback) * coordScale(options);
 }
@@ -504,6 +511,7 @@ function isPaymentCheckField(fieldName) {
 }
 
 function isPaymentCheckboxObject(object, fieldName, pageMeta) {
+  if (!pageMeta.formOptions?.paymentMethodFieldChecks) return false;
   if (!useCSharpTextAlignment(pageMeta)) return false;
   if (!isPaymentCheckField(fieldName)) return false;
   return object.width <= 28 && object.height <= 28;
@@ -884,6 +892,10 @@ function isNumericTableColumn(column) {
   return /(^|_)(qty|quantity|price|amount|discount|sum|total|vat|value|rate|balance|credit|cash|card|change|cost|fee|charge)(_|$)/i.test(fieldName);
 }
 
+function isDateTableColumn(column) {
+  return isDateField(column.fieldName);
+}
+
 function useCSharpPrintTypography(pageMeta) {
   return !!pageMeta?.formOptions?.csharpPrintTypography;
 }
@@ -922,6 +934,7 @@ function tableCellClass(column, extraClass = '') {
   return [
     'sml-table-cell',
     extraClass,
+    isDateTableColumn(column) ? 'sml-table-date-cell' : '',
     isNumericTableColumn(column) ? 'sml-table-number-cell' : 'sml-table-text-cell',
   ].filter(Boolean).join(' ');
 }
@@ -949,6 +962,7 @@ function estimateCellLineCount(value, column, pageMeta) {
   const text = String(value ?? '').replace(/\r/g, '').trim();
   if (!text) return 1;
   if (isNumericTableColumn(column)) return 1;
+  if (isDateTableColumn(column)) return 1;
   const fontSize = tableBodyFontSizePt(column, pageMeta);
   const availableWidth = Math.max(8, column.width - column.padding.left - column.padding.right);
   const charsPerLine = Math.max(4, Math.floor(availableWidth / (fontSize * 0.44)));
@@ -1105,17 +1119,29 @@ function renderSalePrintHtml({
   const printPageSize = /^[a-z0-9 ._-]+$/i.test(String(pageSize || '')) ? String(pageSize || 'A4') : 'A4';
   const forms = formRows.map((form) => parseFormDesign(form, rendererOptions)).filter((form) => form.pages.length);
   const pages = forms.map((form) => renderForm(form, data)).join('\n');
+  const pageWidths = forms.flatMap((form) => form.pages.map((page) => page.setup.width)).filter((width) => width > 0);
+  const formPageWidthPt = pageWidths.length ? Math.max(...pageWidths) : 595.28;
+  const printPaperWidthPt = paperWidthPt(printPageSize) || formPageWidthPt;
+  const printBodyWidthPt = printPaperWidthPt.toFixed(2);
+  const printContentScale = Math.min(1, printPaperWidthPt / formPageWidthPt).toFixed(5);
+  const printViewportWidthPx = Math.ceil(printPaperWidthPt * 96 / 72);
 
   return `<!doctype html>
 <html lang="th">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=${printViewportWidthPx}, initial-scale=1">
   <title>${escapeHtml(data.header?.doc_no || 'sale-print')}</title>
   <style>
     @page { size: ${printPageSize} portrait; margin: 0; }
     * { box-sizing: border-box; }
-    html, body { margin: 0; min-height: 100%; background: #e5e7eb; }
+    html, body {
+      margin: 0;
+      min-height: 100%;
+      background: #e5e7eb;
+      -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
+    }
     body { font-family: ${DEFAULT_FONT}; color: #000; }
     .sml-page {
       position: relative;
@@ -1199,15 +1225,30 @@ function renderSalePrintHtml({
       overflow-wrap: normal;
       word-break: normal;
     }
+    .sml-table-date-cell {
+      overflow-wrap: normal;
+      word-break: normal;
+    }
+    .sml-table-date-cell:not(.sml-table-header-cell) {
+      white-space: nowrap;
+    }
     .sml-table-header-cell.sml-table-number-cell {
       white-space: normal;
       overflow-wrap: anywhere;
     }
     @media print {
-      html, body { width: 100%; background: #fff; }
+      html, body {
+        width: ${printBodyWidthPt}pt;
+        min-width: ${printBodyWidthPt}pt;
+        background: #fff;
+        -webkit-text-size-adjust: 100%;
+        text-size-adjust: 100%;
+      }
       .sml-page {
         margin: 0;
         box-shadow: none;
+        transform: scale(${printContentScale});
+        transform-origin: top left;
         break-after: auto;
         page-break-after: auto;
       }
@@ -1229,7 +1270,11 @@ ${pages || '<div style="padding:24px">ไม่พบแบบฟอร์มส
   function shrinkContentToFit(el, content, options) {
     if (!content) return;
     var style = window.getComputedStyle(el);
-    var size = parseFloat(style.fontSize) || 12;
+    if (!el.getAttribute('data-base-font-px')) {
+      el.setAttribute('data-base-font-px', String(parseFloat(style.fontSize) || 12));
+    }
+    var size = parseFloat(el.getAttribute('data-base-font-px')) || parseFloat(style.fontSize) || 12;
+    el.style.fontSize = size + 'px';
     var minSize = minFontPx(el, options.minSize || 7);
     var guard = 0;
     var fitWidth = options.fitWidth !== false;
@@ -1246,10 +1291,9 @@ ${pages || '<div style="padding:24px">ไม่พบแบบฟอร์มส
     }
   }
   function fitSmlPrintText() {
-    if (${csharpPrintTypography ? 'true' : 'false'}) return;
     document.querySelectorAll('.sml-text').forEach(function (el) {
       var content = el.querySelector('.sml-text-content');
-      shrinkContentToFit(el, content, { minSize: 7, fitWidth: true, fitHeight: false });
+      shrinkContentToFit(el, content, { minSize: ${csharpPrintTypography ? '6' : '7'}, fitWidth: true, fitHeight: false });
     });
   }
   function fitSmlTableText() {
