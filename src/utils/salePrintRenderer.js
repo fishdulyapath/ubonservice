@@ -710,7 +710,7 @@ function renderTextObject(object, data, row, pageMeta) {
     `width:${object.width.toFixed(2)}pt`,
     `height:${object.height.toFixed(2)}pt`,
     fontCss(object.font),
-    boostAdvanceText ? `font-size:${Math.max(resolveFontSizePt(object.font), 8.8).toFixed(2)}pt` : '',
+    boostAdvanceText ? `font-size:${Math.max(resolveFontSizePt(object.font), 13.5).toFixed(2)}pt` : '',
     `text-align:${textAlign}`,
     `align-items:${verticalAlign}`,
     `color:${object.color || '#000000'}`,
@@ -725,8 +725,8 @@ function renderTextObject(object, data, row, pageMeta) {
     'box-sizing:border-box',
     'line-height:1.25',
   ].join(';');
-  const minFontAttr = boostAdvanceText ? ' data-min-font-pt="8"' : '';
-  return `<div class="sml-text"${minFontAttr} style="${style}"><span class="sml-text-content" style="${contentStyle}">${htmlValue}</span></div>`;
+  const advanceFitAttrs = boostAdvanceText ? ' data-min-font-pt="13" data-no-fit="1"' : '';
+  return `<div class="sml-text"${advanceFitAttrs} style="${style}"><span class="sml-text-content" style="${contentStyle}">${htmlValue}</span></div>`;
 }
 
 function renderLineObject(object) {
@@ -1322,6 +1322,7 @@ ${pages || '<div style="padding:24px">ไม่พบแบบฟอร์มส
   }
   function fitSmlPrintText() {
     document.querySelectorAll('.sml-text').forEach(function (el) {
+      if (el.getAttribute('data-no-fit') === '1') return;
       var content = el.querySelector('.sml-text-content');
       shrinkContentToFit(el, content, { minSize: ${csharpPrintTypography ? '6' : '7'}, fitWidth: true, fitHeight: false });
     });
