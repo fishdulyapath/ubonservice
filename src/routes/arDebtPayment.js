@@ -652,9 +652,26 @@ async function loadArDebtPaymentPrintDocument(docNo) {
       `SELECT t.*,
           COALESCE(t.total_net_value,0) AS total_value,
           COALESCE(t.total_net_value,0) AS total_amount,
-          COALESCE(t.total_net_value,0) AS total_net_amount,
-          GREATEST(ROUND(COALESCE(t.total_net_value,0) - COALESCE(cb.discount_amount,0), 2), 0) AS total_after_discount,
-          COALESCE(NULLIF(cb.total_amount_pay,0), t.total_net_value, 0) AS total_amount_pay,
+          CASE
+            WHEN COALESCE(t.total_net_value,0) <> 0 OR COALESCE(cb.discount_amount,0) <> 0 THEN
+              GREATEST(ROUND(COALESCE(t.total_net_value,0) - COALESCE(cb.discount_amount,0), 2), 0)
+            ELSE COALESCE(NULLIF(cb.total_amount_pay,0), NULLIF(cb.total_net_amount,0), 0)
+          END AS total_net_amount,
+          CASE
+            WHEN COALESCE(t.total_net_value,0) <> 0 OR COALESCE(cb.discount_amount,0) <> 0 THEN
+              GREATEST(ROUND(COALESCE(t.total_net_value,0) - COALESCE(cb.discount_amount,0), 2), 0)
+            ELSE COALESCE(NULLIF(cb.total_amount_pay,0), NULLIF(cb.total_net_amount,0), 0)
+          END AS total_net_value,
+          CASE
+            WHEN COALESCE(t.total_net_value,0) <> 0 OR COALESCE(cb.discount_amount,0) <> 0 THEN
+              GREATEST(ROUND(COALESCE(t.total_net_value,0) - COALESCE(cb.discount_amount,0), 2), 0)
+            ELSE COALESCE(NULLIF(cb.total_amount_pay,0), NULLIF(cb.total_net_amount,0), 0)
+          END AS total_after_discount,
+          CASE
+            WHEN COALESCE(t.total_net_value,0) <> 0 OR COALESCE(cb.discount_amount,0) <> 0 THEN
+              GREATEST(ROUND(COALESCE(t.total_net_value,0) - COALESCE(cb.discount_amount,0), 2), 0)
+            ELSE COALESCE(NULLIF(cb.total_amount_pay,0), NULLIF(cb.total_net_amount,0), 0)
+          END AS total_amount_pay,
           COALESCE(cb.cash_amount,0) AS cash_amount,
           COALESCE(cb.tranfer_amount,0) AS tranfer_amount,
           COALESCE(cb.tranfer_amount,0) AS transfer_amount,
@@ -701,7 +718,11 @@ async function loadArDebtPaymentPrintDocument(docNo) {
               AND COALESCE(d.last_status,0) = 0
               AND COALESCE(d.trans_number,'') <> ''
           ),'') AS advance_payment_doc_no,
-          COALESCE(NULLIF(cb.total_amount_pay,0), t.total_net_value, 0) AS total_discount,
+          CASE
+            WHEN COALESCE(t.total_net_value,0) <> 0 OR COALESCE(cb.discount_amount,0) <> 0 THEN
+              GREATEST(ROUND(COALESCE(t.total_net_value,0) - COALESCE(cb.discount_amount,0), 2), 0)
+            ELSE COALESCE(NULLIF(cb.total_amount_pay,0), NULLIF(cb.total_net_amount,0), 0)
+          END AS total_discount,
           COALESCE(t.discount_word,'') AS discount_word,
           COALESCE(df.name_1,'') AS doc_format_name,
           COALESCE(df.form_code,'') AS form_code,
@@ -1705,9 +1726,11 @@ router.get('/ar-debt-payment/print/render', async (req, res) => {
       formRows,
       data: printData,
       autoPrint: String(auto_print) !== '0',
-      coordinateScale: 0.72,
+      coordinateScale: 0.75,
       csharpTextAlignment: true,
       csharpPrintTypography: true,
+      boostAdvancePaymentText: true,
+      plainScreenPage: true,
       pageSize: 'A4',
     });
     res.setHeader('Cache-Control', 'no-store');

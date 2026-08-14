@@ -21,6 +21,12 @@ const SUMMARY_FIELD_NAMES = new Set([
   'total_except_vat',
   'total_amount',
   'total_net_amount',
+  'total_net_value',
+  'total_after_discount',
+  'total_amount_pay',
+  'total_advance_balance',
+  'advance_payment_doc_no',
+  'trans_numbers',
   'cash_amount',
   'tranfer_amount',
   'transfer_amount',
@@ -659,6 +665,22 @@ function summaryStartTop(page) {
   return Math.max(page.setup.height * 0.45, Math.min(...tops) - 6);
 }
 
+
+const ADVANCE_PAYMENT_TEXT_FIELDS = new Set([
+  'advance_payment_doc_no',
+  'trans_numbers',
+  'total_advance_balance',
+]);
+
+function isAdvancePaymentTextObject(object, pageMeta) {
+  if (!pageMeta?.formOptions?.boostAdvancePaymentText) return false;
+  if (objectFieldNames(object).some((fieldName) => ADVANCE_PAYMENT_TEXT_FIELDS.has(fieldName))) return true;
+  const text = `${object.text || ''} ${object.replaceText || ''} ${object.fieldName || ''}`;
+  return text.includes('\u0e40\u0e07\u0e34\u0e19\u0e23\u0e31\u0e1a\u0e25\u0e48\u0e27\u0e07\u0e2b\u0e19\u0e49\u0e32')
+    || text.includes('\u0e40\u0e07\u0e34\u0e19\u0e25\u0e48\u0e27\u0e07\u0e2b\u0e19\u0e49\u0e32')
+    || text.includes('\u0e23\u0e31\u0e1a\u0e25\u0e48\u0e27\u0e07\u0e2b\u0e19\u0e49\u0e32');
+}
+
 function shouldRenderObjectOnPage(object, pageMeta) {
   if (object.toolType === 'Table') return isDetailTable(object) || pageMeta.isSummaryPage;
   if (isPageCounterObject(object)) return true;
@@ -669,6 +691,7 @@ function shouldRenderObjectOnPage(object, pageMeta) {
 
 function renderTextObject(object, data, row, pageMeta) {
   const value = resolveText(object, data, row, pageMeta);
+  const boostAdvanceText = isAdvancePaymentTextObject(object, pageMeta);
   const htmlValue = escapeHtmlWithPrintGaps(value, object.width);
   const verticalAlign = cssVAlign(object.align);
   const textAlign = textObjectAlign(object, pageMeta);
@@ -687,6 +710,7 @@ function renderTextObject(object, data, row, pageMeta) {
     `width:${object.width.toFixed(2)}pt`,
     `height:${object.height.toFixed(2)}pt`,
     fontCss(object.font),
+    boostAdvanceText ? `font-size:${Math.max(resolveFontSizePt(object.font), 8.8).toFixed(2)}pt` : '',
     `text-align:${textAlign}`,
     `align-items:${verticalAlign}`,
     `color:${object.color || '#000000'}`,
@@ -701,7 +725,8 @@ function renderTextObject(object, data, row, pageMeta) {
     'box-sizing:border-box',
     'line-height:1.25',
   ].join(';');
-  return `<div class="sml-text" style="${style}"><span class="sml-text-content" style="${contentStyle}">${htmlValue}</span></div>`;
+  const minFontAttr = boostAdvanceText ? ' data-min-font-pt="8"' : '';
+  return `<div class="sml-text"${minFontAttr} style="${style}"><span class="sml-text-content" style="${contentStyle}">${htmlValue}</span></div>`;
 }
 
 function renderLineObject(object) {
@@ -1112,10 +1137,12 @@ function renderSalePrintHtml({
   csharpTextAlignment = false,
   advancePaymentMethodChecks = false,
   csharpPrintTypography = false,
+  boostAdvancePaymentText = false,
+  plainScreenPage = false,
   fontScale: printFontScale,
   pageSize = 'A4',
 }) {
-  const rendererOptions = { coordinateScale, csharpTextAlignment, advancePaymentMethodChecks, csharpPrintTypography, fontScale: printFontScale };
+  const rendererOptions = { coordinateScale, csharpTextAlignment, advancePaymentMethodChecks, csharpPrintTypography, boostAdvancePaymentText, fontScale: printFontScale };
   const printPageSize = /^[a-z0-9 ._-]+$/i.test(String(pageSize || '')) ? String(pageSize || 'A4') : 'A4';
   const forms = formRows.map((form) => parseFormDesign(form, rendererOptions)).filter((form) => form.pages.length);
   const pages = forms.map((form) => renderForm(form, data)).join('\n');
@@ -1125,6 +1152,9 @@ function renderSalePrintHtml({
   const printBodyWidthPt = printPaperWidthPt.toFixed(2);
   const printContentScale = Math.min(1, printPaperWidthPt / formPageWidthPt).toFixed(5);
   const printViewportWidthPx = Math.ceil(printPaperWidthPt * 96 / 72);
+  const screenBodyBackground = plainScreenPage ? '#fff' : '#e5e7eb';
+  const screenPageMargin = plainScreenPage ? '0 auto' : '16px auto';
+  const screenPageShadow = plainScreenPage ? 'none' : '0 8px 24px rgba(15, 23, 42, 0.16)';
 
   return `<!doctype html>
 <html lang="th">
@@ -1138,7 +1168,7 @@ function renderSalePrintHtml({
     html, body {
       margin: 0;
       min-height: 100%;
-      background: #e5e7eb;
+      background: ${screenBodyBackground};
       -webkit-text-size-adjust: 100%;
       text-size-adjust: 100%;
     }
@@ -1146,9 +1176,9 @@ function renderSalePrintHtml({
     .sml-page {
       position: relative;
       overflow: hidden;
-      margin: 16px auto;
+      margin: ${screenPageMargin};
       background: #fff;
-      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.16);
+      box-shadow: ${screenPageShadow};
     }
     .sml-text { color: #000; }
     .sml-text-content {
