@@ -584,8 +584,10 @@ function isNumericFieldName(fieldName) {
 
 function isNumericObjectField(object) {
   const fieldName = primaryObjectFieldName(object);
+  const key = normalizeKey(fieldName);
   const format = object.fieldFormat || object.displayFormat;
-  return isNumericFormat(format) || SUMMARY_FIELD_NAMES.has(normalizeKey(fieldName)) || isNumericFieldName(fieldName);
+  if (ADVANCE_PAYMENT_LEFT_ALIGN_FIELDS.has(key)) return false;
+  return isNumericFormat(format) || SUMMARY_FIELD_NAMES.has(key) || isNumericFieldName(fieldName);
 }
 
 function textObjectAlign(object, pageMeta) {
@@ -671,6 +673,15 @@ const ADVANCE_PAYMENT_TEXT_FIELDS = new Set([
   'trans_numbers',
   'total_advance_balance',
 ]);
+const ADVANCE_PAYMENT_VALUE_FIELDS = new Set([
+  'advance_payment_doc_no',
+  'trans_numbers',
+  'total_advance_balance',
+]);
+const ADVANCE_PAYMENT_LEFT_ALIGN_FIELDS = new Set([
+  'advance_payment_doc_no',
+  'trans_numbers',
+]);
 
 function isAdvancePaymentTextObject(object, pageMeta) {
   if (!pageMeta?.formOptions?.boostAdvancePaymentText) return false;
@@ -679,6 +690,11 @@ function isAdvancePaymentTextObject(object, pageMeta) {
   return text.includes('\u0e40\u0e07\u0e34\u0e19\u0e23\u0e31\u0e1a\u0e25\u0e48\u0e27\u0e07\u0e2b\u0e19\u0e49\u0e32')
     || text.includes('\u0e40\u0e07\u0e34\u0e19\u0e25\u0e48\u0e27\u0e07\u0e2b\u0e19\u0e49\u0e32')
     || text.includes('\u0e23\u0e31\u0e1a\u0e25\u0e48\u0e27\u0e07\u0e2b\u0e19\u0e49\u0e32');
+}
+
+function isAdvancePaymentValueObject(object, pageMeta) {
+  if (!pageMeta?.formOptions?.boostAdvancePaymentText) return false;
+  return objectFieldNames(object).some((fieldName) => ADVANCE_PAYMENT_VALUE_FIELDS.has(fieldName));
 }
 
 function shouldRenderObjectOnPage(object, pageMeta) {
@@ -692,6 +708,7 @@ function shouldRenderObjectOnPage(object, pageMeta) {
 function renderTextObject(object, data, row, pageMeta) {
   const value = resolveText(object, data, row, pageMeta);
   const boostAdvanceText = isAdvancePaymentTextObject(object, pageMeta);
+  const advanceValueText = isAdvancePaymentValueObject(object, pageMeta);
   const htmlValue = escapeHtmlWithPrintGaps(value, object.width);
   const verticalAlign = cssVAlign(object.align);
   const textAlign = textObjectAlign(object, pageMeta);
@@ -701,7 +718,7 @@ function renderTextObject(object, data, row, pageMeta) {
     'width:100%',
     'white-space:inherit',
     'line-height:1.25',
-    'overflow:visible',
+    advanceValueText ? 'overflow:hidden' : 'overflow:visible',
     contentNudge,
   ].filter(Boolean).join(';');
   const style = [
@@ -719,13 +736,15 @@ function renderTextObject(object, data, row, pageMeta) {
     'position:absolute',
     'z-index:4',
     'display:flex',
-    'white-space:pre',
+    advanceValueText ? 'white-space:nowrap' : 'white-space:pre',
     'word-break:normal',
-    'overflow:visible',
+    advanceValueText ? 'overflow:hidden' : 'overflow:visible',
     'box-sizing:border-box',
     'line-height:1.25',
   ].join(';');
-  const advanceFitAttrs = boostAdvanceText ? ' data-min-font-pt="13" data-no-fit="1"' : '';
+  const advanceFitAttrs = advanceValueText
+    ? ' data-min-font-pt="6"'
+    : (boostAdvanceText ? ' data-min-font-pt="13" data-no-fit="1"' : '');
   return `<div class="sml-text"${advanceFitAttrs} style="${style}"><span class="sml-text-content" style="${contentStyle}">${htmlValue}</span></div>`;
 }
 

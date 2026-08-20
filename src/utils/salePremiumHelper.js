@@ -365,10 +365,14 @@ async function expandSalePremiumItemForSave(queryFn, item, options = {}) {
   const code = safeText(item.sale_premium_code || item.premium_code || item.item_code);
   const packQty = toNumber(item.qty, 1);
   const detail = await loadSalePremiumDetail(queryFn, code, options);
+  const fallbackWhCode = safeText(item.wh_code);
+  const fallbackShelfCode = safeText(item.shelf_code);
   const rows = [];
   for (const paid of detail.paid_items) {
     rows.push({
       ...paid,
+      wh_code: safeText(paid.wh_code) || fallbackWhCode,
+      shelf_code: safeText(paid.shelf_code) || fallbackShelfCode,
       qty: roundMoney(toNumber(paid.qty) * packQty),
       price: paid.price,
       sum_amount: roundMoney(toNumber(paid.price) * toNumber(paid.qty) * packQty),
@@ -381,6 +385,8 @@ async function expandSalePremiumItemForSave(queryFn, item, options = {}) {
   for (const free of detail.free_items) {
     rows.push({
       ...free,
+      wh_code: safeText(free.wh_code) || fallbackWhCode,
+      shelf_code: safeText(free.shelf_code) || fallbackShelfCode,
       qty: roundMoney(toNumber(free.qty) * packQty),
       price: 0,
       sum_amount: 0,
