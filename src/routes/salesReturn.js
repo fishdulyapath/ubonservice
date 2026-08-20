@@ -1029,6 +1029,11 @@ router.get('/sales-return-print/render', async (req, res) => {
       formRows,
       data: salesReturnData,
       autoPrint: String(auto_print) !== '0',
+      coordinateScale: 0.75,
+      csharpTextAlignment: true,
+      csharpPrintTypography: true,
+      plainScreenPage: true,
+      pageSize: 'A4',
     });
     res.setHeader('Cache-Control', 'no-store');
     return res.status(200).type('html').send(html);
