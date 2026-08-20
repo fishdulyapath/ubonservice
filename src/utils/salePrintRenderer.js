@@ -697,6 +697,11 @@ function isAdvancePaymentValueObject(object, pageMeta) {
   return objectFieldNames(object).some((fieldName) => ADVANCE_PAYMENT_VALUE_FIELDS.has(fieldName));
 }
 
+function isAdvancePaymentBalanceObject(object, pageMeta) {
+  if (!pageMeta?.formOptions?.boostAdvancePaymentText) return false;
+  return objectFieldNames(object).some((fieldName) => fieldName === 'total_advance_balance');
+}
+
 function shouldRenderObjectOnPage(object, pageMeta) {
   if (object.toolType === 'Table') return isDetailTable(object) || pageMeta.isSummaryPage;
   if (isPageCounterObject(object)) return true;
@@ -709,16 +714,18 @@ function renderTextObject(object, data, row, pageMeta) {
   const value = resolveText(object, data, row, pageMeta);
   const boostAdvanceText = isAdvancePaymentTextObject(object, pageMeta);
   const advanceValueText = isAdvancePaymentValueObject(object, pageMeta);
+  const advanceBalanceText = isAdvancePaymentBalanceObject(object, pageMeta);
   const htmlValue = escapeHtmlWithPrintGaps(value, object.width);
   const verticalAlign = cssVAlign(object.align);
   const textAlign = textObjectAlign(object, pageMeta);
-  const contentNudge = verticalAlign === 'center' ? 'transform:translateY(-0.08em)' : verticalAlign === 'flex-end' ? 'transform:translateY(-0.12em)' : '';
+  const contentNudge = advanceBalanceText ? '' : (verticalAlign === 'center' ? 'transform:translateY(-0.08em)' : verticalAlign === 'flex-end' ? 'transform:translateY(-0.12em)' : '');
   const contentStyle = [
     'display:block',
     'width:100%',
     'white-space:inherit',
     'line-height:1.25',
     advanceValueText ? 'overflow:hidden' : 'overflow:visible',
+    advanceBalanceText ? 'background:#fff' : '',
     contentNudge,
   ].filter(Boolean).join(';');
   const style = [
@@ -731,7 +738,7 @@ function renderTextObject(object, data, row, pageMeta) {
     `text-align:${textAlign}`,
     `align-items:${verticalAlign}`,
     `color:${object.color || '#000000'}`,
-    object.backgroundColor && object.backgroundColor !== 'transparent' ? `background:${object.backgroundColor}` : '',
+    advanceBalanceText ? 'background:#fff' : (object.backgroundColor && object.backgroundColor !== 'transparent' ? `background:${object.backgroundColor}` : ''),
     `padding:${object.padding.top.toFixed(2)}pt ${object.padding.right.toFixed(2)}pt ${object.padding.bottom.toFixed(2)}pt ${object.padding.left.toFixed(2)}pt`,
     'position:absolute',
     'z-index:4',
