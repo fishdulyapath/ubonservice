@@ -171,6 +171,13 @@ function paperWidthPt(pageSize) {
   return null;
 }
 
+function paperHeightPt(pageSize) {
+  const text = String(pageSize || '').toLowerCase();
+  if (text.includes('letter')) return 792;
+  if (text.includes('a4')) return 841.89;
+  return null;
+}
+
 function toPt(value, fallback = 0, options = {}) {
   return toNumber(value, fallback) * coordScale(options);
 }
@@ -719,17 +726,17 @@ function renderTextObject(object, data, row, pageMeta) {
   const verticalAlign = cssVAlign(object.align);
   const textAlign = textObjectAlign(object, pageMeta);
   const contentNudge = advanceBalanceText ? '' : (verticalAlign === 'center' ? 'transform:translateY(-0.08em)' : verticalAlign === 'flex-end' ? 'transform:translateY(-0.12em)' : '');
+  const renderLeft = advanceBalanceText ? Math.max(0, object.left - 12) : object.left;
   const contentStyle = [
     'display:block',
     'width:100%',
     'white-space:inherit',
     'line-height:1.25',
     advanceValueText ? 'overflow:hidden' : 'overflow:visible',
-    advanceBalanceText ? 'background:#fff' : '',
     contentNudge,
   ].filter(Boolean).join(';');
   const style = [
-    `left:${object.left.toFixed(2)}pt`,
+    `left:${renderLeft.toFixed(2)}pt`,
     `top:${object.top.toFixed(2)}pt`,
     `width:${object.width.toFixed(2)}pt`,
     `height:${object.height.toFixed(2)}pt`,
@@ -738,7 +745,7 @@ function renderTextObject(object, data, row, pageMeta) {
     `text-align:${textAlign}`,
     `align-items:${verticalAlign}`,
     `color:${object.color || '#000000'}`,
-    advanceBalanceText ? 'background:#fff' : (object.backgroundColor && object.backgroundColor !== 'transparent' ? `background:${object.backgroundColor}` : ''),
+    object.backgroundColor && object.backgroundColor !== 'transparent' ? `background:${object.backgroundColor}` : '',
     `padding:${object.padding.top.toFixed(2)}pt ${object.padding.right.toFixed(2)}pt ${object.padding.bottom.toFixed(2)}pt ${object.padding.left.toFixed(2)}pt`,
     'position:absolute',
     'z-index:4',
@@ -1173,9 +1180,13 @@ function renderSalePrintHtml({
   const forms = formRows.map((form) => parseFormDesign(form, rendererOptions)).filter((form) => form.pages.length);
   const pages = forms.map((form) => renderForm(form, data)).join('\n');
   const pageWidths = forms.flatMap((form) => form.pages.map((page) => page.setup.width)).filter((width) => width > 0);
+  const pageHeights = forms.flatMap((form) => form.pages.map((page) => page.setup.height)).filter((height) => height > 0);
   const formPageWidthPt = pageWidths.length ? Math.max(...pageWidths) : 595.28;
+  const formPageHeightPt = pageHeights.length ? Math.max(...pageHeights) : 841.89;
   const printPaperWidthPt = paperWidthPt(printPageSize) || formPageWidthPt;
+  const printPaperHeightPt = paperHeightPt(printPageSize) || formPageHeightPt;
   const printBodyWidthPt = printPaperWidthPt.toFixed(2);
+  const printBodyHeightPt = printPaperHeightPt.toFixed(2);
   const printContentScale = Math.min(1, printPaperWidthPt / formPageWidthPt).toFixed(5);
   const printViewportWidthPx = Math.ceil(printPaperWidthPt * 96 / 72);
   const screenBodyBackground = plainScreenPage ? '#fff' : '#e5e7eb';
@@ -1296,14 +1307,28 @@ function renderSalePrintHtml({
       html, body {
         width: ${printBodyWidthPt}pt;
         min-width: ${printBodyWidthPt}pt;
+        max-width: ${printBodyWidthPt}pt;
+        height: ${printBodyHeightPt}pt;
+        min-height: ${printBodyHeightPt}pt;
+        margin: 0;
+        padding: 0;
         background: #fff;
+        overflow: visible;
         -webkit-text-size-adjust: 100%;
         text-size-adjust: 100%;
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
       }
       .sml-page {
+        width: ${printBodyWidthPt}pt !important;
+        min-width: ${printBodyWidthPt}pt !important;
+        max-width: ${printBodyWidthPt}pt !important;
+        height: ${printBodyHeightPt}pt !important;
+        min-height: ${printBodyHeightPt}pt !important;
         margin: 0;
         box-shadow: none;
-        transform: scale(${printContentScale});
+        zoom: ${printContentScale};
+        transform: none;
         transform-origin: top left;
         break-after: auto;
         page-break-after: auto;
