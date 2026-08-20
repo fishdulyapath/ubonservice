@@ -2,7 +2,7 @@ const zlib = require('zlib');
 const QRCode = require('qrcode');
 
 const COORD_SCALE = 0.75;
-const DEFAULT_FONT = "'Angsana New', 'AngsanaUPC', Thonburi, 'TH Sarabun New', Tahoma, sans-serif";
+const DEFAULT_FONT = "'Angsana New', 'AngsanaUPC', 'TH Sarabun New', 'TH SarabunPSK', Thonburi, serif";
 const TABLE_MIN_FONT_PT = 6;
 const TABLE_HEADER_FONT_DELTA_PT = -1.25;
 const TABLE_HEADER_MAX_FONT_PT = 7.35;
@@ -721,12 +721,13 @@ function renderTextObject(object, data, row, pageMeta) {
   const value = resolveText(object, data, row, pageMeta);
   const boostAdvanceText = isAdvancePaymentTextObject(object, pageMeta);
   const advanceValueText = isAdvancePaymentValueObject(object, pageMeta);
+  const advanceLabelText = boostAdvanceText && !advanceValueText;
   const advanceBalanceText = isAdvancePaymentBalanceObject(object, pageMeta);
   const htmlValue = escapeHtmlWithPrintGaps(value, object.width);
   const verticalAlign = cssVAlign(object.align);
   const textAlign = textObjectAlign(object, pageMeta);
   const contentNudge = advanceBalanceText ? '' : (verticalAlign === 'center' ? 'transform:translateY(-0.08em)' : verticalAlign === 'flex-end' ? 'transform:translateY(-0.12em)' : '');
-  const renderLeft = advanceBalanceText ? Math.max(0, object.left - 12) : object.left;
+  const renderLeft = object.left;
   const contentStyle = [
     'display:block',
     'width:100%',
@@ -741,7 +742,7 @@ function renderTextObject(object, data, row, pageMeta) {
     `width:${object.width.toFixed(2)}pt`,
     `height:${object.height.toFixed(2)}pt`,
     fontCss(object.font),
-    boostAdvanceText ? `font-size:${Math.max(resolveFontSizePt(object.font), 13.5).toFixed(2)}pt` : '',
+    advanceLabelText ? `font-size:${Math.max(resolveFontSizePt(object.font), 11).toFixed(2)}pt` : '',
     `text-align:${textAlign}`,
     `align-items:${verticalAlign}`,
     `color:${object.color || '#000000'}`,
@@ -757,8 +758,8 @@ function renderTextObject(object, data, row, pageMeta) {
     'line-height:1.25',
   ].join(';');
   const advanceFitAttrs = advanceValueText
-    ? ' data-min-font-pt="6"'
-    : (boostAdvanceText ? ' data-min-font-pt="13" data-no-fit="1"' : '');
+    ? ' data-min-font-pt="5"'
+    : (advanceLabelText ? ' data-min-font-pt="9" data-no-fit="1"' : '');
   return `<div class="sml-text"${advanceFitAttrs} style="${style}"><span class="sml-text-content" style="${contentStyle}">${htmlValue}</span></div>`;
 }
 
@@ -1173,6 +1174,8 @@ function renderSalePrintHtml({
   boostAdvancePaymentText = false,
   plainScreenPage = false,
   fontScale: printFontScale,
+  largeScreenFontScale = 1,
+  largeScreenMinWidth = 1400,
   pageSize = 'A4',
 }) {
   const rendererOptions = { coordinateScale, csharpTextAlignment, advancePaymentMethodChecks, csharpPrintTypography, boostAdvancePaymentText, fontScale: printFontScale };
@@ -1189,6 +1192,12 @@ function renderSalePrintHtml({
   const printBodyHeightPt = printPaperHeightPt.toFixed(2);
   const printContentScale = Math.min(1, printPaperWidthPt / formPageWidthPt).toFixed(5);
   const printViewportWidthPx = Math.ceil(printPaperWidthPt * 96 / 72);
+  const largeScreenPrintFontScale = Number.isFinite(Number(largeScreenFontScale)) && Number(largeScreenFontScale) > 0
+    ? Number(largeScreenFontScale)
+    : 1;
+  const largeScreenPrintMinWidth = Number.isFinite(Number(largeScreenMinWidth)) && Number(largeScreenMinWidth) > 0
+    ? Number(largeScreenMinWidth)
+    : 1400;
   const screenBodyBackground = plainScreenPage ? '#fff' : '#e5e7eb';
   const screenPageMargin = plainScreenPage ? '0 auto' : '16px auto';
   const screenPageShadow = plainScreenPage ? 'none' : '0 8px 24px rgba(15, 23, 42, 0.16)';
@@ -1197,7 +1206,7 @@ function renderSalePrintHtml({
 <html lang="th">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=${printViewportWidthPx}, initial-scale=1">
+  <meta name="viewport" content="width=${printViewportWidthPx}, initial-scale=1, maximum-scale=1, user-scalable=no">
   <title>${escapeHtml(data.header?.doc_no || 'sale-print')}</title>
   <style>
     @page { size: ${printPageSize} portrait; margin: 0; }
@@ -1206,8 +1215,8 @@ function renderSalePrintHtml({
       margin: 0;
       min-height: 100%;
       background: ${screenBodyBackground};
-      -webkit-text-size-adjust: 100%;
-      text-size-adjust: 100%;
+      -webkit-text-size-adjust: none;
+      text-size-adjust: none;
     }
     body { font-family: ${DEFAULT_FONT}; color: #000; }
     .sml-page {
@@ -1314,22 +1323,18 @@ function renderSalePrintHtml({
         padding: 0;
         background: #fff;
         overflow: visible;
-        -webkit-text-size-adjust: 100%;
-        text-size-adjust: 100%;
+        -webkit-text-size-adjust: none;
+        text-size-adjust: none;
         -webkit-print-color-adjust: exact;
         print-color-adjust: exact;
       }
       .sml-page {
-        width: ${printBodyWidthPt}pt !important;
-        min-width: ${printBodyWidthPt}pt !important;
-        max-width: ${printBodyWidthPt}pt !important;
-        height: ${printBodyHeightPt}pt !important;
-        min-height: ${printBodyHeightPt}pt !important;
         margin: 0;
         box-shadow: none;
         zoom: ${printContentScale};
         transform: none;
         transform-origin: top left;
+        max-width: none;
         break-after: auto;
         page-break-after: auto;
       }
@@ -1384,16 +1389,60 @@ ${pages || '<div style="padding:24px">ไม่พบแบบฟอร์มส
       shrinkContentToFit(el, content, { minSize: 8, fitWidth: true, fitHeight: true });
     });
   }
+  function currentScreenWidth() {
+    var widths = [
+      window.innerWidth || 0,
+      window.outerWidth || 0,
+      (window.screen && window.screen.width) || 0,
+      (window.screen && window.screen.availWidth) || 0
+    ];
+    return Math.max.apply(Math, widths);
+  }
+  function applyLargeScreenFontScale() {
+    var scale = ${largeScreenPrintFontScale.toFixed(4)};
+    var minWidth = ${largeScreenPrintMinWidth.toFixed(0)};
+    if (!(scale > 0) || Math.abs(scale - 1) < 0.001) return;
+    if (currentScreenWidth() <= minWidth) return;
+    document.querySelectorAll('.sml-text, .sml-table-cell').forEach(function (el) {
+      if (el.getAttribute('data-large-screen-font-scaled') === '1') return;
+      var style = window.getComputedStyle(el);
+      var size = parseFloat(style.fontSize) || 0;
+      if (!(size > 0)) return;
+      el.style.fontSize = (size * scale) + 'px';
+      el.setAttribute('data-large-screen-font-scaled', '1');
+    });
+  }
   function fitSmlPrintLayout() {
+    applyLargeScreenFontScale();
     fitSmlPrintText();
     fitSmlTableText();
   }
-  window.addEventListener("load", function () {
+  function nextFrame() {
+    return new Promise(function (resolve) {
+      requestAnimationFrame(function () {
+        requestAnimationFrame(resolve);
+      });
+    });
+  }
+  function waitForFontsReady() {
+    if (document.fonts && document.fonts.ready) return document.fonts.ready.catch(function () {});
+    return Promise.resolve();
+  }
+  function prepareSmlPrintLayout() {
     fitSmlPrintLayout();
-    if (document.fonts && document.fonts.ready) {
-      document.fonts.ready.then(fitSmlPrintLayout);
-    }
-    ${autoPrint ? 'setTimeout(function(){window.print()},350);' : ''}
+    return waitForFontsReady()
+      .then(function () {
+        fitSmlPrintLayout();
+        return nextFrame();
+      })
+      .then(function () {
+        fitSmlPrintLayout();
+      });
+  }
+  window.addEventListener("load", function () {
+    prepareSmlPrintLayout().then(function () {
+      ${autoPrint ? 'window.print();' : ''}
+    });
   });
   window.addEventListener("beforeprint", fitSmlPrintLayout);
 </script>
