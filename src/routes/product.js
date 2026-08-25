@@ -302,6 +302,8 @@ router.get("/getProductList", async (req, res) => {
     exclude_hold_sale: strExcludeHoldSale = "",
     exclude_hold_purchase: strExcludeHoldPurchase = "",
     sort_stock_desc: strSortStockDesc = "",
+    sort_field: strSortField = "",
+    sort_order: strSortOrder = "asc",
     limit: strLimit = "20",
   } = req.query;
 
@@ -383,9 +385,17 @@ router.get("/getProductList", async (req, res) => {
       ` LEFT JOIN ar_item_by_customer arc ON arc.ic_code = b.code AND arc.ar_code='${strCustCode.replace(/'/g, "''")}'` +
       ` WHERE 1=1 ${whereFinal}`;
 
-    const orderBy = strSortStockDesc === "1"
-      ? ` ORDER BY COALESCE((${stockQtyExpr}),0) DESC, b.code ASC`
-      : "";
+    const requestedSortField = String(strSortField || "").trim().toLowerCase();
+    const requestedSortOrder = String(strSortOrder || "asc").trim().toLowerCase() === "desc" ? "DESC" : "ASC";
+    let orderBy = "";
+    if (strSortStockDesc === "1" || requestedSortField === "stock_qty") {
+      const stockSortOrder = strSortStockDesc === "1" ? "DESC" : requestedSortOrder;
+      orderBy = ` ORDER BY COALESCE((${stockQtyExpr}),0) ${stockSortOrder}, b.code ASC`;
+    } else if (requestedSortField === "item_name") {
+      orderBy = ` ORDER BY COALESCE(b.name_1,'') ${requestedSortOrder}, b.code ASC`;
+    } else if (requestedSortField === "item_code") {
+      orderBy = ` ORDER BY b.code ${requestedSortOrder}`;
+    }
 
     const offsetInt = Math.max(0, parseInt(strOffset, 10) || 0);
     const limitInt = Math.max(1, parseInt(strLimit, 10) || 20);

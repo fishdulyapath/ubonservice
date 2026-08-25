@@ -650,13 +650,42 @@ async function loadArDebtPaymentPrintDocument(docNo) {
   const [headerRes, companyRes, detailsRes, payments] = await Promise.all([
     query(
       `SELECT t.*,
-          COALESCE(t.total_net_value,0) AS total_value,
-          COALESCE(t.total_net_value,0) AS total_amount,
-          CASE
-            WHEN COALESCE(t.total_net_value,0) <> 0 OR COALESCE(cb.discount_amount,0) <> 0 THEN
-              GREATEST(ROUND(COALESCE(t.total_net_value,0) - COALESCE(cb.discount_amount,0), 2), 0)
-            ELSE COALESCE(NULLIF(cb.total_amount_pay,0), NULLIF(cb.total_net_amount,0), 0)
-          END AS total_net_amount,
+          COALESCE(
+            NULLIF(cb.total_amount,0),
+            NULLIF((
+              SELECT SUM(COALESCE(d.sum_pay_money,0))
+              FROM ap_ar_trans_detail d
+              WHERE d.doc_no = t.doc_no
+                AND d.trans_flag = t.trans_flag
+                AND COALESCE(d.last_status,0) = 0
+                AND COALESCE(d.calc_flag,0) = 0
+            ),0),
+            COALESCE(t.total_net_value,0)
+          ) AS total_value,
+          COALESCE(
+            NULLIF(cb.total_amount,0),
+            NULLIF((
+              SELECT SUM(COALESCE(d.sum_pay_money,0))
+              FROM ap_ar_trans_detail d
+              WHERE d.doc_no = t.doc_no
+                AND d.trans_flag = t.trans_flag
+                AND COALESCE(d.last_status,0) = 0
+                AND COALESCE(d.calc_flag,0) = 0
+            ),0),
+            COALESCE(t.total_net_value,0)
+          ) AS total_amount,
+          COALESCE(
+            NULLIF(cb.total_amount,0),
+            NULLIF((
+              SELECT SUM(COALESCE(d.sum_pay_money,0))
+              FROM ap_ar_trans_detail d
+              WHERE d.doc_no = t.doc_no
+                AND d.trans_flag = t.trans_flag
+                AND COALESCE(d.last_status,0) = 0
+                AND COALESCE(d.calc_flag,0) = 0
+            ),0),
+            COALESCE(t.total_net_value,0)
+          ) AS total_net_amount,
           CASE
             WHEN COALESCE(t.total_net_value,0) <> 0 OR COALESCE(cb.discount_amount,0) <> 0 THEN
               GREATEST(ROUND(COALESCE(t.total_net_value,0) - COALESCE(cb.discount_amount,0), 2), 0)
