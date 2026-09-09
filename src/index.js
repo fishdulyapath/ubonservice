@@ -1,4 +1,4 @@
-﻿require('dotenv').config();
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const swaggerUi = require('swagger-ui-express');
@@ -26,6 +26,7 @@ const purchaseRoutes = require('./routes/purchase');
 const purchasePrintRoutes = require('./routes/purchasePrint');
 const purchasePermiumRoutes = require('./routes/purchasePermium');
 const salePremiumRoutes = require('./routes/salePremium');
+const salePremiumBacklogRoutes = require('./routes/salePremiumBacklog');
 const promotionRoutes = require('./routes/promotion');
 const salesReturnRoutes = require('./routes/salesReturn');
 const advancePaymentRoutes = require('./routes/advancePayment');
@@ -77,6 +78,7 @@ app.use('/service/v1', purchaseRoutes);
 app.use('/service/v1', purchasePrintRoutes);
 app.use('/service/v1', purchasePermiumRoutes);
 app.use('/service/v1', salePremiumRoutes);
+app.use('/service/v1', salePremiumBacklogRoutes);
 app.use('/service/v1', promotionRoutes);
 app.use('/service/v1', salesReturnRoutes);
 app.use('/service/v1', advancePaymentRoutes);
@@ -96,4 +98,5 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
+
 

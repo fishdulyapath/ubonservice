@@ -1,4 +1,4 @@
-﻿const PERMISSIONS = [
+const PERMISSIONS = [
   { key: 'permission.manage', label: 'กำหนดสิทธิ์ผู้ใช้' },
   { key: 'dashboard.sold_out_report', label: 'แดชบอร์ด: ดูรายงานสินค้าขายหมด' },
   { key: 'dashboard.monthly_summary', label: 'แดชบอร์ด: สรุปยอดประจำเดือน' },
@@ -33,6 +33,7 @@
   { key: 'purchase.pu.print', label: 'ซื้อ/ตั้งหนี้ (PU): พิมพ์เอกสาร' },
   { key: 'purchase.premium.manage', label: 'ของแถมซื้อ: จัดการเงื่อนไขของแถม' },
   { key: 'sale.premium.manage', label: 'ของแถมขาย: จัดการเงื่อนไขของแถม' },
+  { key: 'sale.premium_backlog.view', label: 'สินค้าคงค้างโปรของแถม: เข้าหน้ารายงาน' },
   { key: 'product.view', label: 'จัดการสินค้า: เข้าหน้าจอ' },
   { key: 'product.images', label: 'จัดการสินค้า: ดูรูปภาพ' },
   { key: 'product.images.edit', label: 'จัดการสินค้า: แก้ไขรูปภาพ' },

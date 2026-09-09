@@ -1,18 +1,246 @@
-﻿const express = require('express');
+const express = require('express');
 const router = express.Router();
 const { query, withTransaction } = require('../db');
 const { safePage, safePageSize } = require('../utils/response');
 const { validateCartStock, validateSaleItemsStock } = require('../utils/cartStockValidator');
 const { assertBasketAccessFromCartKey } = require('../utils/basketAccess');
-const { expandSalePremiumItemForSave } = require('../utils/salePremiumHelper');
+const { buildSalePremiumFulfillment } = require('../utils/salePremiumBacklogHelper');
 
 async function ensureSalePremiumCartColumns(queryFn = query) {
   await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sale_premium_code VARCHAR(25) DEFAULT ''`);
   await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sale_premium_name VARCHAR(255) DEFAULT ''`);
   await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sale_premium_data TEXT DEFAULT ''`);
+  await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sale_premium_line_type VARCHAR(10) DEFAULT ''`);
+  await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sale_premium_backlog_id INTEGER DEFAULT 0`);
+  await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sale_premium_backlog_detail_id INTEGER DEFAULT 0`);
+  await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS is_permium SMALLINT DEFAULT 0`);
 }
 function parseJsonText(value) {
   try { return value ? JSON.parse(value) : null; } catch { return null; }
+}
+function toNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+function safeText(value) {
+  return String(value ?? '').trim();
+}
+async function validateSalePremiumBacklogCartRows(queryFn, rows = []) {
+  const cartRows = (Array.isArray(rows) ? rows : [])
+    .map((row) => ({
+      ...row,
+      sale_premium_backlog_detail_id: parseInt(row?.sale_premium_backlog_detail_id || 0, 10) || 0,
+      qty: toNumber(row?.qty),
+      item_code: safeText(row?.item_code),
+      item_name: safeText(row?.item_name),
+      unit_code: safeText(row?.unit_code),
+    }))
+    .filter((row) => row.sale_premium_backlog_detail_id > 0 && row.qty > 0);
+
+  if (cartRows.length === 0) return [];
+
+  const ids = [...new Set(cartRows.map((row) => row.sale_premium_backlog_detail_id))];
+  const rs = await queryFn(
+    `SELECT d.roworder AS detail_id, d.backlog_id, d.item_code, d.item_name, d.unit_code,
+            COALESCE(d.pending_qty,0)::numeric AS pending_qty,
+            COALESCE(d.status,'') AS detail_status,
+            COALESCE(h.status,'') AS backlog_status
+       FROM sml_sale_premium_backlog_detail d
+       JOIN sml_sale_premium_backlog h ON h.roworder=d.backlog_id
+      WHERE d.roworder = ANY($1::int[])`,
+    [ids],
+  );
+  const detailMap = new Map(rs.rows.map((row) => [Number(row.detail_id), row]));
+  const issues = [];
+  const issueDetailIds = new Set();
+  const groups = new Map();
+
+  for (const row of cartRows) {
+    const current = groups.get(row.sale_premium_backlog_detail_id) || { qty: 0, row };
+    current.qty += row.qty;
+    groups.set(row.sale_premium_backlog_detail_id, current);
+  }
+
+  for (const row of cartRows) {
+    const detail = detailMap.get(row.sale_premium_backlog_detail_id);
+    const itemName = row.item_name || row.item_code;
+    if (!detail) {
+      issues.push({
+        item_code: row.item_code,
+        item_name: itemName,
+        unit_code: row.unit_code,
+        qty_in_cart: row.qty,
+        balance_qty: 0,
+        stock_qty: 0,
+        reserved_other_qty: 0,
+        issue_type: 'premium_backlog_missing',
+      });
+      issueDetailIds.add(row.sale_premium_backlog_detail_id);
+      continue;
+    }
+
+    const pendingQty = toNumber(detail.pending_qty);
+    const itemMismatch = safeText(detail.item_code) !== row.item_code
+      || (safeText(detail.unit_code) && row.unit_code && safeText(detail.unit_code) !== row.unit_code);
+    const closed = pendingQty <= 0
+      || ['closed', 'cancelled'].includes(safeText(detail.detail_status).toLowerCase())
+      || safeText(detail.backlog_status).toLowerCase() === 'closed'
+      || safeText(detail.backlog_status).toLowerCase() === 'cancelled';
+
+    let issueType = '';
+    if (itemMismatch) issueType = 'premium_backlog_mismatch';
+    else if (closed) issueType = 'premium_backlog_closed';
+
+    if (issueType) {
+      issues.push({
+        item_code: row.item_code,
+        item_name: itemName || safeText(detail.item_name) || safeText(detail.item_code),
+        unit_code: row.unit_code || safeText(detail.unit_code),
+        qty_in_cart: row.qty,
+        balance_qty: Math.max(0, pendingQty),
+        stock_qty: Math.max(0, pendingQty),
+        reserved_other_qty: 0,
+        issue_type: issueType,
+      });
+      issueDetailIds.add(row.sale_premium_backlog_detail_id);
+    }
+  }
+
+  for (const [detailId, group] of groups.entries()) {
+    if (issueDetailIds.has(detailId)) continue;
+    const detail = detailMap.get(detailId);
+    if (!detail) continue;
+    const pendingQty = toNumber(detail.pending_qty);
+    if (group.qty > pendingQty + 0.0001) {
+      const row = group.row;
+      issues.push({
+        item_code: row.item_code,
+        item_name: row.item_name || safeText(detail.item_name) || row.item_code,
+        unit_code: row.unit_code || safeText(detail.unit_code),
+        qty_in_cart: group.qty,
+        balance_qty: Math.max(0, pendingQty),
+        stock_qty: Math.max(0, pendingQty),
+        reserved_other_qty: 0,
+        issue_type: 'premium_backlog_exceeding',
+      });
+    }
+  }
+
+  return issues;
+}
+
+function salePremiumBacklogErrorMessage(issue) {
+  if (!issue) return 'ตรวจสอบสินค้าคงค้างไม่สำเร็จ';
+  if (issue.issue_type === 'premium_backlog_missing') return 'ไม่พบรายการสินค้าคงค้างนี้';
+  if (issue.issue_type === 'premium_backlog_mismatch') return 'ข้อมูลสินค้าคงค้างไม่ตรงกับสินค้าในตะกร้า';
+  if (issue.issue_type === 'premium_backlog_closed') return 'รายการสินค้าคงค้างนี้ปิดแล้ว';
+  if (issue.issue_type === 'premium_backlog_exceeding') {
+    return `จำนวนสินค้าคงค้างเกินจำนวนที่ค้างอยู่: ${issue.item_name || issue.item_code}`;
+  }
+  if (issue.issue_type === 'premium_backlog_stock_exceeding' || issue.issue_type === 'premium_backlog_out_of_stock') {
+    return `สต๊อกสินค้าคงค้างไม่พอ: ${issue.item_name || issue.item_code}`;
+  }
+  return 'ตรวจสอบสินค้าคงค้างไม่สำเร็จ';
+}
+
+async function validateSalePremiumBacklogCartStock(queryFn, item) {
+  const itemCode = safeText(item?.item_code);
+  const itemName = safeText(item?.item_name) || itemCode;
+  const unitCode = safeText(item?.unit_code);
+  const qty = toNumber(item?.qty);
+  const ratio = Math.max(1, toNumber(item?.ratio, 1));
+  const cartKey = safeText(item?.cust_code);
+  const guidCode = safeText(item?.guid_code);
+  if (!itemCode || qty <= 0) return null;
+
+  const rs = await queryFn(
+    `WITH stock AS (
+       SELECT COALESCE(SUM(f.balance_qty),0)::numeric AS stock_qty
+         FROM sml_ic_function_stock_balance_warehouse_location(current_date, $1::text, '', '') f
+     ), reserved AS (
+       SELECT COALESCE(SUM(
+                COALESCE(c.qty,0)::numeric
+                * COALESCE(
+                    NULLIF(c.ratio::numeric,0),
+                    NULLIF(u.ratio::numeric,0),
+                    COALESCE(u.stand_value::numeric,1) / NULLIF(COALESCE(u.divide_value::numeric,1),0),
+                    1
+                  )
+              ),0)::numeric AS reserved_qty
+         FROM staff_cart_order c
+         LEFT JOIN ic_inventory i ON i.code=c.item_code
+         LEFT JOIN ic_unit_use u ON u.ic_code=c.item_code AND u.code=c.unit_code
+        WHERE c.cust_code LIKE 'BASKET-%'
+          AND c.item_code=$1
+          AND NOT (c.cust_code=$2 AND c.guid_code=$3)
+          AND COALESCE(NULLIF(c.item_type::text,'')::int, i.item_type, 0) NOT IN (1,3)
+     )
+     SELECT stock.stock_qty,
+            reserved.reserved_qty,
+            GREATEST(stock.stock_qty - reserved.reserved_qty, 0)::numeric AS available_qty
+       FROM stock, reserved`,
+    [itemCode, cartKey, guidCode],
+  );
+  const row = rs.rows[0] || {};
+  const requestedBaseQty = qty * ratio;
+  const stockQty = toNumber(row.stock_qty);
+  const reservedQty = toNumber(row.reserved_qty);
+  const availableQty = toNumber(row.available_qty);
+  if (stockQty <= 0) {
+    return {
+      item_code: itemCode,
+      item_name: itemName,
+      unit_code: unitCode,
+      qty_in_cart: qty,
+      balance_qty: 0,
+      stock_qty: 0,
+      reserved_other_qty: reservedQty,
+      issue_type: 'premium_backlog_out_of_stock',
+    };
+  }
+  if (requestedBaseQty > availableQty + 0.0001) {
+    return {
+      item_code: itemCode,
+      item_name: itemName,
+      unit_code: unitCode,
+      qty_in_cart: qty,
+      balance_qty: Math.max(0, availableQty / ratio),
+      stock_qty: Math.max(0, stockQty / ratio),
+      reserved_other_qty: Math.max(0, reservedQty / ratio),
+      issue_type: 'premium_backlog_stock_exceeding',
+    };
+  }
+  return null;
+}
+
+async function assertSalePremiumBacklogCartItem(queryFn, item) {
+  const detailId = parseInt(item?.sale_premium_backlog_detail_id || 0, 10) || 0;
+  if (detailId <= 0 || toNumber(item?.qty) <= 0) return;
+  const existingRes = await queryFn(
+    `SELECT sale_premium_backlog_detail_id, item_code, item_name, unit_code, qty, ratio
+       FROM staff_cart_order
+      WHERE cust_code=$1
+        AND COALESCE(sale_premium_backlog_detail_id,0)=$2
+        AND guid_code <> $3`,
+    [safeText(item?.cust_code), detailId, safeText(item?.guid_code)],
+  );
+  const issues = await validateSalePremiumBacklogCartRows(queryFn, [
+    ...existingRes.rows,
+    item,
+  ]);
+  if (issues.length > 0) {
+    const error = new Error(salePremiumBacklogErrorMessage(issues[0]));
+    error.statusCode = 400;
+    error.issue_type = issues[0].issue_type;
+    throw error;
+  }
+  const stockIssue = await validateSalePremiumBacklogCartStock(queryFn, item);
+  if (stockIssue) {
+    const error = new Error(salePremiumBacklogErrorMessage(stockIssue));
+    error.statusCode = 400;
+    error.issue_type = stockIssue.issue_type;
+    throw error;
+  }
 }
 async function resolveBasketPricingContext(custCode) {
   if (!custCode || !String(custCode).trim()) {
@@ -87,24 +315,45 @@ router.post('/additemtocart', async (req, res) => {
         const sale_premium_code = item.sale_premium_code || '';
         const sale_premium_name = item.sale_premium_name || '';
         const sale_premium_data = typeof item.sale_premium_data === 'string' ? item.sale_premium_data : JSON.stringify(item.sale_premium_data || null);
+        const sale_premium_line_type = item.sale_premium_line_type || '';
+        const sale_premium_backlog_id = item.sale_premium_backlog_id !== undefined ? parseInt(item.sale_premium_backlog_id, 10) || 0 : 0;
+        const sale_premium_backlog_detail_id = item.sale_premium_backlog_detail_id !== undefined ? parseInt(item.sale_premium_backlog_detail_id, 10) || 0 : 0;
+        const is_permium = item.is_permium !== undefined ? parseInt(item.is_permium, 10) || 0 : 0;
 
-        // DELETE เดิมก่อน (เหมือน Java)
-        await client.query(
-          `DELETE FROM staff_cart_order
-           WHERE item_code = $1 AND unit_code = $2 AND barcode = $3 AND cust_code = $4`,
-          [item_code, unit_code, barcode, cust_code]
-        );
+        await assertSalePremiumBacklogCartItem(client.query.bind(client), {
+          ...item,
+          item_code,
+          item_name,
+          unit_code,
+          qty,
+          ratio,
+          cust_code,
+          guid_code,
+          sale_premium_backlog_detail_id,
+        });
+
+        // DELETE เดิมก่อน (เหมือน Java) แต่รายการคงค้างต้องแยกตาม guid ไม่ merge ข้าม backlog
+        const deleteSql = sale_premium_backlog_detail_id > 0
+          ? `DELETE FROM staff_cart_order WHERE guid_code = $1 AND cust_code = $2`
+          : `DELETE FROM staff_cart_order
+             WHERE item_code = $1 AND unit_code = $2 AND barcode = $3 AND cust_code = $4`;
+        const deleteParams = sale_premium_backlog_detail_id > 0
+          ? [guid_code, cust_code]
+          : [item_code, unit_code, barcode, cust_code];
+        await client.query(deleteSql, deleteParams);
 
         // INSERT ใหม่
         await client.query(
           `INSERT INTO staff_cart_order
            (item_type, cust_code, guid_code, item_code, item_name, unit_code, barcode,
             qty, price, wh_code, shelf_code, creator_code, create_datetime,
-            stand_value, divide_value, ratio, remark, sale_premium_code, sale_premium_name, sale_premium_data)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13,$14,$15,$16,$17,$18,$19)`,
+            stand_value, divide_value, ratio, remark, sale_premium_code, sale_premium_name, sale_premium_data,
+            sale_premium_line_type, sale_premium_backlog_id, sale_premium_backlog_detail_id, is_permium)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
           [item_type, cust_code, guid_code, item_code, item_name, unit_code, barcode,
            qty, price, wh_code, shelf_code, emp_code,
-           stand_value, divide_value, ratio, remark, sale_premium_code, sale_premium_name, sale_premium_data]
+           stand_value, divide_value, ratio, remark, sale_premium_code, sale_premium_name, sale_premium_data,
+           sale_premium_line_type, sale_premium_backlog_id, sale_premium_backlog_detail_id, is_permium]
         );
       }
       resp.success = true;
@@ -153,7 +402,11 @@ router.get('/getcartitemlist', async (req, res) => {
       SELECT sco.cust_code, sco.guid_code, sco.item_code, sco.item_name, sco.unit_code,
              sco.item_type, sco.barcode, sco.qty, sco.price, sco.wh_code, sco.shelf_code,
              sco.creator_code, sco.create_datetime, sco.stand_value, sco.divide_value,
-             sco.ratio, sco.remark, sco.sale_premium_code, sco.sale_premium_name, sco.sale_premium_data, 0 AS balance_qty,
+             sco.ratio, sco.remark, sco.sale_premium_code, sco.sale_premium_name, sco.sale_premium_data,
+             COALESCE(sco.sale_premium_line_type,'') AS sale_premium_line_type,
+             COALESCE(sco.sale_premium_backlog_id,0) AS sale_premium_backlog_id,
+             COALESCE(sco.sale_premium_backlog_detail_id,0) AS sale_premium_backlog_detail_id,
+             COALESCE(sco.is_permium,0) AS is_permium, 0 AS balance_qty,
              COALESCE(i.tax_type, 0) AS tax_type
       FROM staff_cart_order sco
       LEFT JOIN ic_inventory i ON i.code = sco.item_code
@@ -185,6 +438,10 @@ router.get('/getcartitemlist', async (req, res) => {
       sale_premium_code: r.sale_premium_code || '',
       sale_premium_name: r.sale_premium_name || '',
       sale_premium_data: parseJsonText(r.sale_premium_data),
+      sale_premium_line_type: r.sale_premium_line_type || '',
+      sale_premium_backlog_id: Number(r.sale_premium_backlog_id || 0),
+      sale_premium_backlog_detail_id: Number(r.sale_premium_backlog_detail_id || 0),
+      is_permium: Number(r.is_permium || 0),
       balance_qty: 0,
       tax_type: Number(r.tax_type ?? 0),
     }));
@@ -534,16 +791,63 @@ router.get('/validatecartstock', async (req, res) => {
       [custCode.trim()],
     );
     const detailItems = [];
+    const premiumBacklogPreview = [];
+    const salePremiumPricingItems = [];
+    const premiumNoDeliverableIssues = [];
     for (const item of cartRes.rows) {
       const itemType = String(item?.item_type ?? '0');
-      if (item?.sale_premium_code || itemType === '4') {
-        const expanded = await expandSalePremiumItemForSave(query, item, { custCode: '' });
-        detailItems.push(...expanded);
+      const backlogDetailId = parseInt(item?.sale_premium_backlog_detail_id || 0, 10) || 0;
+      if (!backlogDetailId && (item?.sale_premium_code || itemType === '4')) {
+        const fulfillment = await buildSalePremiumFulfillment(query, item, {
+          custCode: '',
+          excludeCartKey: custCode.trim(),
+        });
+        detailItems.push(...fulfillment.deliveredItems);
+        if (fulfillment.deliveredItems.length === 0) {
+          premiumNoDeliverableIssues.push({
+            item_code: item.item_code,
+            item_name: item.item_name,
+            unit_code: item.unit_code,
+            qty_in_cart: Number(item.qty || 0),
+            balance_qty: 0,
+            stock_qty: 0,
+            reserved_other_qty: 0,
+            issue_type: 'out_of_stock',
+          });
+        }
+        salePremiumPricingItems.push(...fulfillment.deliveredItems.map((row, index) => ({
+          ...row,
+          guid_code: `${fulfillment.source_cart_guid || item.guid_code || item.item_code}-premium-${index}`,
+          source_guid_code: fulfillment.source_cart_guid || item.guid_code || '',
+          source_cart_guid: fulfillment.source_cart_guid || item.guid_code || '',
+          source_premium_code: fulfillment.premium_code,
+          source_premium_name: fulfillment.premium_name,
+        })));
+        if (fulfillment.pendingDetails.length > 0) {
+          premiumBacklogPreview.push({
+            premium_code: fulfillment.premium_code,
+            premium_name: fulfillment.premium_name,
+            pending_details: fulfillment.pendingDetails,
+          });
+        }
       } else {
         detailItems.push(item);
       }
     }
-    return res.json(await validateSaleItemsStock(query, detailItems, { excludeCartKey: custCode.trim() }));
+    const validation = await validateSaleItemsStock(query, detailItems, { excludeCartKey: custCode.trim() });
+    const backlogIssues = await validateSalePremiumBacklogCartRows(query, cartRes.rows);
+    const stockIssues = [
+      ...(Array.isArray(validation.stock_issues) ? validation.stock_issues : []),
+      ...backlogIssues,
+      ...premiumNoDeliverableIssues,
+    ];
+    return res.json({
+      ...validation,
+      is_valid: stockIssues.length === 0,
+      stock_issues: stockIssues,
+      sale_premium_backlogs: premiumBacklogPreview,
+      sale_premium_pricing_items: salePremiumPricingItems,
+    });
   } catch (ex) {
     return res.status(ex.statusCode || 500).json({ success: false, error: ex.message, msg: ex.message });
   }
@@ -597,6 +901,9 @@ function safeBigDecimal(s) {
 }
 
 module.exports = router;
+
+
+
 
 
 

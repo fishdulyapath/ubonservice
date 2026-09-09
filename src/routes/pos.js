@@ -6,7 +6,11 @@ const { calcDiscount, calcVat } = require('../utils/vatHelper');
 const { validateSaleItemsStock } = require('../utils/cartStockValidator');
 const { getEmployeePermissions } = require('../utils/permissions');
 const { assertBasketAccess } = require('../utils/basketAccess');
-const { expandSalePremiumItemForSave } = require('../utils/salePremiumHelper');
+const {
+  buildSalePremiumFulfillment,
+  createSalePremiumBacklogs,
+  applySalePremiumBacklogDeliveries,
+} = require('../utils/salePremiumBacklogHelper');
 
 const uuidv4 = () => crypto.randomUUID();
 const SOLD_OUT_PURCHASE_INFO_PERMISSION = 'sold_out.purchase_info.view';
@@ -901,8 +905,8 @@ async function handleSaveTrans(req, res, options = {}) {
     const discount_type = obj.discount_type != null ? parseInt(obj.discount_type) : 0;
     const discount_word = obj.discount_word || '';
 
-    const total_value_dbl = parseFloat(obj.total_value || 0);
-    const total_net_amount_dbl = parseFloat(obj.total_net_amount || 0);
+    let total_value_dbl = parseFloat(obj.total_value || 0);
+    let total_net_amount_dbl = parseFloat(obj.total_net_amount || 0);
     const total_credit_charge_dbl = parseFloat(obj.total_credit_charge || 0);
     const tranfer_amount_dbl = parseFloat(obj.tranfer_amount || 0);
     const card_amount_dbl = parseFloat(obj.card_amount || 0);
@@ -910,7 +914,7 @@ async function handleSaveTrans(req, res, options = {}) {
     const cash_amount_raw = parseFloat(obj.cash_amount || 0);
     const rounded_amount_dbl = parseFloat(obj.rounded_amount || 0);
     const total_income_amount_dbl = parseFloat(obj.total_income_amount || 0);
-    const total_except_vat_dbl = parseFloat(obj.total_except_vat || 0);
+    let total_except_vat_dbl = parseFloat(obj.total_except_vat || 0);
 
     const items = Array.isArray(obj.items) ? obj.items : [];
     const payments = Array.isArray(obj.payment_detail) ? obj.payment_detail : [];
@@ -965,10 +969,10 @@ async function handleSaveTrans(req, res, options = {}) {
     // rounded_amount is also stored in total_income_amount.
     //   total_amount_pay  = cash + transfer + card + wallet + deposit + rounding/income
     // money_change is total paid minus net amount.
-    const card_with_charge = card_amount_dbl + total_credit_charge_dbl;
-    const total_income_amount = total_income_amount_dbl || rounded_amount_dbl;
-    const cash_amount_in_db = cash_amount_raw;
-    const total_amount_pay = roundMoney(
+    let card_with_charge = card_amount_dbl + total_credit_charge_dbl;
+    let total_income_amount = total_income_amount_dbl || rounded_amount_dbl;
+    let cash_amount_in_db = cash_amount_raw;
+    let total_amount_pay = roundMoney(
       cash_amount_in_db
       + tranfer_amount_dbl
       + card_with_charge
@@ -976,32 +980,69 @@ async function handleSaveTrans(req, res, options = {}) {
       + total_income_amount
       + deposit_amount_dbl
     );
-    const money_change = Math.max(0, roundMoney(total_amount_pay - total_net_amount_dbl));
+    let money_change = Math.max(0, roundMoney(total_amount_pay - total_net_amount_dbl));
 
     let doc_no;
     let promotion_count = 0;
+    let createdPremiumBacklogs = [];
+    let appliedPremiumBacklogDeliveries = [];
     await withTransaction(async (client) => {
       if (basket_id) {
         await assertBasketAccess(client.query.bind(client), user_code || emp_code, basket_id, 'can_save_sale');
       }
       const detailItems = [];
+      const salePremiumFulfillments = [];
+      const cartKeyForStock = basket_id ? `BASKET-${basket_id}` : '';
       for (const item of items) {
         const itemTypeForExpand = String(item?.item_type ?? '0');
-        if (item?.sale_premium_code || itemTypeForExpand === '4') {
-          const expanded = await expandSalePremiumItemForSave(client.query.bind(client), item, {
+        const backlogDetailId = parseInt(item?.sale_premium_backlog_detail_id || 0, 10) || 0;
+        if (!backlogDetailId && (item?.sale_premium_code || itemTypeForExpand === '4')) {
+          const fulfillment = await buildSalePremiumFulfillment(client.query.bind(client), item, {
             custCode: cust_code,
             saleType: inquiry_type,
             vatType: vat_type,
             vatRate: vat_rate,
             docDate: doc_date,
+            excludeCartKey: cartKeyForStock,
+            basketId: basket_id,
           });
-          detailItems.push(...expanded);
+          salePremiumFulfillments.push(fulfillment);
+          detailItems.push(...fulfillment.deliveredItems);
         } else {
           detailItems.push(item);
         }
       }
 
-      const cartKeyForStock = basket_id ? `BASKET-${basket_id}` : '';
+      if (detailItems.length === 0) {
+        const error = new Error('SALE_PREMIUM_NO_DELIVERABLE_STOCK');
+        error.code = 'SALE_PREMIUM_NO_DELIVERABLE_STOCK';
+        throw error;
+      }
+
+      if (salePremiumFulfillments.length > 0 || detailItems.some((item) => parseInt(item?.sale_premium_backlog_detail_id || 0, 10) > 0)) {
+        total_value_dbl = roundMoney(detailItems.reduce((sum, item) => sum + roundMoney(item.sum_amount ?? (toNumber(item.qty) * toNumber(item.price))), 0));
+        total_except_vat_dbl = roundMoney(detailItems
+          .filter((item) => Number(item.tax_type ?? 0) === 1)
+          .reduce((sum, item) => sum + roundMoney(item.sum_amount ?? (toNumber(item.qty) * toNumber(item.price))), 0));
+        total_disc = calcDiscount(discount_word, total_value_dbl);
+        [before_vat, vat_value, after_vat, total_amount] = calcVat(
+          vat_type, vat_rate, discount_type, total_value_dbl, total_disc,
+        );
+        total_net_amount_dbl = total_amount;
+        card_with_charge = card_amount_dbl + total_credit_charge_dbl;
+        total_income_amount = total_income_amount_dbl || rounded_amount_dbl;
+        cash_amount_in_db = cash_amount_raw;
+        total_amount_pay = roundMoney(
+          cash_amount_in_db
+          + tranfer_amount_dbl
+          + card_with_charge
+          + wallet_amount_dbl
+          + total_income_amount
+          + deposit_amount_dbl
+        );
+        money_change = Math.max(0, roundMoney(total_amount_pay - total_net_amount_dbl));
+      }
+
       const stockValidation = await validateSaleItemsStock(client, detailItems, {
         excludeCartKey: cartKeyForStock,
       });
@@ -1337,6 +1378,20 @@ async function handleSaveTrans(req, res, options = {}) {
           ]
         );
       }
+      createdPremiumBacklogs = await createSalePremiumBacklogs(client, salePremiumFulfillments, {
+        docNo: doc_no,
+        docDate: doc_date,
+        custCode: cust_code,
+        custName: obj.cust_name || obj.customer_name || '',
+        basketId: basket_id,
+        saleCode: emp_code,
+        creatorCode: creator_code || emp_code,
+      });
+      appliedPremiumBacklogDeliveries = await applySalePremiumBacklogDeliveries(client, detailItems, {
+        docNo: doc_no,
+        docDate: doc_date,
+        creatorCode: creator_code || emp_code,
+      });
 
       if (savePromotionDetails) {
         await client.query('DELETE FROM ic_trans_detail_promotion WHERE doc_no=$1 AND trans_flag=44', [doc_no]);
@@ -1462,6 +1517,8 @@ async function handleSaveTrans(req, res, options = {}) {
       doc_format_code,
       form_code,
       promotion_count,
+      sale_premium_backlogs: createdPremiumBacklogs,
+      sale_premium_backlog_deliveries: appliedPremiumBacklogDeliveries,
       msg: 'success',
     });
   } catch (ex) {
@@ -1472,6 +1529,12 @@ async function handleSaveTrans(req, res, options = {}) {
         msg: '\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32\u0E43\u0E19\u0E15\u0E30\u0E01\u0E23\u0E49\u0E32\u0E2A\u0E15\u0E4A\u0E2D\u0E01\u0E44\u0E21\u0E48\u0E1E\u0E2D',
         stock_issues: ex.stock_issues || [],
       });
+    }
+    if (ex.code === 'SALE_PREMIUM_NO_DELIVERABLE_STOCK') {
+      return res.status(409).json({ success: false, msg: '\u0E44\u0E21\u0E48\u0E21\u0E35\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32\u0E42\u0E1B\u0E23\u0E42\u0E21\u0E0A\u0E31\u0E19\u0E17\u0E35\u0E48\u0E2A\u0E48\u0E07\u0E21\u0E2D\u0E1A\u0E44\u0E14\u0E49\u0E08\u0E32\u0E01\u0E2A\u0E15\u0E4A\u0E2D\u0E01\u0E1B\u0E31\u0E08\u0E08\u0E38\u0E1A\u0E31\u0E19' });
+    }
+    if (msg.includes('premium free item not entitled yet')) {
+      return res.status(409).json({ success: false, msg: '\u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E21\u0E35\u0E2A\u0E34\u0E17\u0E18\u0E34\u0E4C\u0E23\u0E31\u0E1A\u0E02\u0E2D\u0E07\u0E41\u0E16\u0E21 \u0E15\u0E49\u0E2D\u0E07\u0E2A\u0E48\u0E07\u0E2A\u0E34\u0E19\u0E04\u0E49\u0E32\u0E2B\u0E25\u0E31\u0E01\u0E43\u0E2B\u0E49\u0E04\u0E23\u0E1A\u0E40\u0E07\u0E37\u0E48\u0E2D\u0E19\u0E44\u0E02\u0E01\u0E48\u0E2D\u0E19' });
     }
     if (msg.includes('running overflow')) {
       return res.status(409).json({ success: false, msg: 'ERR_DOC_RUNNING_OVERFLOW: ' + msg });
