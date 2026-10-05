@@ -8,6 +8,114 @@ const {
   resolveBasketAccess,
 } = require('../utils/basketAccess');
 
+function toNumber(value) {
+  return Number(value || 0);
+}
+
+// Keep the reserved quantity used by the product dialog aligned with stock availability.
+// Direct cart rows and product-set components must both be included.
+async function getItemCartReservationSnapshot(queryFn, itemCode) {
+  const result = await queryFn(
+    `WITH direct_reservations AS (
+       SELECT
+         c.cust_code AS basket_key,
+         COALESCE(b.basket_id::text, REGEXP_REPLACE(c.cust_code, '^BASKET-', '', 'i')) AS basket_id,
+         COALESCE(b.cust_code, '') AS customer_code,
+         COALESCE(b.cust_name, '') AS customer_name,
+         COALESCE(c.creator_code, '') AS employee_code,
+         'direct'::text AS source_type,
+         c.item_code AS source_item_code,
+         COALESCE(c.item_name, '') AS source_item_name,
+         COALESCE(c.unit_code, '') AS unit_code,
+         COALESCE(SUM(c.qty::numeric), 0)::numeric AS reserved_qty,
+         COALESCE(SUM(
+           c.qty::numeric * COALESCE(NULLIF(c.ratio::numeric, 0), 1)
+         ), 0)::numeric AS reserved_base_qty
+       FROM staff_cart_order c
+       LEFT JOIN pos_basket b ON c.cust_code = 'BASKET-' || b.basket_id::text
+       WHERE c.item_code = $1
+         AND c.cust_code LIKE 'BASKET-%'
+       GROUP BY
+         c.cust_code, b.basket_id, b.cust_code, b.cust_name,
+         c.creator_code, c.item_code, c.item_name, c.unit_code
+     ),
+     set_reservations AS (
+       SELECT
+         c.cust_code AS basket_key,
+         COALESCE(b.basket_id::text, REGEXP_REPLACE(c.cust_code, '^BASKET-', '', 'i')) AS basket_id,
+         COALESCE(b.cust_code, '') AS customer_code,
+         COALESCE(b.cust_name, '') AS customer_name,
+         COALESCE(c.creator_code, '') AS employee_code,
+         'set'::text AS source_type,
+         c.item_code AS source_item_code,
+         COALESCE(c.item_name, '') AS source_item_name,
+         COALESCE(d.unit_code, '') AS unit_code,
+         COALESCE(SUM(c.qty::numeric * d.qty::numeric), 0)::numeric AS reserved_qty,
+         COALESCE(SUM(
+           c.qty::numeric
+           * d.qty::numeric
+           * COALESCE(
+             NULLIF(u.ratio::numeric, 0),
+             COALESCE(u.stand_value::numeric, 1)
+               / NULLIF(COALESCE(u.divide_value::numeric, 1), 0),
+             1
+           )
+         ), 0)::numeric AS reserved_base_qty
+       FROM staff_cart_order c
+       JOIN ic_inventory_set_detail d ON d.ic_set_code = c.item_code
+       LEFT JOIN ic_unit_use u ON u.ic_code = d.ic_code AND u.code = d.unit_code
+       LEFT JOIN pos_basket b ON c.cust_code = 'BASKET-' || b.basket_id::text
+       WHERE c.cust_code LIKE 'BASKET-%'
+         AND COALESCE(NULLIF(c.item_type::text, ''), '0') = '3'
+         AND d.ic_code = $1
+       GROUP BY
+         c.cust_code, b.basket_id, b.cust_code, b.cust_name,
+         c.creator_code, c.item_code, c.item_name, d.unit_code
+     ),
+     reservation_lines AS (
+       SELECT * FROM direct_reservations
+       UNION ALL
+       SELECT * FROM set_reservations
+     ),
+     summary AS (
+       SELECT
+         COALESCE(SUM(reserved_base_qty), 0)::numeric AS reserved_base_units,
+         COUNT(DISTINCT basket_key)::int AS basket_count
+       FROM reservation_lines
+     )
+     SELECT
+       r.*,
+       s.reserved_base_units AS total_reserved_base_units,
+       s.basket_count
+     FROM reservation_lines r
+     CROSS JOIN summary s
+     ORDER BY r.basket_id, r.source_type, r.source_item_code, r.unit_code, r.employee_code`,
+    [itemCode],
+  );
+
+  const rows = result.rows.map(row => ({
+    basket_key: row.basket_key,
+    basket_id: row.basket_id,
+    customer_code: row.customer_code || '',
+    customer_name: row.customer_name || '',
+    employee_code: row.employee_code || '',
+    source_type: row.source_type,
+    source_item_code: row.source_item_code || '',
+    source_item_name: row.source_item_name || '',
+    unit_code: row.unit_code || '',
+    reserved_qty: toNumber(row.reserved_qty),
+    reserved_base_qty: toNumber(row.reserved_base_qty),
+  }));
+
+  return {
+    rows,
+    summary: {
+      reserved_base_units: rows.length > 0 ? toNumber(result.rows[0].total_reserved_base_units) : 0,
+      basket_count: rows.length > 0 ? toNumber(result.rows[0].basket_count) : 0,
+    },
+  };
+}
+
 // GET /service/v1/getBasketList
 // ดึงรายการตะกร้าทั้งหมด พร้อม item_count และ total_price จาก staff_cart_order
 router.get('/getBasketList', async (req, res) => {
@@ -173,6 +281,24 @@ router.post('/clearBasket', async (req, res) => {
   }
 });
 
+// GET /service/v1/getItemCartReservations
+// ดึงตะกร้าทั้งหมดที่กำลังจองสินค้านี้ รวมสินค้าที่ถูกจองผ่านสินค้าชุด
+router.get('/getItemCartReservations', async (req, res) => {
+  const { item_code } = req.query;
+
+  if (!item_code) {
+    return failResponse(res, 'item_code is required', 400);
+  }
+
+  try {
+    const snapshot = await getItemCartReservationSnapshot(query, item_code);
+    return successResponse(res, { item_code, ...snapshot });
+  } catch (ex) {
+    console.error('getItemCartReservations error:', ex.message);
+    return failResponse(res, ex.message, 500);
+  }
+});
+
 // GET /service/v1/getItemReservedQty
 // ดึงจำนวนหน่วยฐานที่ถูกจองจากทุกตะกร้า BASKET-% สำหรับสินค้าชิ้นนี้
 router.get('/getItemReservedQty', async (req, res) => {
@@ -183,33 +309,10 @@ router.get('/getItemReservedQty', async (req, res) => {
   }
 
   try {
-    const result = await query(
-      `WITH direct_reserved AS (
-         SELECT COALESCE(SUM(qty::numeric * COALESCE(NULLIF(ratio::numeric, 0), 1)), 0) AS qty
-         FROM staff_cart_order
-         WHERE item_code = $1
-           AND cust_code LIKE 'BASKET-%'
-       ),
-       set_reserved AS (
-         SELECT COALESCE(SUM(
-           c.qty::numeric
-           * d.qty::numeric
-           * COALESCE(NULLIF(u.ratio::numeric, 0), COALESCE(u.stand_value::numeric, 1) / NULLIF(COALESCE(u.divide_value::numeric, 1), 0), 1)
-         ), 0) AS qty
-         FROM staff_cart_order c
-         JOIN ic_inventory_set_detail d ON d.ic_set_code = c.item_code
-         LEFT JOIN ic_unit_use u ON u.ic_code = d.ic_code AND u.code = d.unit_code
-         WHERE c.cust_code LIKE 'BASKET-%'
-           AND COALESCE(c.item_type, 0) = 3
-           AND d.ic_code = $1
-       )
-       SELECT (direct_reserved.qty + set_reserved.qty) AS reserved_base_units
-       FROM direct_reserved, set_reserved`,
-      [item_code],
-    );
+    const snapshot = await getItemCartReservationSnapshot(query, item_code);
     return successResponse(res, {
       item_code,
-      reserved_base_units: Number(result.rows[0].reserved_base_units),
+      reserved_base_units: snapshot.summary.reserved_base_units,
     });
   } catch (ex) {
     console.error('getItemReservedQty error:', ex.message);
