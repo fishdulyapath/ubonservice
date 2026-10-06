@@ -11,6 +11,12 @@ const {
   createSalePremiumBacklogs,
   applySalePremiumBacklogDeliveries,
 } = require('../utils/salePremiumBacklogHelper');
+const {
+  buildSmlPromotionFulfillment,
+  createSmlPromotionBacklogs,
+  refreshSmlPromotionBacklogItems,
+  applySmlPromotionBacklogDeliveries,
+} = require('../utils/smlPromotionBacklogHelper');
 
 const uuidv4 = () => crypto.randomUUID();
 const SOLD_OUT_PURCHASE_INFO_PERMISSION = 'sold_out.purchase_info.view';
@@ -986,17 +992,23 @@ async function handleSaveTrans(req, res, options = {}) {
     let promotion_count = 0;
     let createdPremiumBacklogs = [];
     let appliedPremiumBacklogDeliveries = [];
+    let createdSmlPromotionBacklogs = [];
+    let appliedSmlPromotionBacklogDeliveries = [];
+    let smlPromotionBacklogOnly = false;
     await withTransaction(async (client) => {
       if (basket_id) {
         await assertBasketAccess(client.query.bind(client), user_code || emp_code, basket_id, 'can_save_sale');
       }
-      const detailItems = [];
+      let detailItems = [];
       const salePremiumFulfillments = [];
+      const smlPromotionFulfillments = [];
+      const allocatedSmlPromotionBaseQty = new Map();
       const cartKeyForStock = basket_id ? `BASKET-${basket_id}` : '';
       for (const item of items) {
         const itemTypeForExpand = String(item?.item_type ?? '0');
         const backlogDetailId = parseInt(item?.sale_premium_backlog_detail_id || 0, 10) || 0;
-        if (!backlogDetailId && (item?.sale_premium_code || itemTypeForExpand === '4')) {
+        const smlBacklogDetailId = parseInt(item?.sml_promotion_backlog_detail_id || 0, 10) || 0;
+        if (!backlogDetailId && !smlBacklogDetailId && (item?.sale_premium_code || itemTypeForExpand === '4')) {
           const fulfillment = await buildSalePremiumFulfillment(client.query.bind(client), item, {
             custCode: cust_code,
             saleType: inquiry_type,
@@ -1008,18 +1020,69 @@ async function handleSaveTrans(req, res, options = {}) {
           });
           salePremiumFulfillments.push(fulfillment);
           detailItems.push(...fulfillment.deliveredItems);
+        } else if (!backlogDetailId && !smlBacklogDetailId) {
+          const fulfillment = await buildSmlPromotionFulfillment(client.query.bind(client), item, {
+            custCode: cust_code,
+            saleType: inquiry_type,
+            vatType: vat_type,
+            vatRate: vat_rate,
+            docDate: doc_date,
+            excludeCartKey: cartKeyForStock,
+            basketId: basket_id,
+            fullItems: items,
+            allocatedBaseQty: allocatedSmlPromotionBaseQty,
+          });
+          if (fulfillment) {
+            smlPromotionFulfillments.push(fulfillment);
+            if (fulfillment.delivered_item) detailItems.push(fulfillment.delivered_item);
+          } else {
+            detailItems.push(item);
+          }
         } else {
           detailItems.push(item);
         }
       }
 
       if (detailItems.length === 0) {
+        if (smlPromotionFulfillments.some((row) => row?.pending_detail)) {
+          createdSmlPromotionBacklogs = await createSmlPromotionBacklogs(client, smlPromotionFulfillments, {
+            docNo: '',
+            docDate: doc_date,
+            custCode: cust_code,
+            custName: obj.cust_name || obj.customer_name || '',
+            basketId: basket_id,
+            saleCode: emp_code,
+            creatorCode: creator_code || emp_code,
+            remark,
+          });
+          const cartKey = basket_id ? `BASKET-${basket_id}` : cust_code;
+          await client.query('DELETE FROM staff_cart_order WHERE cust_code=$1', [cartKey]);
+          if (basket_id) {
+            await client.query(
+              `UPDATE pos_basket
+                 SET cust_code='', cust_name='', sale_code='', sale_name='',
+                     doc_format_code='', form_code='', status='empty', updated_at=NOW()
+               WHERE basket_id=$1`,
+              [basket_id],
+            );
+          }
+          smlPromotionBacklogOnly = true;
+          return;
+        }
         const error = new Error('SALE_PREMIUM_NO_DELIVERABLE_STOCK');
         error.code = 'SALE_PREMIUM_NO_DELIVERABLE_STOCK';
         throw error;
       }
 
-      if (salePremiumFulfillments.length > 0 || detailItems.some((item) => parseInt(item?.sale_premium_backlog_detail_id || 0, 10) > 0)) {
+      detailItems = await refreshSmlPromotionBacklogItems(client, detailItems, {
+        custCode: cust_code,
+        saleType: inquiry_type,
+        vatType: vat_type,
+        vatRate: vat_rate,
+        docDate: doc_date,
+      });
+
+      if (salePremiumFulfillments.length > 0 || smlPromotionFulfillments.length > 0 || detailItems.some((item) => parseInt(item?.sale_premium_backlog_detail_id || 0, 10) > 0 || parseInt(item?.sml_promotion_backlog_detail_id || 0, 10) > 0)) {
         total_value_dbl = roundMoney(detailItems.reduce((sum, item) => sum + roundMoney(item.sum_amount ?? (toNumber(item.qty) * toNumber(item.price))), 0));
         total_except_vat_dbl = roundMoney(detailItems
           .filter((item) => Number(item.tax_type ?? 0) === 1)
@@ -1387,7 +1450,22 @@ async function handleSaveTrans(req, res, options = {}) {
         saleCode: emp_code,
         creatorCode: creator_code || emp_code,
       });
+      createdSmlPromotionBacklogs = await createSmlPromotionBacklogs(client, smlPromotionFulfillments, {
+        docNo: doc_no,
+        docDate: doc_date,
+        custCode: cust_code,
+        custName: obj.cust_name || obj.customer_name || '',
+        basketId: basket_id,
+        saleCode: emp_code,
+        creatorCode: creator_code || emp_code,
+        remark,
+      });
       appliedPremiumBacklogDeliveries = await applySalePremiumBacklogDeliveries(client, detailItems, {
+        docNo: doc_no,
+        docDate: doc_date,
+        creatorCode: creator_code || emp_code,
+      });
+      appliedSmlPromotionBacklogDeliveries = await applySmlPromotionBacklogDeliveries(client, detailItems, {
         docNo: doc_no,
         docDate: doc_date,
         creatorCode: creator_code || emp_code,
@@ -1513,12 +1591,15 @@ async function handleSaveTrans(req, res, options = {}) {
 
     return res.json({
       success: true,
-      doc_no,
+      doc_no: doc_no || '',
       doc_format_code,
       form_code,
       promotion_count,
+      backlog_only: smlPromotionBacklogOnly,
       sale_premium_backlogs: createdPremiumBacklogs,
       sale_premium_backlog_deliveries: appliedPremiumBacklogDeliveries,
+      sml_promotion_backlogs: createdSmlPromotionBacklogs,
+      sml_promotion_backlog_deliveries: appliedSmlPromotionBacklogDeliveries,
       msg: 'success',
     });
   } catch (ex) {
@@ -1998,6 +2079,5 @@ router.post('/sales/cancel', async (req, res) => {
 });
 
 module.exports = router;
-
 
 

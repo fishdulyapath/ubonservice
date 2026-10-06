@@ -286,6 +286,220 @@ async function resolveBasketPricingContext(custCode) {
   return { saleType: null, vatType: null, vatRate: null };
 }
 
+function resolvePromotionSaleType(value) {
+  const saleType = parseInt(value, 10);
+  return Number.isNaN(saleType) ? 0 : saleType;
+}
+
+function promotionSaleTypes(saleType) {
+  const normalized = resolvePromotionSaleType(saleType);
+  const secondary = normalized === 0 || normalized === 2 ? 2 : 1;
+  return Array.from(new Set([0, secondary]));
+}
+
+function sqlQuote(value) {
+  return String(value || "").replace(/'/g, "''");
+}
+
+function promotionCustomerGroupSql(custCode, columnName) {
+  const cust = sqlQuote(custCode);
+  return `(SELECT MAX(${columnName}) FROM ar_customer_detail WHERE ar_code='${cust}')`;
+}
+
+function promotionGroupScopeSql(alias, custCode) {
+  return `(
+    ${alias}.cust_group_1=${promotionCustomerGroupSql(custCode, "group_main")}
+    AND (
+      COALESCE(${alias}.cust_group_2,'')=''
+      OR ${alias}.cust_group_2=${promotionCustomerGroupSql(custCode, "group_sub_1")}
+      OR ${alias}.cust_group_2=${promotionCustomerGroupSql(custCode, "group_sub_2")}
+      OR ${alias}.cust_group_2=${promotionCustomerGroupSql(custCode, "group_sub_3")}
+      OR ${alias}.cust_group_2=${promotionCustomerGroupSql(custCode, "group_sub_4")}
+    )
+  )`;
+}
+
+function activePricePromotionExistsSql(itemExpr, custCode, saleType) {
+  const cust = sqlQuote(custCode);
+  const saleTypes = promotionSaleTypes(saleType).join(",");
+  return `EXISTS (
+    SELECT 1
+      FROM ic_inventory_price p
+     WHERE p.ic_code=${itemExpr}
+       AND CURRENT_DATE BETWEEN p.from_date AND p.to_date
+       AND p.sale_type IN (${saleTypes})
+       AND (
+         COALESCE(p.price_type,1)=1
+         OR (p.price_type=3 AND p.cust_code='${cust}')
+         OR (p.price_type=2 AND ${promotionGroupScopeSql("p", custCode)})
+       )
+  )`;
+}
+
+function activeDiscountPromotionExistsSql(itemExpr, custCode, saleType) {
+  const cust = sqlQuote(custCode);
+  const saleTypes = promotionSaleTypes(saleType).join(",");
+  return `EXISTS (
+    SELECT 1
+      FROM ic_inventory_discount d
+     WHERE d.ic_code=${itemExpr}
+       AND CURRENT_DATE BETWEEN d.from_date AND d.to_date
+       AND d.sale_type IN (${saleTypes})
+       AND (
+         d.discount_type=0
+         OR (d.discount_type=2 AND d.cust_code='${cust}')
+         OR (d.discount_type=1 AND ${promotionGroupScopeSql("d", custCode)})
+       )
+  )`;
+}
+
+function createPromotionMeta() {
+  return {
+    has_price_promotion: false,
+    has_discount_promotion: false,
+    price_promotion_units: new Set(),
+    discount_promotion_units: new Set(),
+    units: new Map(),
+  };
+}
+
+function promotionMetaUnit(meta, unitCode) {
+  if (!meta.units.has(unitCode)) {
+    meta.units.set(unitCode, { promotion: [], discount_promotion: [] });
+  }
+  return meta.units.get(unitCode);
+}
+
+function pricePromotionAudience(priceType) {
+  if (Number(priceType) === 3) return "ลูกค้าเฉพาะ";
+  if (Number(priceType) === 2) return "กลุ่มลูกค้า";
+  return "ทั่วไป";
+}
+
+function discountPromotionAudience(discountType) {
+  if (Number(discountType) === 2) return "ลูกค้าเฉพาะ";
+  if (Number(discountType) === 1) return "กลุ่มลูกค้า";
+  return "ทั่วไป";
+}
+
+async function getActivePromotionMeta(itemCodes, custCode, saleType) {
+  const codes = Array.from(new Set((itemCodes || []).map((code) => String(code || "").trim()).filter(Boolean)));
+  if (codes.length === 0) return new Map();
+
+  const saleTypes = promotionSaleTypes(saleType);
+  const customerContext = `
+    WITH customer_context AS (
+      SELECT MAX(group_main) AS group_main,
+             MAX(group_sub_1) AS group_sub_1,
+             MAX(group_sub_2) AS group_sub_2,
+             MAX(group_sub_3) AS group_sub_3,
+             MAX(group_sub_4) AS group_sub_4
+        FROM ar_customer_detail
+       WHERE ar_code=$2
+    )`;
+  const groupScope = (alias) => `(
+    ${alias}.cust_group_1=cc.group_main
+    AND (
+      COALESCE(${alias}.cust_group_2,'')=''
+      OR ${alias}.cust_group_2=cc.group_sub_1
+      OR ${alias}.cust_group_2=cc.group_sub_2
+      OR ${alias}.cust_group_2=cc.group_sub_3
+      OR ${alias}.cust_group_2=cc.group_sub_4
+    )
+  )`;
+  const [priceResult, discountResult] = await Promise.all([
+    query(
+      `${customerContext}
+       SELECT p.ic_code,p.unit_code,p.line_number,p.from_qty,p.to_qty,
+              COALESCE(p.sale_price1,0) AS sale_price1,COALESCE(p.sale_price2,0) AS sale_price2,
+              COALESCE(p.price_type,1) AS price_type,COALESCE(p.price_mode,0) AS price_mode,
+              COALESCE(u.name_1,p.unit_code) AS unit_name
+         FROM ic_inventory_price p
+         JOIN ic_unit_use uu ON uu.ic_code=p.ic_code AND uu.code=p.unit_code
+         LEFT JOIN ic_unit u ON u.code=p.unit_code
+         CROSS JOIN customer_context cc
+        WHERE p.ic_code=ANY($1::text[])
+          AND CURRENT_DATE BETWEEN p.from_date AND p.to_date
+          AND p.sale_type=ANY($3::int[])
+          AND (
+            COALESCE(p.price_type,1)=1
+            OR (p.price_type=3 AND p.cust_code=$2)
+            OR (p.price_type=2 AND ${groupScope("p")})
+          )
+        ORDER BY p.ic_code,p.unit_code,COALESCE(p.price_type,1) DESC,COALESCE(p.price_mode,0) DESC,p.from_qty,p.line_number`,
+      [codes, String(custCode || ""), saleTypes],
+    ),
+    query(
+      `${customerContext}
+       SELECT d.ic_code,d.unit_code,d.line_number,d.from_qty,d.to_qty,d.discount,d.discount_type,
+              COALESCE(u.name_1,d.unit_code) AS unit_name
+         FROM ic_inventory_discount d
+         JOIN ic_unit_use uu ON uu.ic_code=d.ic_code AND uu.code=d.unit_code
+         LEFT JOIN ic_unit u ON u.code=d.unit_code
+         CROSS JOIN customer_context cc
+        WHERE d.ic_code=ANY($1::text[])
+          AND CURRENT_DATE BETWEEN d.from_date AND d.to_date
+          AND d.sale_type=ANY($3::int[])
+          AND (
+            d.discount_type=0
+            OR (d.discount_type=2 AND d.cust_code=$2)
+            OR (d.discount_type=1 AND ${groupScope("d")})
+          )
+        ORDER BY d.ic_code,d.unit_code,d.discount_type DESC,d.from_qty,d.line_number`,
+      [codes, String(custCode || ""), saleTypes],
+    ),
+  ]);
+
+  const byItem = new Map();
+  const ensure = (itemCode) => {
+    if (!byItem.has(itemCode)) byItem.set(itemCode, createPromotionMeta());
+    return byItem.get(itemCode);
+  };
+
+  for (const row of priceResult.rows) {
+    const meta = ensure(row.ic_code);
+    const unit = promotionMetaUnit(meta, row.unit_code);
+    meta.has_price_promotion = true;
+    meta.price_promotion_units.add(row.unit_code);
+    unit.promotion.push({
+      from_qty: Number(row.from_qty || 0),
+      to_qty: Number(row.to_qty || 0),
+      sale_price1: Number(row.sale_price1 || 0),
+      sale_price2: Number(row.sale_price2 || 0),
+      unit_name: row.unit_name || row.unit_code,
+      price_type: Number(row.price_type || 1),
+      price_mode: Number(row.price_mode || 0),
+      audience: pricePromotionAudience(row.price_type),
+      line_number: Number(row.line_number || 0),
+    });
+  }
+  for (const row of discountResult.rows) {
+    const meta = ensure(row.ic_code);
+    const unit = promotionMetaUnit(meta, row.unit_code);
+    meta.has_discount_promotion = true;
+    meta.discount_promotion_units.add(row.unit_code);
+    unit.discount_promotion.push({
+      from_qty: Number(row.from_qty || 0),
+      to_qty: Number(row.to_qty || 0),
+      discount: row.discount || "",
+      discount_type: Number(row.discount_type || 0),
+      audience: discountPromotionAudience(row.discount_type),
+      line_number: Number(row.line_number || 0),
+    });
+  }
+  return byItem;
+}
+
+function promotionSummary(meta) {
+  const current = meta || createPromotionMeta();
+  return {
+    has_price_promotion: current.has_price_promotion ? "1" : "0",
+    has_discount_promotion: current.has_discount_promotion ? "1" : "0",
+    price_promotion_units: Array.from(current.price_promotion_units),
+    discount_promotion_units: Array.from(current.discount_promotion_units),
+  };
+}
+
 // GET /service/v1/getProductList
 // เลียนแบบ Java ทุกอย่าง: dynamic WHERE, pagination ด้วย offset/limit
 router.get("/getProductList", async (req, res) => {
@@ -301,6 +515,7 @@ router.get("/getProductList", async (req, res) => {
     isproductset: strProductSet = "",
     exclude_hold_sale: strExcludeHoldSale = "",
     exclude_hold_purchase: strExcludeHoldPurchase = "",
+    sale_type: strSaleType = "",
     sort_stock_desc: strSortStockDesc = "",
     sort_field: strSortField = "",
     sort_order: strSortOrder = "asc",
@@ -310,6 +525,15 @@ router.get("/getProductList", async (req, res) => {
   const resp = { success: false };
 
   try {
+    const basketCtxForList = await resolveBasketPricingContext(strCustCode);
+    const requestedSaleType = parseInt(strSaleType, 10);
+    const promotionSaleType = Number.isNaN(requestedSaleType)
+      ? (Number.isNaN(basketCtxForList.saleType) ? 0 : basketCtxForList.saleType)
+      : requestedSaleType;
+    const pricePromotionExists = activePricePromotionExistsSql("b.code", strCustCode, promotionSaleType);
+    const discountPromotionExists = activeDiscountPromotionExistsSql("b.code", strCustCode, promotionSaleType);
+    const promotionExists = `(${pricePromotionExists} OR ${discountPromotionExists})`;
+
     // เลียนแบบ Java search condition: ค้นหา name_1, code, name_eng_2 + barcode (1 สินค้ามีหลายบาร์โค้ด)
     let searchWhere = "";
     if (strSearch && strSearch.trim()) {
@@ -340,10 +564,7 @@ router.get("/getProductList", async (req, res) => {
     if (strExcludeHoldPurchase === "1") whereFinal += ` AND COALESCE(c.is_hold_purchase,0) <> 1`;
 
     if (strPromotion === "1") {
-      whereFinal +=
-        ` AND COALESCE((SELECT ic_code FROM ic_inventory_price WHERE ic_code = b.code` +
-        ` AND ((cust_code = '' OR cust_code = '${strCustCode.replace(/'/g, "''")}') ` +
-        ` AND (cust_group_1 = '' OR cust_group_1 = (SELECT MAX(ar_customer_detail.group_main) FROM ar_customer_detail WHERE ar_customer_detail.ar_code='${strCustCode.replace(/'/g, "''")}'))) LIMIT 1),'') != ''`;
+      whereFinal += ` AND ${promotionExists}`;
     }
 
     // Real-time stock from ic_trans_detail using the same balance_qty formula as SML stock function.
@@ -404,16 +625,15 @@ router.get("/getProductList", async (req, res) => {
     let normalLimit = limitInt;
     const includeSalePremiumRows = strPromotion === "1" || (strSearch.trim() && !strCategory.trim());
     if (includeSalePremiumRows) {
-      const basketCtxForPremium = await resolveBasketPricingContext(strCustCode);
       const allSalePremiumRows = await listSalePremiumProductsForSale(query, {
         custCode: strCustCode,
         search: strSearch,
         isStock: strStock,
         offset: 0,
         limit: 500,
-        saleType: basketCtxForPremium.saleType ?? 0,
-        vatType: basketCtxForPremium.vatType ?? 0,
-        vatRate: basketCtxForPremium.vatRate ?? null,
+        saleType: basketCtxForList.saleType ?? 0,
+        vatType: basketCtxForList.vatType ?? 0,
+        vatRate: basketCtxForList.vatRate ?? null,
       });
       salePremiumRows = allSalePremiumRows.slice(offsetInt, offsetInt + limitInt);
       normalOffset = Math.max(0, offsetInt - allSalePremiumRows.length);
@@ -432,26 +652,22 @@ router.get("/getProductList", async (req, res) => {
       ` COALESCE((${stockQtyExpr}),0) AS stock_qty,` +
       ` (CASE WHEN COALESCE(b.item_type,0) = 1 THEN '0' WHEN (${stockQtyExpr}) <= 0 THEN '1' ELSE '0' END) AS sold_out,` +
       ` CASE WHEN COALESCE(b.item_grade,'') = 'R' THEN '1' ELSE '0' END AS is_return,` +
-      ` CASE WHEN (` +
-      `   COALESCE((SELECT ic_code FROM ic_inventory_price WHERE ic_code = b.code` +
-      `     AND CURRENT_DATE BETWEEN from_date AND to_date` +
-      `     AND ((cust_code = '' OR cust_code = '${strCustCode.replace(/'/g, "''")}')` +
-      `     AND (cust_group_1 = '' OR cust_group_1=(SELECT MAX(ar_customer_detail.group_main) FROM ar_customer_detail WHERE ar_customer_detail.ar_code='${strCustCode.replace(/'/g, "''")}'))) LIMIT 1),'') != ''` +
-      `   OR EXISTS (SELECT 1 FROM ic_inventory_discount` +
-      `     WHERE ic_code = b.code` +
-      `       AND CURRENT_DATE BETWEEN from_date AND to_date` +
-      `       AND (` +
-      `         discount_type = 0` +
-      `         OR (discount_type = 2 AND cust_code = '${strCustCode.replace(/'/g, "''")}')` +
-      `         OR (discount_type = 1 AND cust_group_1 = (SELECT MAX(group_main) FROM ar_customer_detail WHERE ar_code='${strCustCode.replace(/'/g, "''")}'))` +
-      `       ))` +
-      ` ) THEN '1' ELSE '0' END AS is_promotion,` +
+      ` CASE WHEN ${pricePromotionExists} THEN '1' ELSE '0' END AS has_price_promotion,` +
+      ` CASE WHEN ${discountPromotionExists} THEN '1' ELSE '0' END AS has_discount_promotion,` +
+      ` CASE WHEN ${promotionExists} THEN '1' ELSE '0' END AS is_promotion,` +
       ` COALESCE(arc.status,0) AS favorite_item` +
       `${baseFrom}${orderBy} OFFSET ${normalOffset} LIMIT ${normalLimit}`;
 
     const dataResult = normalLimit > 0 ? await query(dataSQL, []) : { rows: [] };
 
-    const normalData = dataResult.rows.map((r) => ({
+    const promotionMeta = await getActivePromotionMeta(
+      dataResult.rows.map((row) => row.item_code),
+      strCustCode,
+      promotionSaleType,
+    );
+    const normalData = dataResult.rows.map((r) => {
+      const meta = promotionSummary(promotionMeta.get(r.item_code));
+      return {
       item_code: r.item_code,
       item_name: r.item_name,
       item_type: r.item_type,
@@ -461,9 +677,14 @@ router.get("/getProductList", async (req, res) => {
       unit_cost: r.unit_cost,
       start_sale_unit: r.start_sale_unit,
       is_promotion: r.is_promotion,
+      has_price_promotion: r.has_price_promotion ?? meta.has_price_promotion,
+      has_discount_promotion: r.has_discount_promotion ?? meta.has_discount_promotion,
+      price_promotion_units: meta.price_promotion_units,
+      discount_promotion_units: meta.discount_promotion_units,
       favorite_item: r.favorite_item,
       is_return: r.is_return,
-    }));
+      };
+    });
 
 
     const data = includeSalePremiumRows ? [...salePremiumRows, ...normalData] : normalData;
@@ -644,6 +865,17 @@ router.get("/getProductDetail", async (req, res) => {
     const vatTypeReq = parseInt(strVatType, 10);
     const vatRateReq = parseFloat(strVatRate);
     const docDate = strDocDate.trim() || undefined;
+    const saleType = Number.isNaN(saleTypeReq)
+      ? (Number.isNaN(basketCtx.saleType) ? 0 : basketCtx.saleType)
+      : saleTypeReq;
+    let promotionMeta = new Map();
+    if (strShowPromotion === "1") {
+      try {
+        promotionMeta = await getActivePromotionMeta([strItemCode], strCustCode, saleType);
+      } catch (ex) {
+        console.error(`getProductDetail promotion metadata error for ${strItemCode}:`, ex.message);
+      }
+    }
 
     const data = [];
 
@@ -669,16 +901,35 @@ router.get("/getProductDetail", async (req, res) => {
         is_return: r.is_return,
         description: r.description,
         promotion: [],
+        discount_promotion: [],
+        has_price_promotion: "0",
+        has_discount_promotion: "0",
       };
 
       try {
-        const saleType = Number.isNaN(saleTypeReq) ? (Number.isNaN(basketCtx.saleType) ? 0 : basketCtx.saleType) : saleTypeReq;
         const vatType = Number.isNaN(vatTypeReq)
           ? (Number.isNaN(basketCtx.vatType) ? (parseInt(r.tax_type, 10) || 0) : basketCtx.vatType)
           : vatTypeReq;
         const vatRate = Number.isNaN(vatRateReq)
           ? (Number.isNaN(basketCtx.vatRate) ? null : basketCtx.vatRate)
           : vatRateReq;
+
+        const unitPromotion = promotionMeta.get(r.ic_code)?.units.get(r.unit_code);
+        if (unitPromotion) {
+          obj.promotion = unitPromotion.promotion.map((promotion) => ({
+            from_qty: promotion.from_qty,
+            to_qty: promotion.to_qty,
+            unit_name: promotion.unit_name,
+            price: vatType === 0 ? promotion.sale_price1 : promotion.sale_price2,
+            audience: promotion.audience,
+            price_type: promotion.price_type,
+            price_mode: promotion.price_mode,
+            line_number: promotion.line_number,
+          }));
+          obj.discount_promotion = unitPromotion.discount_promotion.map((discount) => ({ ...discount }));
+        }
+        obj.has_price_promotion = obj.promotion.length > 0 ? "1" : "0";
+        obj.has_discount_promotion = obj.discount_promotion.length > 0 ? "1" : "0";
 
         const priceRes = await getProductPriceLocalx(r.ic_code, r.unit_code, "1", strCustCode, vatType, vatRate, saleType, r.barcode, docDate);
         const arr = priceRes.data || [];
@@ -691,61 +942,6 @@ router.get("/getProductDetail", async (req, res) => {
           obj.type = type;
           obj.mode = mode;
           obj.price_type = roworder;
-
-          if (strShowPromotion == "1") {
-            // query promotion ถ้า type IN (1,2,3) — เหมือน Java lines 3490-3524
-            if (["1", "2", "3"].includes(type)) {
-              const proParams = [r.ic_code, r.unit_code, mode];
-              let moreWhere = "";
-              if (roworder === "3") {
-                moreWhere = " AND cust_code=$4";
-                proParams.push(strCustCode);
-              } else if (roworder === "4") {
-                moreWhere = " AND cust_group_1=(SELECT MAX(group_main) FROM ar_customer_detail WHERE ar_code=$4)";
-                proParams.push(strCustCode);
-              }
-              const proResult = await query(
-                `SELECT line_number, sale_price2 AS price, from_qty, to_qty,
-                COALESCE((SELECT name_1 FROM ic_unit WHERE code=unit_code), unit_code) AS unit_name
-               FROM ic_inventory_price
-               WHERE ic_code=$1 AND unit_code=$2
-                 AND CURRENT_DATE BETWEEN from_date AND to_date
-                 AND price_mode=$3
-                 ${moreWhere}
-               ORDER BY from_qty ASC, line_number ASC`,
-                proParams,
-              );
-              let lineNum = 1;
-              obj.promotion = proResult.rows.map((p) => ({
-                from_qty: p.from_qty,
-                to_qty: p.to_qty,
-                unit_name: p.unit_name,
-                price: p.price,
-                line_number: lineNum++,
-              }));
-            }
-
-            // query discount_promotion จาก ic_inventory_discount (ไม่ filter qty)
-            const dpResult = await query(
-              `SELECT from_qty, to_qty, discount, discount_type, line_number
-               FROM ic_inventory_discount
-               WHERE ic_code=$1 AND unit_code=$2
-                 AND CURRENT_DATE BETWEEN from_date AND to_date
-                 AND (
-                   discount_type = 0
-                   OR (discount_type = 2 AND cust_code = $3)
-                   OR (discount_type = 1 AND cust_group_1 = (SELECT MAX(group_main) FROM ar_customer_detail WHERE ar_code = $3))
-                 )
-               ORDER BY discount_type DESC, line_number`,
-              [r.ic_code, r.unit_code, strCustCode],
-            );
-            obj.discount_promotion = dpResult.rows.map((d) => ({
-              from_qty: d.from_qty,
-              to_qty: d.to_qty,
-              discount: d.discount,
-              discount_type: d.discount_type,
-            }));
-          }
         }
       } catch (ex) {
         console.error(`getProductDetail price/promotion error for ${r.ic_code}/${r.unit_code}:`, ex.message);
@@ -1214,6 +1410,8 @@ router.get("/getCategoryList", async (req, res) => {
 router.get("/getProductByBarcode", async (req, res) => {
   const {
     barcode: strBarcode = "",
+    cust_code: strCustCode = "",
+    sale_type: strSaleType = "",
     exclude_hold_sale: strExcludeHoldSale = "",
     exclude_hold_purchase: strExcludeHoldPurchase = "",
   } = req.query;
@@ -1252,6 +1450,14 @@ router.get("/getProductByBarcode", async (req, res) => {
       return res.json(resp);
     }
 
+    const basketCtx = await resolveBasketPricingContext(strCustCode);
+    const requestedSaleType = parseInt(strSaleType, 10);
+    const saleType = Number.isNaN(requestedSaleType)
+      ? (Number.isNaN(basketCtx.saleType) ? 0 : basketCtx.saleType)
+      : requestedSaleType;
+    const promotionMeta = await getActivePromotionMeta([result.rows[0].item_code], strCustCode, saleType);
+    const promotion = promotionSummary(promotionMeta.get(result.rows[0].item_code));
+
     resp.success = true;
     resp.data = {
       item_code: result.rows[0].item_code,
@@ -1261,6 +1467,8 @@ router.get("/getProductByBarcode", async (req, res) => {
       unit_cost: result.rows[0].unit_cost,
       start_sale_unit: result.rows[0].start_sale_unit,
       sold_out: result.rows[0].sold_out,
+      is_promotion: promotion.has_price_promotion === "1" || promotion.has_discount_promotion === "1" ? "1" : "0",
+      ...promotion,
     };
     return res.json(resp);
   } catch (ex) {
@@ -3087,6 +3295,27 @@ router.get("/getProductPriceFormulas", async (req, res) => {
   }
 });
 
+// GET /service/v1/getProductPriceFormulaTemplates
+// SML ERP price-formula templates. A selected template fills price_1 through price_9 for one unit formula.
+router.get("/getProductPriceFormulaTemplates", async (_req, res) => {
+  try {
+    const result = await query(
+      `SELECT code,
+              COALESCE(price_1,'') AS price_1, COALESCE(price_2,'') AS price_2,
+              COALESCE(price_3,'') AS price_3, COALESCE(price_4,'') AS price_4,
+              COALESCE(price_5,'') AS price_5, COALESCE(price_6,'') AS price_6,
+              COALESCE(price_7,'') AS price_7, COALESCE(price_8,'') AS price_8,
+              COALESCE(price_9,'') AS price_9
+       FROM ic_price_formula_template
+       ORDER BY code`,
+    );
+    return res.json({ success: true, data: result.rows });
+  } catch (ex) {
+    console.error("getProductPriceFormulaTemplates error:", ex.message);
+    return res.status(500).json({ success: false, message: ex.message });
+  }
+});
+
 // POST /service/v1/saveProductPriceFormula
 router.post("/saveProductPriceFormula", async (req, res) => {
   const {
@@ -3159,7 +3388,3 @@ router.post("/deleteProductPriceFormula", async (req, res) => {
 });
 
 module.exports = router;
-
-
-
-

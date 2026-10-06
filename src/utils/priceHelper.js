@@ -13,28 +13,51 @@ function todayLocalDate() {
   return `${y}-${m}-${day}`;
 }
 
-// เลียนแบบ myglobal._calcFormulaPrice()
+// เลียนแบบ MyLib._myGlobal._calcFormulaPrice() ของ SML ERP
 function calcFormulaPrice(qty, price, formula) {
-  let newPrice = price;
-  if (!formula || formula.trim().length === 0) return price;
+  const basePrice = Number(String(price ?? '').replace(/,/g, ''));
+  if (!Number.isFinite(basePrice)) return price;
 
-  const first = formula.trim().charAt(0);
-  if (first === '=' || first === '-' || first === '+') {
-    const parts = formula.split(',');
-    if (parts.length > 0) {
-      const valStr = parts[0].replace(/^[=+\-]/, '');
-      if (first === '=') {
-        newPrice = valStr;
-      } else if (first === '-') {
-        newPrice = String(parseFloat(newPrice) - parseFloat(valStr));
-      } else if (first === '+') {
-        newPrice = String(parseFloat(newPrice) + parseFloat(valStr));
-      }
-    }
-  } else {
-    newPrice = formula;
+  const sourceFormula = String(formula ?? '').trim();
+  if (!sourceFormula) return String(basePrice);
+  if (!/^[=+-]/.test(sourceFormula)) {
+    const directPrice = Number(sourceFormula.replace(/,/g, ''));
+    return Number.isFinite(directPrice) ? String(directPrice) : String(basePrice);
   }
-  return newPrice;
+
+  let formulaPrice = basePrice;
+  let discountFormula = sourceFormula;
+  if (sourceFormula.startsWith('=')) {
+    const [fixedPrice, ...remainingFormula] = sourceFormula.split(',');
+    const parsedFixedPrice = Number(fixedPrice.slice(1).replace(/,/g, ''));
+    if (!Number.isFinite(parsedFixedPrice)) return String(basePrice);
+    formulaPrice = parsedFixedPrice;
+    discountFormula = remainingFormula.join(',').trim();
+    if (!discountFormula) return String(formulaPrice);
+  }
+
+  let remainingAmount = formulaPrice;
+  for (const rawPart of discountFormula.replace(/\s/g, '').split(',')) {
+    const part = rawPart.replace(/-/g, '');
+    if (!part) continue;
+    if (part.includes('%')) {
+      const rate = Number(part.replace(/%/g, ''));
+      if (!Number.isFinite(rate)) return String(basePrice);
+      remainingAmount -= (rate / 100) * remainingAmount;
+    } else if (part.includes('@')) {
+      const amountPerUnit = Number(part.replace(/@/g, ''));
+      if (!Number.isFinite(amountPerUnit)) return String(basePrice);
+      remainingAmount = (Number(qty) || 1) * (formulaPrice - amountPerUnit);
+    } else {
+      const amount = Number(part.replace(/,/g, ''));
+      if (!Number.isFinite(amount)) return String(basePrice);
+      remainingAmount -= amount;
+    }
+  }
+
+  const adjustment = formulaPrice - remainingAmount;
+  const result = discountFormula.startsWith('+') ? formulaPrice + adjustment : formulaPrice - adjustment;
+  return String(result);
 }
 
 

@@ -5,6 +5,11 @@ const { safePage, safePageSize } = require('../utils/response');
 const { validateCartStock, validateSaleItemsStock } = require('../utils/cartStockValidator');
 const { assertBasketAccessFromCartKey } = require('../utils/basketAccess');
 const { buildSalePremiumFulfillment } = require('../utils/salePremiumBacklogHelper');
+const {
+  buildSmlPromotionFulfillment,
+  ensureSmlPromotionBacklogSchema,
+  getSmlPromotionBacklogCartPricing,
+} = require('../utils/smlPromotionBacklogHelper');
 
 async function ensureSalePremiumCartColumns(queryFn = query) {
   await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sale_premium_code VARCHAR(25) DEFAULT ''`);
@@ -14,6 +19,9 @@ async function ensureSalePremiumCartColumns(queryFn = query) {
   await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sale_premium_backlog_id INTEGER DEFAULT 0`);
   await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sale_premium_backlog_detail_id INTEGER DEFAULT 0`);
   await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS is_permium SMALLINT DEFAULT 0`);
+  await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sml_promotion_backlog_id INTEGER DEFAULT 0`);
+  await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sml_promotion_backlog_detail_id INTEGER DEFAULT 0`);
+  await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sml_promotion_full_qty NUMERIC(18,4) DEFAULT 0`);
 }
 function parseJsonText(value) {
   try { return value ? JSON.parse(value) : null; } catch { return null; }
@@ -126,6 +134,72 @@ async function validateSalePremiumBacklogCartRows(queryFn, rows = []) {
     }
   }
 
+  return issues;
+}
+
+async function validateSmlPromotionBacklogCartRows(queryFn, rows = []) {
+  const cartRows = (Array.isArray(rows) ? rows : [])
+    .map((row) => ({
+      ...row,
+      sml_promotion_backlog_detail_id: parseInt(row?.sml_promotion_backlog_detail_id || 0, 10) || 0,
+      qty: toNumber(row?.qty),
+      item_code: safeText(row?.item_code),
+      unit_code: safeText(row?.unit_code),
+      cust_code: safeText(row?.cust_code),
+      guid_code: safeText(row?.guid_code),
+    }))
+    .filter((row) => row.sml_promotion_backlog_detail_id > 0 && row.qty > 0);
+  if (!cartRows.length) return [];
+
+  await ensureSmlPromotionBacklogSchema(queryFn);
+  const ids = [...new Set(cartRows.map((row) => row.sml_promotion_backlog_detail_id))];
+  const details = await queryFn(
+    `SELECT d.roworder AS detail_id,d.backlog_id,d.item_code,d.unit_code,d.pending_qty,d.status AS detail_status,
+            h.cust_code,h.status AS backlog_status
+       FROM sml_sml_promotion_backlog_detail d
+       JOIN sml_sml_promotion_backlog h ON h.roworder=d.backlog_id
+      WHERE d.roworder=ANY($1::int[])`,
+    [ids],
+  );
+  const detailMap = new Map(details.rows.map((row) => [Number(row.detail_id), row]));
+  const existing = await queryFn(
+    `SELECT sml_promotion_backlog_detail_id,cust_code,guid_code,qty
+       FROM staff_cart_order
+      WHERE COALESCE(sml_promotion_backlog_detail_id,0)=ANY($1::int[])`,
+    [ids],
+  );
+  const grouped = new Map();
+  for (const row of cartRows) {
+    const key = `${row.cust_code}::${row.sml_promotion_backlog_detail_id}`;
+    const group = grouped.get(key) || { ...row, qty: 0, guids: new Set() };
+    group.qty += row.qty;
+    group.guids.add(row.guid_code);
+    grouped.set(key, group);
+  }
+  const issues = [];
+  for (const group of grouped.values()) {
+    const detail = detailMap.get(group.sml_promotion_backlog_detail_id);
+    const label = group.item_name || group.item_code;
+    if (!detail || safeText(detail.item_code) !== group.item_code || safeText(detail.unit_code) !== group.unit_code) {
+      issues.push({ item_code: group.item_code, item_name: label, unit_code: group.unit_code, qty_in_cart: group.qty, balance_qty: 0, issue_type: 'sml_promotion_backlog_missing' });
+      continue;
+    }
+    const closed = toNumber(detail.pending_qty) <= 0
+      || ['closed', 'cancelled'].includes(safeText(detail.detail_status).toLowerCase())
+      || ['closed', 'cancelled'].includes(safeText(detail.backlog_status).toLowerCase());
+    if (closed) {
+      issues.push({ item_code: group.item_code, item_name: label, unit_code: group.unit_code, qty_in_cart: group.qty, balance_qty: 0, issue_type: 'sml_promotion_backlog_closed' });
+      continue;
+    }
+    const reservedElsewhere = existing.rows
+      .filter((row) => Number(row.sml_promotion_backlog_detail_id || 0) === group.sml_promotion_backlog_detail_id)
+      .filter((row) => safeText(row.cust_code) !== group.cust_code || !group.guids.has(safeText(row.guid_code)))
+      .reduce((sum, row) => sum + toNumber(row.qty), 0);
+    const available = Math.max(0, toNumber(detail.pending_qty) - reservedElsewhere);
+    if (group.qty > available + 0.0001) {
+      issues.push({ item_code: group.item_code, item_name: label, unit_code: group.unit_code, qty_in_cart: group.qty, balance_qty: available, issue_type: 'sml_promotion_backlog_exceeding' });
+    }
+  }
   return issues;
 }
 
@@ -242,30 +316,54 @@ async function assertSalePremiumBacklogCartItem(queryFn, item) {
     throw error;
   }
 }
+
+async function assertSmlPromotionBacklogCartItem(queryFn, item) {
+  const detailId = parseInt(item?.sml_promotion_backlog_detail_id || 0, 10) || 0;
+  if (detailId <= 0 || toNumber(item?.qty) <= 0) return;
+  const issues = await validateSmlPromotionBacklogCartRows(queryFn, [item]);
+  if (issues.length) {
+    const issue = issues[0];
+    throw new Error(issue.issue_type === 'sml_promotion_backlog_exceeding'
+      ? `sml promotion backlog qty exceeds pending: ${issue.item_code}`
+      : `sml promotion backlog is unavailable: ${issue.item_code}`);
+  }
+}
 async function resolveBasketPricingContext(custCode) {
-  if (!custCode || !String(custCode).trim()) {
-    return { saleType: null, vatType: null, vatRate: null };
+  const requestedCode = safeText(custCode);
+  if (!requestedCode) {
+    return { custCode: '', saleType: null, vatType: null, vatRate: null };
   }
   try {
+    const basketMatch = requestedCode.match(/^BASKET-(\d+)$/i);
     const rs = await query(
-      `SELECT COALESCE(inquiry_type,0) AS sale_type,
+      basketMatch
+        ? `SELECT COALESCE(cust_code,'') AS cust_code,
+                  COALESCE(inquiry_type,0) AS sale_type,
+                  COALESCE(vat_type,0) AS vat_type,
+                  COALESCE(vat_rate,0) AS vat_rate
+             FROM pos_basket
+            WHERE basket_id=$1
+            LIMIT 1`
+        : `SELECT COALESCE(cust_code,'') AS cust_code,
+              COALESCE(inquiry_type,0) AS sale_type,
               COALESCE(vat_type,0) AS vat_type,
               COALESCE(vat_rate,0) AS vat_rate
        FROM pos_basket
        WHERE cust_code=$1
        ORDER BY basket_id DESC
        LIMIT 1`,
-      [custCode]
+      [basketMatch ? Number(basketMatch[1]) : requestedCode]
     );
     if (rs.rows.length > 0) {
       return {
+        custCode: safeText(rs.rows[0].cust_code) || requestedCode,
         saleType: parseInt(rs.rows[0].sale_type, 10),
         vatType: parseInt(rs.rows[0].vat_type, 10),
         vatRate: parseFloat(rs.rows[0].vat_rate),
       };
     }
   } catch (_) {}
-  return { saleType: null, vatType: null, vatRate: null };
+  return { custCode: requestedCode, saleType: null, vatType: null, vatRate: null };
 }
 
 // POST /service/v1/additemtocart
@@ -318,6 +416,9 @@ router.post('/additemtocart', async (req, res) => {
         const sale_premium_line_type = item.sale_premium_line_type || '';
         const sale_premium_backlog_id = item.sale_premium_backlog_id !== undefined ? parseInt(item.sale_premium_backlog_id, 10) || 0 : 0;
         const sale_premium_backlog_detail_id = item.sale_premium_backlog_detail_id !== undefined ? parseInt(item.sale_premium_backlog_detail_id, 10) || 0 : 0;
+        const sml_promotion_backlog_id = item.sml_promotion_backlog_id !== undefined ? parseInt(item.sml_promotion_backlog_id, 10) || 0 : 0;
+        const sml_promotion_backlog_detail_id = item.sml_promotion_backlog_detail_id !== undefined ? parseInt(item.sml_promotion_backlog_detail_id, 10) || 0 : 0;
+        const sml_promotion_full_qty = item.sml_promotion_full_qty !== undefined ? toNumber(item.sml_promotion_full_qty) : 0;
         const is_permium = item.is_permium !== undefined ? parseInt(item.is_permium, 10) || 0 : 0;
 
         await assertSalePremiumBacklogCartItem(client.query.bind(client), {
@@ -331,13 +432,23 @@ router.post('/additemtocart', async (req, res) => {
           guid_code,
           sale_premium_backlog_detail_id,
         });
+        await assertSmlPromotionBacklogCartItem(client.query.bind(client), {
+          ...item,
+          item_code,
+          item_name,
+          unit_code,
+          qty,
+          cust_code,
+          guid_code,
+          sml_promotion_backlog_detail_id,
+        });
 
         // DELETE เดิมก่อน (เหมือน Java) แต่รายการคงค้างต้องแยกตาม guid ไม่ merge ข้าม backlog
-        const deleteSql = sale_premium_backlog_detail_id > 0
+        const deleteSql = sale_premium_backlog_detail_id > 0 || sml_promotion_backlog_detail_id > 0
           ? `DELETE FROM staff_cart_order WHERE guid_code = $1 AND cust_code = $2`
           : `DELETE FROM staff_cart_order
              WHERE item_code = $1 AND unit_code = $2 AND barcode = $3 AND cust_code = $4`;
-        const deleteParams = sale_premium_backlog_detail_id > 0
+        const deleteParams = sale_premium_backlog_detail_id > 0 || sml_promotion_backlog_detail_id > 0
           ? [guid_code, cust_code]
           : [item_code, unit_code, barcode, cust_code];
         await client.query(deleteSql, deleteParams);
@@ -348,12 +459,14 @@ router.post('/additemtocart', async (req, res) => {
            (item_type, cust_code, guid_code, item_code, item_name, unit_code, barcode,
             qty, price, wh_code, shelf_code, creator_code, create_datetime,
             stand_value, divide_value, ratio, remark, sale_premium_code, sale_premium_name, sale_premium_data,
-            sale_premium_line_type, sale_premium_backlog_id, sale_premium_backlog_detail_id, is_permium)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+            sale_premium_line_type, sale_premium_backlog_id, sale_premium_backlog_detail_id, is_permium,
+            sml_promotion_backlog_id, sml_promotion_backlog_detail_id, sml_promotion_full_qty)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
           [item_type, cust_code, guid_code, item_code, item_name, unit_code, barcode,
            qty, price, wh_code, shelf_code, emp_code,
            stand_value, divide_value, ratio, remark, sale_premium_code, sale_premium_name, sale_premium_data,
-           sale_premium_line_type, sale_premium_backlog_id, sale_premium_backlog_detail_id, is_permium]
+           sale_premium_line_type, sale_premium_backlog_id, sale_premium_backlog_detail_id, is_permium,
+           sml_promotion_backlog_id, sml_promotion_backlog_detail_id, sml_promotion_full_qty]
         );
       }
       resp.success = true;
@@ -392,6 +505,7 @@ router.get('/getcartitemlist', async (req, res) => {
   try {
     await assertBasketAccessFromCartKey(query, userCode, custCode, 'can_enter');
     await ensureSalePremiumCartColumns(query);
+    await ensureSmlPromotionBacklogSchema(query);
     // COUNT
     const countSql = `SELECT COUNT(*) AS total_count FROM staff_cart_order WHERE cust_code = $1${searchCondition}`;
     const countResult = await query(countSql, params);
@@ -406,10 +520,16 @@ router.get('/getcartitemlist', async (req, res) => {
              COALESCE(sco.sale_premium_line_type,'') AS sale_premium_line_type,
              COALESCE(sco.sale_premium_backlog_id,0) AS sale_premium_backlog_id,
              COALESCE(sco.sale_premium_backlog_detail_id,0) AS sale_premium_backlog_detail_id,
+             COALESCE(sco.sml_promotion_backlog_id,0) AS sml_promotion_backlog_id,
+             COALESCE(sco.sml_promotion_backlog_detail_id,0) AS sml_promotion_backlog_detail_id,
+             COALESCE(sco.sml_promotion_full_qty,0) AS sml_promotion_full_qty,
+             COALESCE(sml_backlog.pricing_context,'{}'::jsonb) AS sml_promotion_pricing_context,
              COALESCE(sco.is_permium,0) AS is_permium, 0 AS balance_qty,
              COALESCE(i.tax_type, 0) AS tax_type
       FROM staff_cart_order sco
       LEFT JOIN ic_inventory i ON i.code = sco.item_code
+      LEFT JOIN sml_sml_promotion_backlog_detail sml_backlog
+        ON sml_backlog.roworder = NULLIF(sco.sml_promotion_backlog_detail_id,0)
       WHERE sco.cust_code = $1${searchCondition}
       ORDER BY sco.item_code ASC, sco.unit_code ASC
       LIMIT $${params.length + 1} OFFSET $${params.length + 2}
@@ -441,6 +561,10 @@ router.get('/getcartitemlist', async (req, res) => {
       sale_premium_line_type: r.sale_premium_line_type || '',
       sale_premium_backlog_id: Number(r.sale_premium_backlog_id || 0),
       sale_premium_backlog_detail_id: Number(r.sale_premium_backlog_detail_id || 0),
+      sml_promotion_backlog_id: Number(r.sml_promotion_backlog_id || 0),
+      sml_promotion_backlog_detail_id: Number(r.sml_promotion_backlog_detail_id || 0),
+      sml_promotion_full_qty: toNumber(r.sml_promotion_full_qty),
+      sml_promotion_pricing_context: r.sml_promotion_pricing_context || null,
       is_permium: Number(r.is_permium || 0),
       balance_qty: 0,
       tax_type: Number(r.tax_type ?? 0),
@@ -610,6 +734,12 @@ router.get('/getcartorder', async (req, res) => {
         sale_premium_code: r.sale_premium_code || '',
         sale_premium_name: r.sale_premium_name || '',
         sale_premium_data: parseJsonText(r.sale_premium_data),
+        sale_premium_line_type: r.sale_premium_line_type || '',
+        sale_premium_backlog_id: Number(r.sale_premium_backlog_id || 0),
+        sale_premium_backlog_detail_id: Number(r.sale_premium_backlog_detail_id || 0),
+        sml_promotion_backlog_id: Number(r.sml_promotion_backlog_id || 0),
+        sml_promotion_backlog_detail_id: Number(r.sml_promotion_backlog_detail_id || 0),
+        sml_promotion_full_qty: toNumber(r.sml_promotion_full_qty),
       };
     });
 
@@ -648,6 +778,9 @@ router.post('/getcartorderprice', async (req, res) => {
       const itemCode = it.item_code;
       const unitCode = it.unit_code;
       const qty = it.qty !== undefined ? it.qty.toString() : '1';
+      const pricingQty = toNumber(it.sml_promotion_full_qty) > 0
+        ? toNumber(it.sml_promotion_full_qty).toString()
+        : qty;
       const itemType = it.item_type !== undefined ? it.item_type.toString() : '0';
       const barcode = it.barcode !== undefined ? String(it.barcode) : '';
 
@@ -668,7 +801,7 @@ router.post('/getcartorderprice', async (req, res) => {
           if (Number.isNaN(vatRate)) vatRate = Number.isNaN(bodyVatRate) ? basketCtx.vatRate : bodyVatRate;
           if (Number.isNaN(vatRate)) vatRate = null;
 
-          const priceRes = await getProductPriceLocalx(itemCode, unitCode, qty, cust_code, vatType, vatRate, saleType, barcode, docDate);
+          const priceRes = await getProductPriceLocalx(itemCode, unitCode, pricingQty, basketCtx.custCode || cust_code, vatType, vatRate, saleType, barcode, docDate);
           const arr = priceRes.data || [];
           if (arr.length > 0) {
             priceConfirm = safeBigDecimal(arr[0].price);
@@ -683,7 +816,7 @@ router.post('/getcartorderprice', async (req, res) => {
         o.error_type = ex.constructor.name;
         o.message = ex.message;
         o.detail = ex.toString();
-        o.qty = qty;
+        o.qty = pricingQty;
         o.item_type = itemType;
       }
       result.push(o);
@@ -715,6 +848,7 @@ router.get('/getcartfinalsummary', async (req, res) => {
   try {
     const sql = `
             SELECT c.cust_code, c.item_code, c.item_name, c.unit_code, c.item_type, c.qty, c.price, c.barcode,
+             COALESCE(c.sml_promotion_full_qty,0) AS sml_promotion_full_qty,
              COALESCE(i.tax_type,0) AS tax_type
       FROM staff_cart_order c
       LEFT JOIN ic_inventory i ON i.code = c.item_code
@@ -745,7 +879,8 @@ router.get('/getcartfinalsummary', async (req, res) => {
             ? (Number.isNaN(basketCtx.vatRate) ? null : basketCtx.vatRate)
             : vatRateReq;
 
-          const priceRes = await getProductPriceLocalx(r.item_code, r.unit_code, r.qty.toString(), custCode, vatType, vatRate, saleType, r.barcode, docDate);
+          const pricingQty = toNumber(r.sml_promotion_full_qty) > 0 ? r.sml_promotion_full_qty : r.qty;
+          const priceRes = await getProductPriceLocalx(r.item_code, r.unit_code, pricingQty.toString(), basketCtx.custCode || custCode, vatType, vatRate, saleType, r.barcode, docDate);
           const arr = priceRes.data || [];
           if (arr.length > 0) {
             priceConfirm = safeBigDecimal(arr[0].price);
@@ -783,6 +918,7 @@ router.get('/validatecartstock', async (req, res) => {
   try {
     await assertBasketAccessFromCartKey(query, userCode, custCode, 'can_enter');
     await ensureSalePremiumCartColumns(query);
+    await ensureSmlPromotionBacklogSchema(query);
     const cartRes = await query(
       `SELECT c.*, COALESCE(i.tax_type,0) AS tax_type
          FROM staff_cart_order c
@@ -790,14 +926,21 @@ router.get('/validatecartstock', async (req, res) => {
         WHERE c.cust_code=$1`,
       [custCode.trim()],
     );
+    const basketCtx = await resolveBasketPricingContext(custCode);
+    const basketMatch = String(custCode).trim().match(/^BASKET-(\d+)$/i);
+    const promotionCustCode = basketCtx.custCode || String(custCode).trim();
     const detailItems = [];
     const premiumBacklogPreview = [];
     const salePremiumPricingItems = [];
+    const smlPromotionBacklogPreview = [];
+    const smlPromotionPricingItems = [];
     const premiumNoDeliverableIssues = [];
+    const allocatedSmlPromotionBaseQty = new Map();
     for (const item of cartRes.rows) {
       const itemType = String(item?.item_type ?? '0');
       const backlogDetailId = parseInt(item?.sale_premium_backlog_detail_id || 0, 10) || 0;
-      if (!backlogDetailId && (item?.sale_premium_code || itemType === '4')) {
+      const smlBacklogDetailId = parseInt(item?.sml_promotion_backlog_detail_id || 0, 10) || 0;
+      if (!backlogDetailId && !smlBacklogDetailId && (item?.sale_premium_code || itemType === '4')) {
         const fulfillment = await buildSalePremiumFulfillment(query, item, {
           custCode: '',
           excludeCartKey: custCode.trim(),
@@ -830,15 +973,72 @@ router.get('/validatecartstock', async (req, res) => {
             pending_details: fulfillment.pendingDetails,
           });
         }
+      } else if (!backlogDetailId && !smlBacklogDetailId) {
+        const fulfillment = await buildSmlPromotionFulfillment(query, item, {
+          custCode: promotionCustCode,
+          saleType: basketCtx.saleType,
+          vatType: basketCtx.vatType,
+          vatRate: basketCtx.vatRate,
+          excludeCartKey: custCode.trim(),
+          basketId: basketMatch ? Number(basketMatch[1]) : 0,
+          fullItems: cartRes.rows,
+          allocatedBaseQty: allocatedSmlPromotionBaseQty,
+        });
+        if (fulfillment) {
+          const delivered = fulfillment.delivered_item;
+          const pending = fulfillment.pending_detail;
+          if (delivered) {
+            detailItems.push(delivered);
+            smlPromotionPricingItems.push({
+              ...delivered,
+              guid_code: `${fulfillment.source_cart_guid || item.guid_code || item.item_code}-sml-promotion`,
+              source_guid_code: fulfillment.source_cart_guid || item.guid_code || '',
+              source_cart_guid: fulfillment.source_cart_guid || item.guid_code || '',
+            });
+          }
+          if (pending) {
+            smlPromotionBacklogPreview.push({
+              source_guid_code: fulfillment.source_cart_guid || item.guid_code || '',
+              item_code: pending.item_code || item.item_code,
+              item_name: pending.item_name || item.item_name,
+              unit_code: pending.unit_code || item.unit_code,
+              requested_qty: Number(fulfillment.original_qty || item.qty || 0),
+              deliverable_qty: Number(delivered?.qty || 0),
+              pending_qty: Number(pending.pending_qty || 0),
+              price: Number((delivered || pending).price || 0),
+              normal_price: Number((delivered || pending).normal_price || (delivered || pending).price || 0),
+              full_price_qty: Number(pending.full_price_qty || fulfillment.original_qty || item.qty || 0),
+            });
+          }
+        } else {
+          detailItems.push(item);
+        }
+      } else if (smlBacklogDetailId) {
+        const pricedBacklogItem = await getSmlPromotionBacklogCartPricing(query, item, {
+          custCode: promotionCustCode,
+          saleType: basketCtx.saleType,
+          vatType: basketCtx.vatType,
+          vatRate: basketCtx.vatRate,
+        });
+        detailItems.push(pricedBacklogItem || item);
+        if (pricedBacklogItem) {
+          smlPromotionPricingItems.push({
+            ...pricedBacklogItem,
+            source_guid_code: item.guid_code || '',
+            source_cart_guid: item.guid_code || '',
+          });
+        }
       } else {
         detailItems.push(item);
       }
     }
     const validation = await validateSaleItemsStock(query, detailItems, { excludeCartKey: custCode.trim() });
     const backlogIssues = await validateSalePremiumBacklogCartRows(query, cartRes.rows);
+    const smlPromotionBacklogIssues = await validateSmlPromotionBacklogCartRows(query, cartRes.rows);
     const stockIssues = [
       ...(Array.isArray(validation.stock_issues) ? validation.stock_issues : []),
       ...backlogIssues,
+      ...smlPromotionBacklogIssues,
       ...premiumNoDeliverableIssues,
     ];
     return res.json({
@@ -847,6 +1047,8 @@ router.get('/validatecartstock', async (req, res) => {
       stock_issues: stockIssues,
       sale_premium_backlogs: premiumBacklogPreview,
       sale_premium_pricing_items: salePremiumPricingItems,
+      sml_promotion_backlogs: smlPromotionBacklogPreview,
+      sml_promotion_pricing_items: smlPromotionPricingItems,
     });
   } catch (ex) {
     return res.status(ex.statusCode || 500).json({ success: false, error: ex.message, msg: ex.message });
