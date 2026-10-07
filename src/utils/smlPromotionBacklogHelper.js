@@ -106,6 +106,9 @@ async function ensureSmlPromotionBacklogSchema(queryFn = query) {
     )
   `);
 
+  await queryFn(`ALTER TABLE sml_sml_promotion_backlog_detail ADD COLUMN IF NOT EXISTS cancelled_by VARCHAR(25) DEFAULT ''`);
+  await queryFn(`ALTER TABLE sml_sml_promotion_backlog_detail ADD COLUMN IF NOT EXISTS cancelled_date_time_now TIMESTAMP NULL`);
+
   await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sml_promotion_backlog_id INTEGER DEFAULT 0`);
   await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sml_promotion_backlog_detail_id INTEGER DEFAULT 0`);
   await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sml_promotion_full_qty NUMERIC(18,4) DEFAULT 0`);
@@ -443,10 +446,78 @@ async function applySmlPromotionBacklogDeliveries(client, items = [], context = 
   return applied;
 }
 
+async function cancelSmlPromotionBacklogDetail(client, options = {}) {
+  await ensureSmlPromotionBacklogSchema(client.query.bind(client));
+  const detailId = Math.trunc(toNumber(options.detailId));
+  const expectedBacklogId = Math.trunc(toNumber(options.backlogId));
+  if (detailId <= 0) throw new Error('sml promotion backlog detail is required');
+
+  const detail = await getSmlBacklogDetailForUpdate(client, detailId);
+  if (!detail) {
+    const error = new Error('ไม่พบรายการสินค้าคงค้างโปรโมชั่น SML');
+    error.statusCode = 404;
+    throw error;
+  }
+  if (expectedBacklogId > 0 && Number(detail.backlog_id) !== expectedBacklogId) {
+    const error = new Error('รายการสินค้าคงค้างไม่ตรงกับเอกสารต้นทาง');
+    error.statusCode = 409;
+    throw error;
+  }
+  if (safeText(detail.status) === 'cancelled' || toNumber(detail.pending_qty) <= 0) {
+    const error = new Error('รายการสินค้าคงค้างนี้ถูกปิดไปแล้ว');
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const cartRows = await client.query(
+    `SELECT guid_code,cust_code,qty
+       FROM staff_cart_order
+      WHERE COALESCE(sml_promotion_backlog_detail_id,0)=$1
+        AND COALESCE(qty,0) > 0
+      FOR UPDATE`,
+    [detailId],
+  );
+  if (cartRows.rows.length > 0) {
+    const error = new Error('รายการนี้อยู่ในตะกร้าขายแล้ว กรุณานำออกจากตะกร้าก่อนลบ');
+    error.statusCode = 409;
+    throw error;
+  }
+
+  await client.query(
+    `UPDATE sml_sml_promotion_backlog_detail
+        SET pending_qty=0,status='cancelled',cancelled_by=$2,cancelled_date_time_now=NOW(),
+            update_date_time_now=NOW(),close_date_time_now=NOW()
+      WHERE roworder=$1`,
+    [detailId, safeText(options.cancelledBy)],
+  );
+  const remainingResult = await client.query(
+    `SELECT COUNT(*) FILTER (WHERE pending_qty > 0 AND status <> 'cancelled')::int AS open_count
+       FROM sml_sml_promotion_backlog_detail
+      WHERE backlog_id=$1`,
+    [detail.backlog_id],
+  );
+  const headerStatus = Number(remainingResult.rows[0]?.open_count || 0) === 0 ? 'cancelled' : 'partial';
+  await client.query(
+    `UPDATE sml_sml_promotion_backlog
+        SET status=$2::text,update_date_time_now=NOW(),close_date_time_now=CASE WHEN $2::text='cancelled' THEN NOW() ELSE NULL END
+      WHERE roworder=$1`,
+    [detail.backlog_id, headerStatus],
+  );
+  return {
+    backlog_id: Number(detail.backlog_id),
+    detail_id: detailId,
+    item_code: safeText(detail.item_code),
+    item_name: safeText(detail.item_name),
+    unit_code: safeText(detail.unit_code),
+    cancelled_by: safeText(options.cancelledBy),
+  };
+}
+
 async function listSmlPromotionBacklogLots(queryFn = query, options = {}) {
   await ensureSmlPromotionBacklogSchema(queryFn);
   const params = [];
-  const where = [`d.pending_qty > 0`, `d.status <> 'cancelled'`, `h.status IN ('open','partial')`];
+  const includeClosed = String(options.includeClosed || '') === '1';
+  const where = includeClosed ? ['1=1'] : [`d.pending_qty > 0`, `d.status <> 'cancelled'`, `h.status IN ('open','partial')`];
   if (safeText(options.custCode)) {
     params.push(safeText(options.custCode));
     where.push(`h.cust_code=$${params.length}`);
@@ -461,7 +532,7 @@ async function listSmlPromotionBacklogLots(queryFn = query, options = {}) {
   }
   const result = await queryFn(
     `SELECT h.roworder AS backlog_id,h.cust_code,h.cust_name,h.source_doc_no,h.source_doc_date,h.origin_request_ref,h.source_basket_id,h.sale_code,h.creator_code,h.status AS backlog_status,h.create_date_time_now,
-            d.roworder AS detail_id,d.item_code,d.item_name,d.unit_code,d.barcode,d.wh_code,d.shelf_code,d.stand_value,d.divide_value,d.ratio,d.tax_type,d.original_qty,d.full_price_qty,d.delivered_qty,d.pending_qty,d.pricing_context,d.status AS detail_status
+            d.roworder AS detail_id,d.item_code,d.item_name,d.unit_code,d.barcode,d.wh_code,d.shelf_code,d.stand_value,d.divide_value,d.ratio,d.tax_type,d.original_qty,d.full_price_qty,d.delivered_qty,d.pending_qty,d.pricing_context,d.status AS detail_status,d.cancelled_by,d.cancelled_date_time_now
        FROM sml_sml_promotion_backlog h
        JOIN sml_sml_promotion_backlog_detail d ON d.backlog_id=h.roworder
       WHERE ${where.join(' AND ')}
@@ -694,6 +765,7 @@ module.exports = {
   createSmlPromotionBacklogs,
   refreshSmlPromotionBacklogItems,
   applySmlPromotionBacklogDeliveries,
+  cancelSmlPromotionBacklogDetail,
   listSmlPromotionBacklogLots,
   listSmlPromotionBacklogs,
   getSmlPromotionBacklogSummary,

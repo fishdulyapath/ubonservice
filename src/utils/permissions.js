@@ -78,4 +78,3 @@ async function getEmployeePermissions(query, userCode) {
 }
 
 module.exports = { PERMISSIONS, ALL_PERMISSION_KEYS, getEmployeePermissions };
-

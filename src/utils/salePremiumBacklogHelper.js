@@ -112,6 +112,10 @@ async function ensureSalePremiumBacklogSchema(queryFn = query) {
     )
   `);
   await queryFn(`CREATE INDEX IF NOT EXISTS sml_sale_premium_backlog_delivery_detail_idx ON sml_sale_premium_backlog_delivery (backlog_detail_id)`);
+  await queryFn(`ALTER TABLE sml_sale_premium_backlog_detail ADD COLUMN IF NOT EXISTS cancelled_by VARCHAR(25) DEFAULT ''`);
+  await queryFn(`ALTER TABLE sml_sale_premium_backlog_detail ADD COLUMN IF NOT EXISTS cancelled_date_time_now TIMESTAMP NULL`);
+  await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sale_premium_backlog_id INTEGER DEFAULT 0`);
+  await queryFn(`ALTER TABLE staff_cart_order ADD COLUMN IF NOT EXISTS sale_premium_backlog_detail_id INTEGER DEFAULT 0`);
 }
 
 async function loadAvailableBaseStock(queryFn, lines = [], excludeCartKey = '') {
@@ -413,6 +417,82 @@ async function applySalePremiumBacklogDeliveries(client, deliveredItems = [], co
   return applied;
 }
 
+async function cancelSalePremiumBacklogDetail(client, options = {}) {
+  await ensureSalePremiumBacklogSchema(client.query.bind(client));
+  const detailId = Math.trunc(toNumber(options.detailId));
+  const expectedBacklogId = Math.trunc(toNumber(options.backlogId));
+  if (detailId <= 0) throw new Error('premium backlog detail is required');
+
+  const detailResult = await client.query(
+    `SELECT d.roworder AS detail_id,d.backlog_id,d.item_code,d.item_name,d.unit_code,d.pending_qty,d.status AS detail_status,
+            h.status AS backlog_status
+       FROM sml_sale_premium_backlog_detail d
+       JOIN sml_sale_premium_backlog h ON h.roworder=d.backlog_id
+      WHERE d.roworder=$1
+      FOR UPDATE OF d,h`,
+    [detailId],
+  );
+  const detail = detailResult.rows[0];
+  if (!detail) {
+    const error = new Error('ไม่พบรายการสินค้าคงค้าง');
+    error.statusCode = 404;
+    throw error;
+  }
+  if (expectedBacklogId > 0 && Number(detail.backlog_id) !== expectedBacklogId) {
+    const error = new Error('รายการสินค้าคงค้างไม่ตรงกับเอกสารต้นทาง');
+    error.statusCode = 409;
+    throw error;
+  }
+  if (safeText(detail.detail_status) === 'cancelled' || toNumber(detail.pending_qty) <= 0) {
+    const error = new Error('รายการสินค้าคงค้างนี้ถูกปิดไปแล้ว');
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const cartRows = await client.query(
+    `SELECT guid_code,cust_code,qty
+       FROM staff_cart_order
+      WHERE COALESCE(sale_premium_backlog_detail_id,0)=$1
+        AND COALESCE(qty,0) > 0
+      FOR UPDATE`,
+    [detailId],
+  );
+  if (cartRows.rows.length > 0) {
+    const error = new Error('รายการนี้อยู่ในตะกร้าขายแล้ว กรุณานำออกจากตะกร้าก่อนลบ');
+    error.statusCode = 409;
+    throw error;
+  }
+
+  await client.query(
+    `UPDATE sml_sale_premium_backlog_detail
+        SET pending_qty=0,status='cancelled',cancelled_by=$2,cancelled_date_time_now=NOW(),
+            update_date_time_now=NOW(),close_date_time_now=NOW()
+      WHERE roworder=$1`,
+    [detailId, safeText(options.cancelledBy)],
+  );
+  const remainingResult = await client.query(
+    `SELECT COUNT(*) FILTER (WHERE pending_qty > 0 AND status <> 'cancelled')::int AS open_count
+       FROM sml_sale_premium_backlog_detail
+      WHERE backlog_id=$1`,
+    [detail.backlog_id],
+  );
+  const headerStatus = Number(remainingResult.rows[0]?.open_count || 0) === 0 ? 'cancelled' : 'partial';
+  await client.query(
+    `UPDATE sml_sale_premium_backlog
+        SET status=$2::text,update_date_time_now=NOW(),close_date_time_now=CASE WHEN $2::text='cancelled' THEN NOW() ELSE NULL END
+      WHERE roworder=$1`,
+    [detail.backlog_id, headerStatus],
+  );
+  return {
+    backlog_id: Number(detail.backlog_id),
+    detail_id: detailId,
+    item_code: safeText(detail.item_code),
+    item_name: safeText(detail.item_name),
+    unit_code: safeText(detail.unit_code),
+    cancelled_by: safeText(options.cancelledBy),
+  };
+}
+
 async function listSalePremiumBacklogs(queryFn = query, options = {}) {
   await ensureSalePremiumBacklogSchema(queryFn);
   const params = [];
@@ -424,7 +504,11 @@ async function listSalePremiumBacklogs(queryFn = query, options = {}) {
     params.push(custCode);
     where.push(`h.cust_code=$${params.length}`);
   }
-  if (!includeClosed) where.push(`h.status IN ('open','partial')`);
+  if (!includeClosed) {
+    where.push(`h.status IN ('open','partial')`);
+    where.push(`d.pending_qty > 0`);
+    where.push(`d.status <> 'cancelled'`);
+  }
   if (search) {
     params.push(`%${search}%`);
     where.push(`(h.cust_code ILIKE $${params.length} OR h.cust_name ILIKE $${params.length} OR h.premium_code ILIKE $${params.length} OR h.premium_name ILIKE $${params.length} OR d.item_code ILIKE $${params.length} OR d.item_name ILIKE $${params.length})`);
@@ -439,11 +523,11 @@ async function listSalePremiumBacklogs(queryFn = query, options = {}) {
              d.roworder AS detail_id, d.line_number, d.line_type, d.item_code, d.item_name,
              d.unit_code, d.barcode, d.wh_code, d.shelf_code, d.stand_value, d.divide_value,
              d.ratio, d.tax_type, d.target_qty, d.delivered_qty, d.pending_qty,
-             d.unit_price, d.sum_amount, d.is_permium, d.status AS detail_status
-        FROM sml_sale_premium_backlog h
+             d.unit_price, d.sum_amount, d.is_permium, d.status AS detail_status,
+             d.cancelled_by, d.cancelled_date_time_now
+       FROM sml_sale_premium_backlog h
         JOIN sml_sale_premium_backlog_detail d ON d.backlog_id=h.roworder
        WHERE ${where.length ? where.join(' AND ') : '1=1'}
-         AND d.pending_qty > 0
        ORDER BY h.update_date_time_now DESC, h.roworder DESC, d.line_number, d.roworder
        LIMIT $${params.length}
     ), codes AS (
@@ -490,6 +574,7 @@ module.exports = {
   buildSalePremiumFulfillment,
   createSalePremiumBacklogs,
   applySalePremiumBacklogDeliveries,
+  cancelSalePremiumBacklogDetail,
   listSalePremiumBacklogs,
   getSalePremiumBacklogSummary,
 };

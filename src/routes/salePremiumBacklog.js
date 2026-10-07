@@ -8,6 +8,7 @@ const {
   listSalePremiumBacklogs,
   getSalePremiumBacklogSummary,
   ensureSalePremiumBacklogSchema,
+  cancelSalePremiumBacklogDetail,
 } = require('../utils/salePremiumBacklogHelper');
 const {
   ensureSmlPromotionBacklogSchema,
@@ -15,6 +16,7 @@ const {
   listGroupedSmlPromotionBacklogs,
   getSmlPromotionBacklogSummary,
   addSmlPromotionBacklogToCart,
+  cancelSmlPromotionBacklogDetail,
   toNumber,
 } = require('../utils/smlPromotionBacklogHelper');
 
@@ -26,6 +28,30 @@ async function employeeHasAnyPermission(queryFn, userCode, keys = []) {
   if (!code) return true;
   const permissions = await getEmployeePermissions(queryFn, code);
   return keys.some((key) => permissions.includes(key));
+}
+
+async function verifyBacklogDeleteUser(client, username, password) {
+  const userCode = safeText(username);
+  if (!userCode || !String(password || '')) {
+    const error = new Error('กรุณาระบุผู้ใช้และรหัสผ่าน');
+    error.statusCode = 400;
+    throw error;
+  }
+  const userResult = await client.query(
+    `SELECT code AS user_code,name_1 AS user_name
+       FROM erp_user
+      WHERE UPPER(code)=UPPER($1) AND password=$2
+      ORDER BY code
+      LIMIT 1`,
+    [userCode, String(password || '')],
+  );
+  const user = userResult.rows[0];
+  if (!user) {
+    const error = new Error('รหัสผ่านไม่ถูกต้อง');
+    error.statusCode = 401;
+    throw error;
+  }
+  return user;
 }
 
 function rowToResponse(row) {
@@ -45,6 +71,8 @@ function rowToResponse(row) {
     creator_code: row.creator_code || '',
     backlog_status: row.backlog_status || '',
     detail_status: row.detail_status || '',
+    cancelled_by: row.cancelled_by || '',
+    cancelled_date_time_now: row.cancelled_date_time_now || null,
     line_number: Number(row.line_number || 0),
     line_type: row.line_type || 'sale',
     item_code: row.item_code || '',
@@ -151,6 +179,39 @@ router.post('/sml-promotion-backlog/add-to-cart', async (req, res) => {
         qty: toNumber(body.qty),
         creatorCode: userCode,
       });
+    });
+    return res.json({ success: true, data });
+  } catch (ex) {
+    return res.status(ex.statusCode || 400).json({ success: false, msg: ex.message });
+  }
+});
+
+router.post('/sale-premium-backlog/cancel', async (req, res) => {
+  try {
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
+    const requestUserCode = safeText(body.user_code || req.get('x-user-code'));
+    const username = safeText(body.username || requestUserCode);
+    const password = String(body.password || '');
+    const backlogType = safeText(body.backlog_type || 'sale_premium');
+    const backlogId = Number(body.backlog_id || 0);
+    const detailId = Number(body.detail_id || 0);
+    if (!username || !password || detailId <= 0) {
+      return res.status(400).json({ success: false, msg: 'username, password, and detail_id are required' });
+    }
+    if (requestUserCode && requestUserCode.toUpperCase() !== username.toUpperCase()) {
+      return res.status(403).json({ success: false, msg: 'ยืนยันได้เฉพาะรหัสผ่านของผู้ใช้ปัจจุบัน' });
+    }
+    if (!['sale_premium', 'sml_promotion'].includes(backlogType)) {
+      return res.status(400).json({ success: false, msg: 'invalid backlog_type' });
+    }
+
+    const data = await withTransaction(async (client) => {
+      const verifiedUser = await verifyBacklogDeleteUser(client, username, password);
+      const options = { backlogId, detailId, cancelledBy: verifiedUser.user_code };
+      if (backlogType === 'sml_promotion') {
+        return cancelSmlPromotionBacklogDetail(client, options);
+      }
+      return cancelSalePremiumBacklogDetail(client, options);
     });
     return res.json({ success: true, data });
   } catch (ex) {
