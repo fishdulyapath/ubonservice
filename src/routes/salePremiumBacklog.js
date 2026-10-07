@@ -194,8 +194,10 @@ router.post('/sale-premium-backlog/cancel', async (req, res) => {
     const password = String(body.password || '');
     const backlogType = safeText(body.backlog_type || 'sale_premium');
     const backlogId = Number(body.backlog_id || 0);
-    const detailId = Number(body.detail_id || 0);
-    if (!username || !password || detailId <= 0) {
+    const detailIds = [...new Set((Array.isArray(body.detail_ids) ? body.detail_ids : [body.detail_id])
+      .map((value) => Number(value || 0))
+      .filter((value) => Number.isInteger(value) && value > 0))];
+    if (!username || !password || detailIds.length === 0) {
       return res.status(400).json({ success: false, msg: 'username, password, and detail_id are required' });
     }
     if (requestUserCode && requestUserCode.toUpperCase() !== username.toUpperCase()) {
@@ -207,11 +209,16 @@ router.post('/sale-premium-backlog/cancel', async (req, res) => {
 
     const data = await withTransaction(async (client) => {
       const verifiedUser = await verifyBacklogDeleteUser(client, username, password);
-      const options = { backlogId, detailId, cancelledBy: verifiedUser.user_code };
-      if (backlogType === 'sml_promotion') {
-        return cancelSmlPromotionBacklogDetail(client, options);
+      const cancelled = [];
+      for (const detailId of detailIds) {
+        const options = { backlogId, detailId, cancelledBy: verifiedUser.user_code };
+        if (backlogType === 'sml_promotion') {
+          cancelled.push(await cancelSmlPromotionBacklogDetail(client, options));
+        } else {
+          cancelled.push(await cancelSalePremiumBacklogDetail(client, options));
+        }
       }
-      return cancelSalePremiumBacklogDetail(client, options);
+      return { cancelled, cancelled_count: cancelled.length };
     });
     return res.json({ success: true, data });
   } catch (ex) {
