@@ -9,12 +9,12 @@ function calcDiscount(discountWord, totalValue) {
   for (let part of parts) {
     part = part.trim();
     if (!part) continue;
-    if (part.toUpperCase().endsWith('B')) {
-      const amt = parseFloat(part.slice(0, -1)) || 0;
-      remaining -= amt;
-    } else {
-      const pct = parseFloat(part) || 0;
+    if (part.endsWith('%')) {
+      const pct = parseFloat(part.slice(0, -1)) || 0;
       remaining = remaining * (1.0 - pct / 100.0);
+    } else {
+      const amountText = part.toUpperCase().endsWith('B') ? part.slice(0, -1) : part;
+      remaining -= parseFloat(amountText) || 0;
     }
     if (remaining < 0) remaining = 0;
   }

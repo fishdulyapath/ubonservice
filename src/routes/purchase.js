@@ -123,6 +123,23 @@ function normalizePUItem(item) {
   };
 }
 
+function normalizePurchasePriceCheckItems(items) {
+  return normalizeArray(items)
+    .map((item, index) => {
+      const amounts = calcPULineAmounts(item);
+      const qty = toNumber(amounts.qty);
+      return {
+        line_id: safeText(item?.line_id || item?._line_id || index + 1),
+        item_code: safeText(item?.item_code || item?.code || item?.ic_code),
+        item_name: safeText(item?.item_name || item?.name_1),
+        unit_code: safeText(item?.unit_code || item?.unit_cost || item?.unit_standard),
+        current_unit_price: qty > 0 ? roundMoney(amounts.sum_amount / qty) : 0,
+        is_permium: amounts.is_permium,
+      };
+    })
+    .filter((item) => item.item_code && item.unit_code && item.is_permium !== 1 && item.current_unit_price > 0);
+}
+
 function toInt(value, fallback = 0) {
   const num = parseInt(value, 10);
   return Number.isFinite(num) ? num : fallback;
@@ -1163,6 +1180,105 @@ router.post('/getPurchaseLatestItemPrices', async (req, res) => {
        ) last_po ON true
        ORDER BY r.item_code, r.unit_code, r.barcode`,
       [JSON.stringify(items), PU_TRANS_FLAG, PO_TRANS_FLAG],
+    );
+    return successResponse(res, result.rows);
+  } catch (ex) {
+    return failResponse(res, ex.message, 500);
+  }
+});
+
+// POST /service/v1/checkPurchasePriceIncrease
+// Returns only rows whose net unit cost is higher than the latest usable PU.
+router.post('/checkPurchasePriceIncrease', async (req, res) => {
+  const custCode = safeText(req.body?.cust_code || req.body?.ap_cust_code);
+  const excludeDocNo = safeText(req.body?.exclude_doc_no || req.body?.doc_no);
+  const items = normalizePurchasePriceCheckItems(req.body?.items);
+  if (!items.length) return successResponse(res, []);
+
+  try {
+    const result = await query(
+      `WITH requested AS (
+         SELECT DISTINCT ON (line_id)
+           line_id, item_code, item_name, unit_code, current_unit_price
+         FROM jsonb_to_recordset($1::jsonb) AS x(
+           line_id text,
+           item_code text,
+           item_name text,
+           unit_code text,
+           current_unit_price numeric
+         )
+         WHERE COALESCE(item_code,'') <> ''
+           AND COALESCE(unit_code,'') <> ''
+           AND COALESCE(current_unit_price,0) > 0
+       )
+       SELECT
+         r.line_id,
+         r.item_code,
+         r.item_name,
+         r.unit_code,
+         r.current_unit_price,
+         COALESCE(same_supplier.unit_price, any_supplier.unit_price) AS previous_unit_price,
+         ROUND(r.current_unit_price - COALESCE(same_supplier.unit_price, any_supplier.unit_price), 2) AS difference_amount,
+         ROUND(
+           ((r.current_unit_price - COALESCE(same_supplier.unit_price, any_supplier.unit_price))
+             * 100 / NULLIF(COALESCE(same_supplier.unit_price, any_supplier.unit_price), 0)),
+           2
+         ) AS difference_percent,
+         COALESCE(same_supplier.doc_no, any_supplier.doc_no, '') AS previous_doc_no,
+         COALESCE(same_supplier.doc_date::text, any_supplier.doc_date::text, '') AS previous_doc_date,
+         COALESCE(same_supplier.cust_code, any_supplier.cust_code, '') AS previous_cust_code,
+         COALESCE(same_supplier.cust_name, any_supplier.cust_name, '') AS previous_cust_name,
+         CASE WHEN same_supplier.doc_no IS NOT NULL THEN 'same_supplier' ELSE 'all_suppliers' END AS reference_scope
+       FROM requested r
+       LEFT JOIN LATERAL (
+         SELECT
+           CASE WHEN COALESCE(d.qty,0) <> 0
+             THEN ROUND(COALESCE(d.sum_amount, d.price * d.qty) / d.qty, 2)
+             ELSE COALESCE(d.price,0)
+           END AS unit_price,
+           d.doc_no,
+           d.doc_date,
+           COALESCE(d.cust_code,'') AS cust_code,
+           COALESCE(ap.name_1,'') AS cust_name
+         FROM ic_trans_detail d
+         LEFT JOIN ap_supplier ap ON ap.code = d.cust_code
+         WHERE d.trans_flag = $4
+           AND COALESCE(d.last_status,0) = 0
+           AND COALESCE(d.is_permium,0) <> 1
+           AND COALESCE(d.qty,0) <> 0
+           AND d.item_code = r.item_code
+           AND COALESCE(d.unit_code,'') = r.unit_code
+           AND COALESCE(d.cust_code,'') = $2
+           AND ($3 = '' OR d.doc_no <> $3)
+         ORDER BY d.doc_date DESC, COALESCE(d.doc_time,'') DESC, d.doc_no DESC, d.line_number DESC
+         LIMIT 1
+       ) same_supplier ON true
+       LEFT JOIN LATERAL (
+         SELECT
+           CASE WHEN COALESCE(d.qty,0) <> 0
+             THEN ROUND(COALESCE(d.sum_amount, d.price * d.qty) / d.qty, 2)
+             ELSE COALESCE(d.price,0)
+           END AS unit_price,
+           d.doc_no,
+           d.doc_date,
+           COALESCE(d.cust_code,'') AS cust_code,
+           COALESCE(ap.name_1,'') AS cust_name
+         FROM ic_trans_detail d
+         LEFT JOIN ap_supplier ap ON ap.code = d.cust_code
+         WHERE d.trans_flag = $4
+           AND COALESCE(d.last_status,0) = 0
+           AND COALESCE(d.is_permium,0) <> 1
+           AND COALESCE(d.qty,0) <> 0
+           AND d.item_code = r.item_code
+           AND COALESCE(d.unit_code,'') = r.unit_code
+           AND ($3 = '' OR d.doc_no <> $3)
+         ORDER BY d.doc_date DESC, COALESCE(d.doc_time,'') DESC, d.doc_no DESC, d.line_number DESC
+         LIMIT 1
+       ) any_supplier ON same_supplier.doc_no IS NULL
+       WHERE COALESCE(same_supplier.unit_price, any_supplier.unit_price, 0) > 0
+         AND r.current_unit_price > COALESCE(same_supplier.unit_price, any_supplier.unit_price) + 0.01
+       ORDER BY r.item_code, r.unit_code, r.line_id`,
+      [JSON.stringify(items), custCode, excludeDocNo, PU_TRANS_FLAG],
     );
     return successResponse(res, result.rows);
   } catch (ex) {

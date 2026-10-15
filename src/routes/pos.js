@@ -6,6 +6,7 @@ const { calcDiscount, calcVat } = require('../utils/vatHelper');
 const { validateSaleItemsStock } = require('../utils/cartStockValidator');
 const { getEmployeePermissions } = require('../utils/permissions');
 const { assertBasketAccess } = require('../utils/basketAccess');
+const { querySaleAdvanceDepositBalances } = require('../utils/saleAdvanceDeposit');
 const {
   buildSalePremiumFulfillment,
   createSalePremiumBacklogs,
@@ -215,57 +216,6 @@ function normalizeSaleDepositPayments(payments) {
       };
     })
     .filter((row) => (row.doc_type === 5 || row.doc_type === 6) && row.amount > 0);
-}
-
-async function querySaleAdvanceDepositBalances(queryFn, custCode, docNos = []) {
-  const params = [custCode];
-  let docFilter = '';
-  if (docNos.length > 0) {
-    params.push(docNos);
-    docFilter = `AND h.doc_no = ANY($${params.length}::text[])`;
-  }
-
-  const result = await queryFn(
-    `SELECT x.doc_no, x.doc_date, x.doc_time, x.cust_code, x.trans_flag,
-            CASE WHEN x.trans_flag IN (110,9110) THEN 6 ELSE 5 END AS doc_type,
-            CASE WHEN x.trans_flag IN (110,9110) THEN 'deposit' ELSE 'advance' END AS payment_kind,
-            CASE WHEN x.trans_flag IN (110,9110) THEN '\u0E40\u0E07\u0E34\u0E19\u0E21\u0E31\u0E14\u0E08\u0E33' ELSE '\u0E40\u0E07\u0E34\u0E19\u0E25\u0E48\u0E27\u0E07\u0E2B\u0E19\u0E49\u0E32' END AS type_label,
-            COALESCE(x.remark,'') AS remark,
-            COALESCE(x.total_amount,0) AS total_amount,
-            COALESCE(x.used_amount,0) AS used_amount,
-            GREATEST(ROUND(COALESCE(x.total_amount,0) - COALESCE(x.used_amount,0), 2), 0) AS balance_amount
-     FROM (
-       SELECT h.doc_no, h.doc_date, h.doc_time, h.cust_code, h.trans_flag, h.remark,
-              COALESCE(h.total_amount,0) AS total_amount,
-              COALESCE((
-                SELECT SUM(COALESCE(r.total_amount,0))
-                FROM ic_trans r
-                WHERE COALESCE(r.last_status,0) = 0
-                  AND r.doc_ref = h.doc_no
-                  AND (
-                    (h.trans_flag IN (40,9040) AND r.trans_flag = 42)
-                    OR (h.trans_flag IN (110,9110) AND r.trans_flag = 112)
-                  )
-              ),0)
-              + COALESCE((
-                SELECT SUM(COALESCE(d.amount,0))
-                FROM cb_trans_detail d
-                WHERE COALESCE(d.last_status,0) = 0
-                  AND d.trans_number = h.doc_no
-                  AND d.doc_type = CASE WHEN h.trans_flag IN (110,9110) THEN 6 ELSE 5 END
-              ),0) AS used_amount
-       FROM ic_trans h
-       WHERE h.trans_flag IN (40,9040,110,9110)
-         AND h.cust_code = $1
-         AND COALESCE(h.last_status,0) = 0
-         AND COALESCE(h.is_doc_copy,0) <> 1
-         ${docFilter}
-     ) x
-     WHERE GREATEST(ROUND(COALESCE(x.total_amount,0) - COALESCE(x.used_amount,0), 2), 0) > 0
-     ORDER BY x.doc_date DESC, x.doc_no DESC`,
-    params
-  );
-  return result.rows;
 }
 
 // -- helper: buildDocPattern ------------------------------------------------
@@ -590,7 +540,10 @@ router.get('/getDashboardSoldOut', async (req, res) => {
     const purchaseInfoJoin = canViewPurchaseInfo
       ? `LEFT JOIN LATERAL (
            SELECT
-             d.price,
+             CASE
+               WHEN COALESCE(d.qty, 0) <> 0 THEN COALESCE(d.sum_amount, d.price * d.qty) / d.qty
+               ELSE d.price
+             END AS price,
              d.doc_no,
              d.doc_date,
              d.qty,

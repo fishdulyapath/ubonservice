@@ -1238,10 +1238,82 @@ function saleLowCostAfterDiscount(word, amount, point = 2, qty = 1) {
 }
 
 function saleLowCostAmount(item) {
-  const supplied = saleLowCostNumber(item?.sum_amount);
-  if (Number.isFinite(supplied) && supplied !== 0) return supplied;
+  if (item?.sum_amount !== undefined && item?.sum_amount !== null && item?.sum_amount !== "") {
+    return saleLowCostNumber(item.sum_amount);
+  }
   const gross = saleLowCostRound(saleLowCostNumber(item?.price) * saleLowCostNumber(item?.qty), 2);
   return saleLowCostAfterDiscount(item?.discount || "", gross, 2, saleLowCostNumber(item?.qty));
+}
+
+async function getSaleLowCostIssues(items, { vatType, vatRate }) {
+  const validItems = (items || []).filter((item) => {
+    return String(item?.item_code || "").trim() && String(item?.unit_code || "").trim();
+  });
+  if (!validItems.length) return [];
+
+  const itemCodes = validItems.map((item) => String(item.item_code).trim());
+  const unitCodes = validItems.map((item) => String(item.unit_code).trim());
+  const itemResult = await query(
+    `WITH requested AS (
+       SELECT DISTINCT item_code, unit_code
+       FROM unnest($1::text[], $2::text[]) AS input(item_code, unit_code)
+     )
+     SELECT i.code AS item_code,
+            requested.unit_code,
+            COALESCE(i.name_1,'') AS item_name,
+            COALESCE(i.average_cost,0) AS average_cost,
+            COALESCE(d.is_premium,0) AS is_premium,
+            COALESCE(cu.stand_value,1) AS average_cost_stand,
+            COALESCE(cu.divide_value,1) AS average_cost_div,
+            COALESCE(su.stand_value, i.unit_standard_stand_value, 1) AS sale_stand_value,
+            COALESCE(su.divide_value, i.unit_standard_divide_value, 1) AS sale_divide_value
+       FROM requested
+       JOIN ic_inventory i ON i.code = requested.item_code
+       LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
+       LEFT JOIN ic_unit_use cu ON cu.ic_code = i.code AND cu.code = i.unit_cost
+       LEFT JOIN ic_unit_use su ON su.ic_code = i.code AND su.code = requested.unit_code`,
+    [itemCodes, unitCodes],
+  );
+  const itemByKey = new Map(itemResult.rows.map((row) => [`${row.item_code}\u0000${row.unit_code}`, row]));
+  const issues = [];
+
+  for (const item of validItems) {
+    const itemCode = String(item.item_code).trim();
+    const unitCode = String(item.unit_code).trim();
+    const row = itemByKey.get(`${itemCode}\u0000${unitCode}`);
+    if (!row) continue;
+
+    const qty = saleLowCostNumber(item.qty);
+    const amount = saleLowCostAmount(item);
+    const saleStand = saleLowCostNumber(item.stand_value) || saleLowCostNumber(row.sale_stand_value) || 1;
+    const saleDiv = saleLowCostNumber(item.divide_value) || saleLowCostNumber(row.sale_divide_value) || 1;
+    const costStand = saleLowCostNumber(row.average_cost_stand) || 1;
+    const costDiv = saleLowCostNumber(row.average_cost_div) || 1;
+    const cost = saleLowCostNumber(row.average_cost);
+    const isPremium = String(row.is_premium ?? "0") === "1"
+      || Number(item?.is_permium ?? item?.is_premium ?? 0) === 1;
+
+    if (qty === 0 || saleDiv === 0 || costDiv === 0 || isPremium) continue;
+
+    let salePriceForCostUnit = amount / (qty * (saleStand / saleDiv));
+    if (vatType === 1 && vatRate > 0) {
+      salePriceForCostUnit = (salePriceForCostUnit * 100) / (100 + vatRate);
+    }
+    salePriceForCostUnit = salePriceForCostUnit * (costStand / costDiv);
+
+    if (salePriceForCostUnit + 0.0001 < cost) {
+      issues.push({
+        item_code: itemCode,
+        item_name: row.item_name || item.item_name || "",
+        unit_code: unitCode,
+        qty,
+        sum_amount: saleLowCostRound(amount, 2),
+        sale_price_for_cost_unit: saleLowCostRound(salePriceForCostUnit, 4),
+        average_cost: saleLowCostRound(cost, 4),
+      });
+    }
+  }
+  return issues;
 }
 
 // POST /service/v1/checkSaleLowCost
@@ -1271,61 +1343,7 @@ router.post("/checkSaleLowCost", async (req, res) => {
       }
     }
 
-    const issues = [];
-    for (const item of detailItems) {
-      const itemCode = String(item?.item_code || "").trim();
-      const unitCode = String(item?.unit_code || "").trim();
-      if (!itemCode || !unitCode) continue;
-
-      const itemResult = await query(
-        `SELECT i.code AS item_code,
-                COALESCE(i.name_1,'') AS item_name,
-                COALESCE(i.average_cost,0) AS average_cost,
-                COALESCE(d.is_premium,0) AS is_premium,
-                COALESCE(cu.stand_value,1) AS average_cost_stand,
-                COALESCE(cu.divide_value,1) AS average_cost_div,
-                COALESCE(su.stand_value, i.unit_standard_stand_value, 1) AS sale_stand_value,
-                COALESCE(su.divide_value, i.unit_standard_divide_value, 1) AS sale_divide_value
-           FROM ic_inventory i
-           LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
-           LEFT JOIN ic_unit_use cu ON cu.ic_code = i.code AND cu.code = i.unit_cost
-           LEFT JOIN ic_unit_use su ON su.ic_code = i.code AND su.code = $2
-          WHERE i.code = $1
-          LIMIT 1`,
-        [itemCode, unitCode],
-      );
-      const row = itemResult.rows[0];
-      if (!row) continue;
-
-      const qty = saleLowCostNumber(item.qty);
-      const amount = saleLowCostAmount(item);
-      const saleStand = saleLowCostNumber(item.stand_value) || saleLowCostNumber(row.sale_stand_value) || 1;
-      const saleDiv = saleLowCostNumber(item.divide_value) || saleLowCostNumber(row.sale_divide_value) || 1;
-      const costStand = saleLowCostNumber(row.average_cost_stand) || 1;
-      const costDiv = saleLowCostNumber(row.average_cost_div) || 1;
-      const cost = saleLowCostNumber(row.average_cost);
-      const isPremium = String(row.is_premium ?? "0") === "1" || Number(item?.is_permium ?? 0) === 1;
-
-      if (qty === 0 || saleDiv === 0 || costDiv === 0 || isPremium) continue;
-
-      let salePriceForCostUnit = amount / (qty * (saleStand / saleDiv));
-      if (vatType === 1 && vatRate > 0) {
-        salePriceForCostUnit = (salePriceForCostUnit * 100) / (100 + vatRate);
-      }
-      salePriceForCostUnit = salePriceForCostUnit * (costStand / costDiv);
-
-      if (salePriceForCostUnit + 0.0001 < cost) {
-        issues.push({
-          item_code: itemCode,
-          item_name: row.item_name || item.item_name || "",
-          unit_code: unitCode,
-          qty,
-          sum_amount: saleLowCostRound(amount, 2),
-          sale_price_for_cost_unit: saleLowCostRound(salePriceForCostUnit, 4),
-          average_cost: saleLowCostRound(cost, 4),
-        });
-      }
-    }
+    const issues = await getSaleLowCostIssues(detailItems, { vatType, vatRate });
 
     resp.success = true;
     resp.data = issues;
@@ -1382,7 +1400,12 @@ router.get("/getProductPrice", async (req, res) => {
     }
     const result = await getProductPriceLocalx(strItemCode, strUnitCode, strQty || "1", strCustCode, vatType, vatRate, saleType, barcodeForPrice, docDate);
     resp.success = true;
-    resp.data = result.data || [];
+    resp.data = (result.data || []).map((row) => ({
+      ...row,
+      pricing_sale_type: saleType ?? 0,
+      pricing_vat_type: vatType ?? 0,
+      pricing_vat_rate: vatRate || 0,
+    }));
     return res.json(resp);
   } catch (ex) {
     return res.status(400).json({ ERROR: ex.message });
@@ -2154,7 +2177,11 @@ router.get("/getPurchaseStockReorderList", async (req, res) => {
              COALESCE(lp.qty,0)::numeric AS last_purchase_qty
            FROM candidates c
            LEFT JOIN LATERAL (
-             SELECT d.price, d.cust_code, d.doc_date, d.qty
+             SELECT CASE
+                      WHEN COALESCE(d.qty,0) <> 0 THEN COALESCE(d.sum_amount, d.price * d.qty) / d.qty
+                      ELSE d.price
+                    END AS price,
+                    d.cust_code, d.doc_date, d.qty
              FROM ic_trans_detail d
              WHERE d.trans_flag = 12
                AND COALESCE(d.last_status,0) = 0
@@ -2299,7 +2326,11 @@ router.get("/getPurchaseStockReorderList", async (req, res) => {
              COALESCE(lp.qty,0)::numeric AS last_purchase_qty
          FROM candidates c
          LEFT JOIN LATERAL (
-           SELECT d.price, d.cust_code, d.doc_date, d.qty
+           SELECT CASE
+                    WHEN COALESCE(d.qty,0) <> 0 THEN COALESCE(d.sum_amount, d.price * d.qty) / d.qty
+                    ELSE d.price
+                  END AS price,
+                  d.cust_code, d.doc_date, d.qty
            FROM ic_trans_detail d
            WHERE d.trans_flag = 12
              AND COALESCE(d.last_status,0) = 0

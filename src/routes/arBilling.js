@@ -4,6 +4,7 @@ const { withTransaction, query } = require('../db');
 const { resolveDocumentNo } = require('../utils/docFormat');
 const { getEmployeePermissions } = require('../utils/permissions');
 const { renderSalePrintHtml } = require('../utils/salePrintRenderer');
+const { querySaleAdvanceDepositBalances, summarizeSaleAdvanceDepositBalances } = require('../utils/saleAdvanceDeposit');
 
 const TRANS_TYPE = 2;
 const TRANS_FLAG = 235;
@@ -55,6 +56,15 @@ function boolFlag(value) {
   if (typeof value === 'boolean') return value;
   const text = String(value ?? '').trim().toLowerCase();
   return text === '1' || text === 'true' || text === 'yes' || text === 'on';
+}
+
+async function loadArBillingAdvancePayments(queryFn, custCode) {
+  const rows = await querySaleAdvanceDepositBalances(queryFn, custCode);
+  return {
+    balance_amount: roundMoney(summarizeSaleAdvanceDepositBalances(rows)),
+    rows,
+    queried_at: new Date().toISOString(),
+  };
 }
 
 async function loadArBillingProfile(queryFn, userCode = '') {
@@ -927,6 +937,23 @@ router.get('/ar-billing/open-docs', async (req, res) => {
   }
 });
 
+// Current customer advance/deposit balance for the billing screen. This is
+// informational only; billing documents do not consume these balances.
+router.get('/ar-billing/advance-payments', async (req, res) => {
+  const custCode = safeText(req.query.cust_code);
+  if (!custCode) return res.json({
+    success: true,
+    data: { balance_amount: 0, rows: [], queried_at: new Date().toISOString() },
+  });
+  try {
+    await assertPermission(query, req.query.user_code || req.query.emp_code, AR_BILLING_VIEW_PERMISSION);
+    return res.json({ success: true, data: await loadArBillingAdvancePayments(query, custCode) });
+  } catch (ex) {
+    if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
+    return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
 router.get('/ar-billing/detail', async (req, res) => {
   const docNo = safeText(req.query.doc_no);
   if (!docNo) return res.status(400).json({ success: false, msg: 'doc_no is required' });
@@ -961,8 +988,13 @@ router.get('/ar-billing/detail', async (req, res) => {
         [docNo, TRANS_FLAG],
       ),
     ]);
-    if (!header.rows[0]) return res.status(404).json({ success: false, msg: 'document not found' });
-    return res.json({ success: true, data: { header: header.rows[0], details: details.rows } });
+    const headerRow = header.rows[0];
+    if (!headerRow) return res.status(404).json({ success: false, msg: 'document not found' });
+    const advancePayments = await loadArBillingAdvancePayments(query, headerRow.cust_code);
+    return res.json({
+      success: true,
+      data: { header: headerRow, details: details.rows, advance_payments: advancePayments },
+    });
   } catch (ex) {
     if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
     return res.status(500).json({ success: false, msg: ex.message });
