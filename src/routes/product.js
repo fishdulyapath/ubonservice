@@ -496,6 +496,7 @@ function promotionSummary(meta) {
     has_price_promotion: current.has_price_promotion ? "1" : "0",
     has_discount_promotion: current.has_discount_promotion ? "1" : "0",
     price_promotion_units: Array.from(current.price_promotion_units),
+    price_promotion_modes: [...new Set(Array.from(current.units.values()).flatMap(unit => unit.promotion.map(row => row.price_mode)))],
     discount_promotion_units: Array.from(current.discount_promotion_units),
   };
 }
@@ -680,6 +681,7 @@ router.get("/getProductList", async (req, res) => {
       has_price_promotion: r.has_price_promotion ?? meta.has_price_promotion,
       has_discount_promotion: r.has_discount_promotion ?? meta.has_discount_promotion,
       price_promotion_units: meta.price_promotion_units,
+      price_promotion_modes: meta.price_promotion_modes,
       discount_promotion_units: meta.discount_promotion_units,
       favorite_item: r.favorite_item,
       is_return: r.is_return,

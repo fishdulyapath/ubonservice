@@ -5,6 +5,7 @@ const { pool, query } = require('../db');
 const { successResponse, failResponse } = require('../utils/response');
 const { resolveDocFormat, resolveDocumentNo } = require('../utils/docFormat');
 const { getEmployeePermissions } = require('../utils/permissions');
+const { calcAfterDiscount, calcPULineAmounts, calculatePUDocument, roundERP, pricingOptions } = require('../utils/puPricing');
 
 const PU_TRANS_FLAG = 12;
 const PO_TRANS_FLAG = 6;
@@ -52,81 +53,22 @@ function roundMoney(value) {
   return Math.round(toNumber(value) * 100) / 100;
 }
 
-function roundPoint(value, point = 2) {
-  const factor = Math.pow(10, point);
-  return Math.round(toNumber(value) * factor) / factor;
-}
-
-function calcAfterDiscount(discountWord, amount, point = 2, qty = 1, alwaysRound = true) {
-  if (!discountWord || !String(discountWord).trim()) return toNumber(amount);
-  let result = toNumber(amount);
-  for (const raw of String(discountWord).replace(/\s/g, '').split(',')) {
-    const token = raw.trim();
-    if (!token) continue;
-    if (token.startsWith('@')) {
-      const val = parseFloat(token.slice(1)) || 0;
-      result -= alwaysRound ? roundPoint(val * toNumber(qty), point) : val * toNumber(qty);
-    } else if (token.includes('%')) {
-      const pct = parseFloat(token.replace(/%/g, '')) || 0;
-      result -= alwaysRound ? roundPoint((pct / 100) * result, point) : (pct / 100) * result;
-    } else {
-      const val = parseFloat(token) || 0;
-      result -= alwaysRound ? roundPoint(val, point) : val;
-    }
-  }
-  return roundPoint(result, point);
-}
-
 function isPermiumItem(item) {
   // ic_trans_detail.is_permium (1=ของแถม) — สะกดตาม schema ต้นฉบับ
   return String(item?.is_permium ?? item?.is_premium ?? '0') === '1';
 }
 
-function calcPULineAmounts(item) {
-  const qty = toNumber(item?.qty);
-  // ของแถม (is_permium=1): บังคับ price/sum_amount = 0 ฝั่ง server กัน client ส่งผิด
-  if (isPermiumItem(item)) {
-    return {
-      qty,
-      price: 0,
-      discount: '',
-      discount_amount: 0,
-      sum_amount: 0,
-      is_permium: 1,
-    };
-  }
-  const price = toNumber(item?.price);
-  const gross = roundMoney(price * qty);
-  const discountWord = String(item?.discount || '').trim()
-    || (toNumber(item?.discount_amount) ? String(item.discount_amount) : '');
-  const net = discountWord ? calcAfterDiscount(discountWord, gross, 2, qty) : gross;
-  return {
-    qty,
-    price,
-    discount: discountWord,
-    discount_amount: roundMoney(gross - net),
-    sum_amount: Math.max(0, roundMoney(net)),
-    is_permium: 0,
-  };
+async function loadPUPricingOptions(client) {
+  const result = await client.query(`SELECT item_amount_decimal, item_price_decimal,
+    discout_type, discount_vat_type, discount_step_round_off,
+    calc_item_price_discount, round_type FROM erp_option LIMIT 1`);
+  return result.rows[0] || {};
 }
 
-function normalizePUItem(item) {
-  const amounts = calcPULineAmounts(item);
-  return {
-    ...item,
-    qty: amounts.qty,
-    price: amounts.price,
-    discount: amounts.discount,
-    discount_amount: amounts.discount_amount,
-    sum_amount: amounts.sum_amount,
-    is_permium: amounts.is_permium,
-  };
-}
-
-function normalizePurchasePriceCheckItems(items) {
+function normalizePurchasePriceCheckItems(items, optionRow = {}) {
   return normalizeArray(items)
     .map((item, index) => {
-      const amounts = calcPULineAmounts(item);
+      const amounts = calcPULineAmounts(item, optionRow);
       const qty = toNumber(amounts.qty);
       return {
         line_id: safeText(item?.line_id || item?._line_id || index + 1),
@@ -269,6 +211,7 @@ async function getCurrentPURefs(client, currentDocNo) {
 
 async function validatePUSavePlan(client, body) {
   const payload = normalizeSavePayload(body);
+  const optionRow = await loadPUPricingOptions(client);
   const mode = requestedMode(body, payload);
   const errors = [];
   const warnings = [];
@@ -308,7 +251,7 @@ async function validatePUSavePlan(client, body) {
     const code = String(item?.item_code || '').trim();
     const unit = String(item?.unit_code || '').trim();
     const qty = toNumber(item?.qty);
-    const expected = calcPULineAmounts(item);
+    const expected = calcPULineAmounts(item, optionRow);
     if (!code || !unit || qty <= 0) {
       invalidItems.push({ line: index + 1, item_code: code, unit_code: unit, qty });
     }
@@ -330,6 +273,10 @@ async function validatePUSavePlan(client, body) {
   }
   if (freeItemRows.length) {
     warnings.push(`free/bonus items (is_permium=1): lines ${freeItemRows.join(', ')}`);
+  }
+  const calculatedTotals = calculatePUDocument(items, payload.discount_word, payload.vat_rate, taxType, optionRow).totals;
+  if (Math.abs(toNumber(payload.total_amount) - calculatedTotals.total_amount) > 0.01) {
+    warnings.push(`header total_amount will be recalculated on save: ${calculatedTotals.total_amount}`);
   }
 
   let resolvedDoc = null;
@@ -420,7 +367,10 @@ async function validatePUSavePlan(client, body) {
   if (isCashSale) {
     const cashAmount = toNumber(payload.cash_amount);
     const transferAmount = toNumber(payload.transfer_amount);
-    const totalAfterRounded = toNumber(payload.total_after_rounded, toNumber(payload.total_amount));
+    const option = pricingOptions(optionRow);
+    const totalAfterRounded = roundERP(
+      calculatedTotals.total_amount + toNumber(payload.rounded_amount), option.amountPoint, option.roundType,
+    );
     const paidAmount = cashAmount + transferAmount;
     const paymentDiff = roundMoney(paidAmount - totalAfterRounded);
     if (paidAmount <= 0) errors.push('cash PU requires cash_amount or transfer_amount');
@@ -466,17 +416,20 @@ async function validatePUSavePlan(client, body) {
   };
 }
 
-function normalizedPUSaveFields(payload) {
+function normalizedPUSaveFields(payload, optionRow = {}) {
   const docDate = normalizeDate(payload.doc_date);
   const taxDocDate = normalizeDate(payload.tax_doc_date) || docDate;
   const docRefDate = normalizeDate(payload.doc_ref_date);
   const saleType = toInt(payload.sale_type ?? payload.inquiry_type, 0);
   const taxType = toInt(payload.tax_type ?? payload.vat_type, 1);
-  const totalAmount = toNumber(payload.total_amount);
-  const totalAfterRounded = toNumber(payload.total_after_rounded, totalAmount) || totalAmount;
+  const pricing = calculatePUDocument(payload.items, payload.discount_word, payload.vat_rate, taxType, optionRow);
+  const totals = pricing.totals;
+  const totalAmount = totals.total_amount;
   const cashAmount = toNumber(payload.cash_amount);
   const transferAmount = toNumber(payload.transfer_amount);
   const roundedAmount = toNumber(payload.rounded_amount);
+  const option = pricingOptions(optionRow);
+  const totalAfterRounded = roundERP(totalAmount + roundedAmount, option.amountPoint, option.roundType);
 
   return {
     docDate,
@@ -492,13 +445,13 @@ function normalizedPUSaveFields(payload) {
     apCustName: safeText(payload.ap_cust_name),
     apBranchCode: safeText(payload.ap_branch_code || payload.branch_code),
     apTaxId: safeText(payload.ap_tax_id),
-    totalValue: toNumber(payload.total_value),
-    totalBeforeVat: toNumber(payload.total_before_vat),
-    totalExceptVat: toNumber(payload.total_except_vat),
-    totalAfterVat: toNumber(payload.total_after_vat, totalAmount),
-    totalVatValue: toNumber(payload.total_vat_value),
+    totalValue: totals.total_value,
+    totalBeforeVat: totals.total_before_vat,
+    totalExceptVat: totals.total_except_vat,
+    totalAfterVat: totals.total_after_vat,
+    totalVatValue: totals.total_vat_value,
     totalAmount,
-    totalDiscount: toNumber(payload.total_discount),
+    totalDiscount: totals.total_discount,
     discountWord: String(payload.discount_word ?? ''),
     saleType,
     taxType,
@@ -512,7 +465,8 @@ function normalizedPUSaveFields(payload) {
     totalAfterRounded,
     whFrom: safeText(payload.wh_from),
     locationFrom: safeText(payload.location_from),
-    items: normalizeArray(payload.items).map(normalizePUItem),
+    items: pricing.items,
+    pricingOption: option,
     docList: normalizeArray(payload.doc_list),
     payments: normalizeArray(payload.payment_detail),
     isCashSale: saleType === 1 || saleType === 3,
@@ -658,7 +612,9 @@ async function insertPUDetails(client, docNo, fields) {
     // ตรงกับ C# — ของแถม (is_permium=1) ทั้งคู่เป็น 0
     const unitPrice = toNumber(item.price);
     const lineQty = toNumber(item.qty);
-    const sumOfCost = isPermium ? 0 : roundMoney(unitPrice * lineQty);
+    const sumOfCost = isPermium ? 0 : roundERP(
+      unitPrice * lineQty, fields.pricingOption.amountPoint, fields.pricingOption.roundType,
+    );
     await client.query(
       `INSERT INTO ic_trans_detail
         (trans_type, trans_flag, doc_date, doc_time, doc_no, cust_code, inquiry_type,
@@ -843,7 +799,10 @@ async function insertPUCashbook(client, docNo, fields) {
 }
 
 async function savePUDocTransaction(client, payload, mode) {
-  const fields = normalizedPUSaveFields(payload);
+  const fields = normalizedPUSaveFields(payload, await loadPUPricingOptions(client));
+  if (fields.isCashSale && fields.cashAmount + fields.transferAmount + 0.000001 < fields.totalAfterRounded) {
+    throw new Error(`cash PU payment is not enough: required ${fields.totalAfterRounded}`);
+  }
   const supplier = await supplierTaxInfo(client, fields);
   let docNo = safeText(payload.doc_no);
 
@@ -1019,6 +978,10 @@ async function handlePUSave(req, res, mode) {
 
   const client = await pool.connect();
   try {
+    if (mode === 'update') {
+      const linked = await client.query('SELECT 1 FROM sml_staff_sale_claim WHERE pu_doc_no=$1 LIMIT 1', [safeText(payload.doc_no)]);
+      if (linked.rows.length) throw new Error('claim purchase document cannot be edited independently');
+    }
     const plan = await validatePUSavePlan(client, { mode, payload });
     if (!plan.can_prepare_save) {
       return res.status(400).json({ success: false, msg: 'PU save validation failed', data: plan });
@@ -1192,10 +1155,12 @@ router.post('/getPurchaseLatestItemPrices', async (req, res) => {
 router.post('/checkPurchasePriceIncrease', async (req, res) => {
   const custCode = safeText(req.body?.cust_code || req.body?.ap_cust_code);
   const excludeDocNo = safeText(req.body?.exclude_doc_no || req.body?.doc_no);
-  const items = normalizePurchasePriceCheckItems(req.body?.items);
-  if (!items.length) return successResponse(res, []);
-
   try {
+    const optionRes = await query(`SELECT item_amount_decimal, item_price_decimal,
+      discout_type, discount_vat_type, discount_step_round_off,
+      calc_item_price_discount, round_type FROM erp_option LIMIT 1`);
+    const items = normalizePurchasePriceCheckItems(req.body?.items, optionRes.rows[0] || {});
+    if (!items.length) return successResponse(res, []);
     const result = await query(
       `WITH requested AS (
          SELECT DISTINCT ON (line_id)
@@ -1814,3 +1779,5 @@ router.get('/getPurchasePrintForms', async (req, res) => {
 });
 
 module.exports = router;
+module.exports.savePUDocTransaction = savePUDocTransaction;
+module.exports.calcAfterDiscount = calcAfterDiscount;

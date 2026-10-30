@@ -261,6 +261,7 @@ router.post('/clearBasket', async (req, res) => {
   try {
     await withTransaction(async (client) => {
       await assertBasketAccess(client.query.bind(client), userCode, basket_id, 'can_edit_basket');
+      await client.query(`DELETE FROM sml_staff_cart_claim WHERE cart_key = 'BASKET-' || $1::text`, [basket_id]);
       await client.query(
         `DELETE FROM staff_cart_order WHERE cust_code = 'BASKET-' || $1::text`,
         [basket_id],

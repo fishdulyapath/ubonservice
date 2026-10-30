@@ -536,10 +536,21 @@ router.get('/getcartitemlist', async (req, res) => {
     `;
     const dataParams = [...params, pageSize, offset];
     const dataResult = await query(dataSql, dataParams);
+    const claimGuids = dataResult.rows.map((row) => row.guid_code).filter(Boolean);
+    const claimResult = claimGuids.length
+      ? await query(`SELECT sale_guid,line_no,claim_item_code,unit_code,qty,quoted_unit_price,quoted_amount
+          FROM sml_staff_cart_claim WHERE cart_key=$1 AND sale_guid=ANY($2::text[]) ORDER BY sale_guid,line_no`, [custCode, claimGuids])
+      : { rows: [] };
+    const claimsByGuid = new Map();
+    for (const claim of claimResult.rows) {
+      if (!claimsByGuid.has(claim.sale_guid)) claimsByGuid.set(claim.sale_guid, []);
+      claimsByGuid.get(claim.sale_guid).push(claim);
+    }
 
     const data = dataResult.rows.map(r => ({
       cust_code: r.cust_code,
       guid_code: r.guid_code,
+      claim_items: claimsByGuid.get(r.guid_code) || [],
       item_code: r.item_code,
       item_name: r.item_name,
       unit_code: r.unit_code,
@@ -1063,10 +1074,10 @@ router.get('/deleteItem', async (req, res) => {
   const resp = { success: false };
   try {
     await assertBasketAccessFromCartKey(query, userCode, cust_code, 'can_edit_items');
-    await query(
-      `DELETE FROM staff_cart_order WHERE guid_code = $1 AND cust_code = $2`,
-      [guid_code || '', cust_code || '']
-    );
+    await withTransaction(async (client) => {
+      await client.query('DELETE FROM sml_staff_cart_claim WHERE cart_key=$1 AND sale_guid=$2', [cust_code || '', guid_code || '']);
+      await client.query('DELETE FROM staff_cart_order WHERE guid_code = $1 AND cust_code = $2', [guid_code || '', cust_code || '']);
+    });
     resp.success = true;
     return res.json(resp);
   } catch (ex) {
@@ -1082,10 +1093,10 @@ router.get('/deleteAllItems', async (req, res) => {
   const resp = { success: false };
   try {
     await assertBasketAccessFromCartKey(query, userCode, cust_code, 'can_edit_items');
-    await query(
-      `DELETE FROM staff_cart_order WHERE cust_code = $1`,
-      [cust_code || '']
-    );
+    await withTransaction(async (client) => {
+      await client.query('DELETE FROM sml_staff_cart_claim WHERE cart_key=$1', [cust_code || '']);
+      await client.query('DELETE FROM staff_cart_order WHERE cust_code = $1', [cust_code || '']);
+    });
     resp.success = true;
     return res.json(resp);
   } catch (ex) {

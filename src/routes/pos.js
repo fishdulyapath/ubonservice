@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
 const { query, withTransaction } = require('../db');
+const { cartClaims, quoteClaim, money, applyClaimDiscount, buildClaimPUPayload } = require('../utils/saleClaim');
+const { savePUDocTransaction } = require('./purchase');
 const { calcDiscount, calcVat } = require('../utils/vatHelper');
 const { validateSaleItemsStock } = require('../utils/cartStockValidator');
 const { getEmployeePermissions } = require('../utils/permissions');
@@ -479,7 +481,9 @@ router.get('/getPOSList', async (req, res) => {
 // -- GET /service/v1/getErpOption -------------------------------------------
 router.get('/getErpOption', async (req, res) => {
   try {
-    const result = await query('SELECT vat_type, vat_rate, discout_type FROM erp_option LIMIT 1');
+    const result = await query(`SELECT vat_type, vat_rate, discout_type, discount_vat_type,
+      item_amount_decimal, item_price_decimal, discount_step_round_off,
+      calc_item_price_discount, round_type FROM erp_option LIMIT 1`);
     return res.json({ success: true, data: result.rows[0] || {} });
   } catch (ex) {
     return res.status(500).json({ success: false, msg: ex.message });
@@ -948,6 +952,7 @@ async function handleSaveTrans(req, res, options = {}) {
     let createdSmlPromotionBacklogs = [];
     let appliedSmlPromotionBacklogDeliveries = [];
     let smlPromotionBacklogOnly = false;
+    let claimPurchaseDocNo = '';
     await withTransaction(async (client) => {
       if (basket_id) {
         await assertBasketAccess(client.query.bind(client), user_code || emp_code, basket_id, 'can_save_sale');
@@ -997,6 +1002,13 @@ async function handleSaveTrans(req, res, options = {}) {
       }
 
       if (detailItems.length === 0) {
+        const claimCartKey = basket_id ? `BASKET-${basket_id}` : cust_code;
+        const noDeliveryClaims = await cartClaims(client.query.bind(client), claimCartKey);
+        if (noDeliveryClaims.length) {
+          const err = new Error('claim sale has no deliverable stock; remove claim or adjust sale quantity');
+          err.statusCode = 409;
+          throw err;
+        }
         if (smlPromotionFulfillments.some((row) => row?.pending_detail)) {
           createdSmlPromotionBacklogs = await createSmlPromotionBacklogs(client, smlPromotionFulfillments, {
             docNo: '',
@@ -1035,7 +1047,63 @@ async function handleSaveTrans(req, res, options = {}) {
         docDate: doc_date,
       });
 
-      if (salePremiumFulfillments.length > 0 || smlPromotionFulfillments.length > 0 || detailItems.some((item) => parseInt(item?.sale_premium_backlog_detail_id || 0, 10) > 0 || parseInt(item?.sml_promotion_backlog_detail_id || 0, 10) > 0)) {
+      const claimCartKey = basket_id ? `BASKET-${basket_id}` : cust_code;
+      const persistedClaims = await cartClaims(client.query.bind(client), claimCartKey);
+      const requestClaims = items.flatMap((item) => (Array.isArray(item.claim_items) ? item.claim_items : []).map((claim) => ({
+        sale_guid: String(item.guid_code || ''),
+        claim_item_code: String(claim.claim_item_code || ''),
+        unit_code: String(claim.unit_code || ''),
+        qty: Number(claim.qty),
+        quoted_amount: Number(claim.quoted_amount),
+      })));
+      const claimKey = (row) => `${row.sale_guid}\0${row.claim_item_code}\0${row.unit_code}\0${Number(row.qty)}\0${Number(row.quoted_amount)}`;
+      const savedClaimKeys = persistedClaims.map(claimKey).sort();
+      const requestClaimKeys = requestClaims.map(claimKey).sort();
+      if (requestClaimKeys.length !== savedClaimKeys.length || requestClaimKeys.some((key, index) => key !== savedClaimKeys[index])) {
+        const err = new Error('claim basket changed; review cart again'); err.statusCode = 409; err.claim_price_changed = true; throw err;
+      }
+      if (persistedClaims.length) {
+        const liveRows = await client.query('SELECT guid_code,item_code,unit_code,qty FROM staff_cart_order WHERE cust_code=$1 FOR UPDATE', [claimCartKey]);
+        for (const item of items.filter((row) => Array.isArray(row.claim_items) && row.claim_items.length)) {
+          const live = liveRows.rows.find((row) => row.guid_code === item.guid_code);
+          if (!live || live.item_code !== item.item_code || live.unit_code !== item.unit_code || Number(live.qty) !== Number(item.qty)) {
+            const err = new Error('claim sale cart item changed; review cart again'); err.statusCode = 409; err.claim_price_changed = true; throw err;
+          }
+        }
+      }
+      const saleGuids = new Set(items.map((item) => String(item.guid_code || '')));
+      const claimByGuid = new Map();
+      const claimQuotes = [];
+      for (const claim of persistedClaims) {
+        if (!saleGuids.has(claim.sale_guid)) throw new Error('claim cart item changed; reload basket');
+        const saleItem = items.find((item) => String(item.guid_code || '') === claim.sale_guid);
+        if (!saleItem || String(saleItem.item_type || '0') !== '0') throw new Error('claim requires a normal sale item');
+        const eligible = await client.query('SELECT can_claim FROM sml_staff_claim_item WHERE item_code=$1', [saleItem.item_code]);
+        if (!eligible.rows[0]?.can_claim) throw new Error('sale item no longer accepts claims');
+        const quote = await quoteClaim(client.query.bind(client), {
+          item_code: claim.claim_item_code, unit_code: claim.unit_code, qty: claim.qty,
+          cust_code, sale_type: inquiry_type, vat_type, vat_rate,
+        });
+        if (Math.abs(quote.amount - Number(claim.quoted_amount)) > 0.005) {
+          const err = new Error('claim price changed; review cart and payment again');
+          err.statusCode = 409;
+          err.claim_price_changed = true;
+          throw err;
+        }
+        if (!claimByGuid.has(claim.sale_guid)) claimByGuid.set(claim.sale_guid, []);
+        claimByGuid.get(claim.sale_guid).push(quote);
+        claimQuotes.push({ ...quote, sale_guid: claim.sale_guid });
+      }
+      for (const [guid, quotes] of claimByGuid) {
+        const line = detailItems.find((item) => String(item.guid_code || '') === guid);
+        const original = items.find((item) => String(item.guid_code || '') === guid);
+        if (!line || Number(line.qty) !== Number(original.qty)) throw new Error('claim sale quantity changed; review cart again');
+        const claimAmount = money(quotes.reduce((sum, row) => sum + row.amount, 0));
+        try { applyClaimDiscount(line, original, claimAmount); }
+        catch (error) { error.statusCode = 409; throw error; }
+      }
+
+      if (claimQuotes.length > 0 || salePremiumFulfillments.length > 0 || smlPromotionFulfillments.length > 0 || detailItems.some((item) => parseInt(item?.sale_premium_backlog_detail_id || 0, 10) > 0 || parseInt(item?.sml_promotion_backlog_detail_id || 0, 10) > 0)) {
         total_value_dbl = roundMoney(detailItems.reduce((sum, item) => sum + roundMoney(item.sum_amount ?? (toNumber(item.qty) * toNumber(item.price))), 0));
         total_except_vat_dbl = roundMoney(detailItems
           .filter((item) => Number(item.tax_type ?? 0) === 1)
@@ -1057,6 +1125,13 @@ async function handleSaveTrans(req, res, options = {}) {
           + deposit_amount_dbl
         );
         money_change = Math.max(0, roundMoney(total_amount_pay - total_net_amount_dbl));
+      }
+
+      if (claimQuotes.length > 0 && Math.abs(Number(obj.total_amount) - total_amount) > 0.01) {
+        const err = new Error('claim total changed; review payment again');
+        err.statusCode = 409;
+        err.claim_price_changed = true;
+        throw err;
       }
 
       const stockValidation = await validateSaleItemsStock(client, detailItems, {
@@ -1273,6 +1348,7 @@ async function handleSaveTrans(req, res, options = {}) {
       };
 
       let detailLineNumber = 0;
+      const claimSaleLines = new Map();
       for (const it of detailItems) {
         const itQty = parseFloat(it.qty || 0);
         const itPrice = parseFloat(it.price || 0);
@@ -1281,6 +1357,7 @@ async function handleSaveTrans(req, res, options = {}) {
         const itemType = String(it.item_type ?? '0');
 
         if (itemType !== '3') {
+          if (claimByGuid.has(String(it.guid_code || ''))) claimSaleLines.set(String(it.guid_code), detailLineNumber);
           await insertDetailLine({
             item: it,
             qty: itQty,
@@ -1339,6 +1416,29 @@ async function handleSaveTrans(req, res, options = {}) {
             discountAmount: 0,
           });
         }
+      }
+
+      if (claimQuotes.length > 0) {
+        const branch = await client.query('SELECT wh_code,shelf_code,pu_doc_format_code FROM sml_staff_claim_branch WHERE branch_code=$1', [branch_code]);
+        if (!branch.rows[0]) throw new Error(`claim warehouse is not configured for branch ${branch_code}`);
+        const supplier = await client.query('SELECT 1 FROM ap_supplier WHERE code=$1', ['AP0186']);
+        if (!supplier.rows.length) throw new Error('claim supplier AP0186 not found');
+        const pu = await savePUDocTransaction(client, buildClaimPUPayload({
+          claimQuotes, branch: branch.rows[0], docNo: doc_no, docDate: doc_date,
+          docTime: doc_time, branchCode: branch_code, empCode: emp_code,
+          creatorCode: creator_code,
+        }), 'create');
+        claimPurchaseDocNo = pu.doc_no;
+        for (let i = 0; i < claimQuotes.length; i++) {
+          const row = claimQuotes[i];
+          await client.query(`INSERT INTO sml_staff_sale_claim
+            (sale_doc_no,sale_line_no,pu_doc_no,pu_line_no,claim_item_code,unit_code,qty,unit_price,amount)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+            [doc_no, claimSaleLines.get(row.sale_guid), claimPurchaseDocNo, i, row.item_code, row.unit_code, row.qty, row.unit_price, row.amount]);
+        }
+        const saleRemark = [String(remark).trim(), `รับสินค้าเคลม ใบซื้อ/ตั้งหนี้ ${claimPurchaseDocNo}`]
+          .filter(Boolean).join('\n');
+        await client.query('UPDATE ic_trans SET remark=$2 WHERE doc_no=$1 AND trans_flag=44', [doc_no, saleRemark]);
       }
 
       for (let i = 0; false && i < items.length; i++) {
@@ -1519,6 +1619,7 @@ async function handleSaveTrans(req, res, options = {}) {
       const cart_key = basket_id ? `BASKET-${basket_id}` : cust_code;
       const staffCartTable = await client.query("SELECT to_regclass('public.staff_cart_order') AS table_name");
       if (staffCartTable.rows[0]?.table_name) {
+        await client.query('DELETE FROM sml_staff_cart_claim WHERE cart_key=$1', [cart_key]);
         await client.query('DELETE FROM staff_cart_order WHERE cust_code=$1', [cart_key]);
       }
 
@@ -1553,6 +1654,7 @@ async function handleSaveTrans(req, res, options = {}) {
       sale_premium_backlog_deliveries: appliedPremiumBacklogDeliveries,
       sml_promotion_backlogs: createdSmlPromotionBacklogs,
       sml_promotion_backlog_deliveries: appliedSmlPromotionBacklogDeliveries,
+      claim_pu_doc_no: claimPurchaseDocNo,
       msg: 'success',
     });
   } catch (ex) {
@@ -1579,7 +1681,8 @@ async function handleSaveTrans(req, res, options = {}) {
     if (msg.includes('advance/deposit')) {
       return res.status(400).json({ success: false, msg });
     }
-    return res.status(500).json({ success: false, msg });
+    if (ex.claim_price_changed) return res.status(409).json({ success: false, msg, claim_price_changed: true });
+    return res.status(ex.statusCode || 500).json({ success: false, msg });
   }
 }
 
@@ -1781,7 +1884,7 @@ router.get('/getDocSaleHistoryDetail', async (req, res) => {
   const { doc_no = '' } = req.query;
   if (!doc_no) return res.status(400).json({ success: false, msg: 'doc_no is required' });
   try {
-    const [headerRes, itemsRes, promotionTableRes] = await Promise.all([
+    const [headerRes, itemsRes, promotionTableRes, claimRes] = await Promise.all([
       query(
         `SELECT t.doc_no, t.doc_date, t.doc_time, t.inquiry_type, t.vat_type, t.vat_rate,
             COALESCE(t.doc_format_code,'') AS doc_format_code,
@@ -1820,7 +1923,7 @@ router.get('/getDocSaleHistoryDetail', async (req, res) => {
         [doc_no]
       ),
       query(
-        `SELECT item_code, item_name, unit_code, qty, price, sum_amount,
+        `SELECT line_number, item_code, item_name, unit_code, qty, price, sum_amount,
           COALESCE(price_exclude_vat, price, 0) AS price_exclude_vat,
           COALESCE(sum_amount_exclude_vat, sum_amount, 0) AS sum_amount_exclude_vat,
           COALESCE(total_vat_value,0) AS total_vat_value,
@@ -1837,6 +1940,10 @@ router.get('/getDocSaleHistoryDetail', async (req, res) => {
         `SELECT to_regclass('public.ic_trans_detail_promotion') IS NOT NULL AS table_exists`,
         []
       ),
+      query(`SELECT c.sale_line_no,c.pu_doc_no,c.claim_item_code,c.unit_code,c.qty,c.unit_price,c.amount,
+              COALESCE(i.name_1,'') AS claim_item_name
+             FROM sml_staff_sale_claim c LEFT JOIN ic_inventory i ON i.code=c.claim_item_code
+            WHERE c.sale_doc_no=$1 ORDER BY c.sale_line_no,c.pu_line_no`, [doc_no]),
     ]);
     let promotions = [];
     if (promotionTableRes.rows[0]?.table_exists) {
@@ -1854,7 +1961,8 @@ router.get('/getDocSaleHistoryDetail', async (req, res) => {
       success: true,
       data: {
         header: h,
-        items: itemsRes.rows,
+        items: itemsRes.rows.map((item) => ({ ...item, claim_items: claimRes.rows.filter((claim) => Number(claim.sale_line_no) === Number(item.line_number)) })),
+        claim_pu_doc_no: claimRes.rows[0]?.pu_doc_no || '',
         promotions,
         promotion_detail: promotions,
       },
@@ -1929,6 +2037,38 @@ router.post('/sales/cancel', async (req, res) => {
         throw err;
       }
 
+      const claimRows = await client.query(
+        `SELECT pu_doc_no FROM sml_staff_sale_claim WHERE sale_doc_no=$1 FOR UPDATE`, [docNo],
+      );
+      const claimPuDocNos = [...new Set(claimRows.rows.map((row) => row.pu_doc_no))];
+      for (const puDocNo of claimPuDocNos) {
+        const pu = await client.query(`SELECT doc_no,doc_date,COALESCE(last_status,0) AS last_status
+          FROM ic_trans WHERE doc_no=$1 AND trans_flag=12 FOR UPDATE`, [puDocNo]);
+        if (!pu.rows[0] || Number(pu.rows[0].last_status) !== 0) {
+          const err = new Error(`linked claim PU is unavailable: ${puDocNo}`); err.status = 409; throw err;
+        }
+        const used = await client.query(`SELECT 1 FROM ap_ar_trans_detail
+          WHERE billing_no=$1 AND doc_no<>$1 AND COALESCE(last_status,0)=0 LIMIT 1`, [puDocNo]);
+        if (used.rows.length) {
+          const err = new Error(`claim PU has payment/reference and cannot be cancelled: ${puDocNo}`); err.status = 409; throw err;
+        }
+        const claimItems = await client.query(`SELECT item_code,wh_code,shelf_code,SUM(qty * COALESCE(NULLIF(stand_value,0),1) / COALESCE(NULLIF(divide_value,0),1)) AS base_qty
+          FROM ic_trans_detail WHERE doc_no=$1 AND trans_flag=12 GROUP BY item_code,wh_code,shelf_code`, [puDocNo]);
+        for (const item of claimItems.rows) {
+          const moved = await client.query(`SELECT 1 FROM ic_trans_detail d JOIN ic_trans t ON t.doc_no=d.doc_no AND t.trans_flag=d.trans_flag
+            WHERE d.item_code=$1 AND d.wh_code=$2 AND d.shelf_code=$3 AND d.doc_no<>$4
+              AND d.doc_date >= $5::date AND COALESCE(t.last_status,0)=0 AND COALESCE(d.last_status,0)=0
+              AND d.trans_flag<>12 LIMIT 1`,
+            [item.item_code, item.wh_code, item.shelf_code, puDocNo, pu.rows[0].doc_date]);
+          const stock = await client.query(`SELECT COALESCE(SUM(balance_qty),0) AS balance_qty
+            FROM sml_ic_function_stock_balance_warehouse_location('NOW()', $1, $2, $3)`,
+            [item.item_code, item.wh_code, item.shelf_code]);
+          if (moved.rows.length || Number(stock.rows[0].balance_qty) + 0.0001 < Number(item.base_qty)) {
+            const err = new Error(`claim stock moved; linked PU cannot be cancelled: ${puDocNo}`); err.status = 409; throw err;
+          }
+        }
+      }
+
       let tigerCancelStatus = '';
       let tigerCancelData = null;
       const hasTigerPending = Number(sale.send_sms || 0) === 1 && safeText(sale.tiger_order_id);
@@ -1987,6 +2127,13 @@ router.post('/sales/cancel', async (req, res) => {
         'UPDATE cb_trans_detail SET last_status = 1 WHERE doc_no = $1',
         [docNo],
       );
+      for (const puDocNo of claimPuDocNos) {
+        await client.query('UPDATE ic_trans SET last_status=1 WHERE doc_no=$1 AND trans_flag=12', [puDocNo]);
+        await client.query('UPDATE ic_trans_detail SET last_status=1 WHERE doc_no=$1 AND trans_flag=12', [puDocNo]);
+        await client.query('DELETE FROM gl_journal_vat_buy WHERE doc_no=$1 AND trans_flag=12', [puDocNo]);
+        await client.query(`INSERT INTO process (process_name,wherein)
+          SELECT DISTINCT 'IC',item_code FROM ic_trans_detail WHERE doc_no=$1 AND trans_flag=12`, [puDocNo]);
+      }
 
       if (hasTigerPending) {
         const meta = parseTigerMeta(sale.tiger_status_note);
@@ -2013,7 +2160,10 @@ router.post('/sales/cancel', async (req, res) => {
          WHERE doc_no = $1 AND trans_flag = 44 AND COALESCE(item_code,'') <> ''`,
         [docNo],
       );
-      await refreshSaleInventoryBalanceQty(client, itemRes.rows.map((row) => row.item_code));
+      const claimItemCodes = claimRows.rows.length
+        ? (await client.query('SELECT DISTINCT claim_item_code FROM sml_staff_sale_claim WHERE sale_doc_no=$1', [docNo])).rows.map((row) => row.claim_item_code)
+        : [];
+      await refreshSaleInventoryBalanceQty(client, [...itemRes.rows.map((row) => row.item_code), ...claimItemCodes]);
 
       return {
         doc_no: docNo,

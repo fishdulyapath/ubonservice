@@ -61,6 +61,11 @@ function calcFormulaPrice(qty, price, formula) {
 }
 
 
+function normalizePriceQuantity(qty) {
+  const value = Number.parseFloat(qty);
+  return Number.isFinite(value) && value > 0 ? value : 1;
+}
+
 async function getProductPriceLocalx(
   icCode,
   unitCode,
@@ -74,7 +79,7 @@ async function getProductPriceLocalx(
   currencyCode = ''
 ) {
   const today = docDate || todayLocalDate();
-  const qtyVal = (!qty || qty === '0' || qty === 0) ? 1 : (parseInt(qty) || 1);
+  const qtyVal = normalizePriceQuantity(qty);
   const vatTypeVal = parseInt(vatType, 10);
   const isVatExcluded = vatTypeVal === 0;
   const saleTypeVal = parseInt(saleType, 10);
@@ -500,4 +505,4 @@ async function getProductPriceLocalx(
   }
 }
 
-module.exports = { getProductPriceLocalx, calcFormulaPrice };
+module.exports = { getProductPriceLocalx, calcFormulaPrice, normalizePriceQuantity };

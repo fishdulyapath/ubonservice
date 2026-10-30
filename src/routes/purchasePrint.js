@@ -26,9 +26,9 @@ function lowerCodes(codes) {
   return codes.map((code) => code.toLowerCase());
 }
 
-async function loadPurchaseDocument(docNo) {
+async function loadPurchaseDocument(docNo, dbQuery = query) {
   const [headerRes, companyRes, detailsRes] = await Promise.all([
-    query(
+    dbQuery(
       `SELECT pu.*,
           COALESCE(df.name_1,'') AS doc_format_name,
           COALESCE(df.form_code,'') AS form_code,
@@ -50,8 +50,8 @@ async function loadPurchaseDocument(docNo) {
        LIMIT 1`,
       [docNo, PU_TRANS_FLAG],
     ),
-    query('SELECT * FROM erp_company_profile ORDER BY roworder LIMIT 1'),
-    query(
+    dbQuery('SELECT * FROM erp_company_profile ORDER BY roworder LIMIT 1'),
+    dbQuery(
       `SELECT d.*,
           COALESCE(u.name_1, d.unit_code, '') AS unit_name,
           COALESCE(d.ref_doc_no,'') AS doc_ref,
@@ -73,7 +73,7 @@ async function loadPurchaseDocument(docNo) {
   company.tax_text = company.tax_number ? `หมายเลขประจำตัวผู้เสียภาษี ${company.tax_number}` : '';
   company.telephone_text = company.telephone_number ? `โทร. ${company.telephone_number}` : '';
 
-  const poRefsRes = await query(
+  const poRefsRes = await dbQuery(
     `SELECT string_agg(billing_no, ',' ORDER BY billing_no) AS po_doc_list
      FROM ap_ar_trans_detail
      WHERE doc_no = $1 AND trans_flag = $2`,
@@ -128,8 +128,8 @@ async function createPrintLog(docNo, userCode) {
   });
 }
 
-async function loadPrintFormOptions(docNo) {
-  const docRes = await query(
+async function loadPrintFormOptions(docNo, dbQuery = query) {
+  const docRes = await dbQuery(
     `SELECT pu.doc_no, COALESCE(pu.doc_format_code,'') AS doc_format_code,
         COALESCE(df.name_1,'') AS doc_format_name,
         COALESCE(df.form_code,'') AS form_code
@@ -146,7 +146,7 @@ async function loadPrintFormOptions(docNo) {
   const codes = uniqueCodes(splitFormCodes(doc.form_code));
   let formRows = [];
   if (codes.length) {
-    const result = await query(
+    const result = await dbQuery(
       `SELECT formcode, formname
        FROM formdesign
        WHERE lower(formcode) = ANY($1::text[])`,
@@ -175,9 +175,9 @@ async function loadPrintFormOptions(docNo) {
   };
 }
 
-async function loadFormDesignRows(formCodes) {
+async function loadFormDesignRows(formCodes, dbQuery = query) {
   if (!formCodes.length) return [];
-  const result = await query(
+  const result = await dbQuery(
     `SELECT formcode, formname, formdesigntext, formbackground
      FROM formdesign
      WHERE lower(formcode) = ANY($1::text[])`,
@@ -229,3 +229,6 @@ router.get('/purchase-print/render', async (req, res) => {
 });
 
 module.exports = router;
+module.exports.loadPurchaseDocument = loadPurchaseDocument;
+module.exports.loadPrintFormOptions = loadPrintFormOptions;
+module.exports.loadFormDesignRows = loadFormDesignRows;

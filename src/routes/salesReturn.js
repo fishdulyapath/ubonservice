@@ -1070,6 +1070,13 @@ async function lockAndBuildReturnLines(client, fields) {
     const itemCode = safeText(item.item_code);
     const refDocNo = safeText(item.ref_doc_no);
     const refRow = toInt(item.ref_row, -1);
+    if (refDocNo && refRow >= 0) {
+      const claimed = await client.query('SELECT 1 FROM sml_staff_sale_claim WHERE sale_doc_no=$1 AND sale_line_no=$2 LIMIT 1', [refDocNo, refRow]);
+      if (claimed.rows.length) {
+        errors.push(`sale item with claim cannot be returned: ${refDocNo} row ${refRow}`);
+        continue;
+      }
+    }
     const returnQty = toNumber(item.qty ?? item.return_qty);
     if (!itemCode || !refDocNo || refRow < 0 || returnQty <= 0) {
       errors.push(`invalid return item row: ${index + 1}`);

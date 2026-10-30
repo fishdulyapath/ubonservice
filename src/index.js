@@ -33,6 +33,7 @@ const advancePaymentRoutes = require('./routes/advancePayment');
 const arBillingRoutes = require('./routes/arBilling');
 const arDebtPaymentRoutes = require('./routes/arDebtPayment');
 const otherExpenseRoutes = require('./routes/otherExpense');
+const claimRoutes = require('./routes/claim');
 
 const app = express();
 const PORT = process.env.PORT || 47300;
@@ -85,6 +86,7 @@ app.use('/service/v1', advancePaymentRoutes);
 app.use('/service/v1', arBillingRoutes);
 app.use('/service/v1', arDebtPaymentRoutes);
 app.use('/service/v1', otherExpenseRoutes);
+app.use('/service/v1', claimRoutes);
 
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
