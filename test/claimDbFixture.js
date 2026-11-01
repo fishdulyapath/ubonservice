@@ -24,7 +24,7 @@ async function main() {
       WHERE NOT EXISTS (SELECT 1 FROM ap_supplier WHERE code='AP0186')`);
     await client.query(`INSERT INTO sml_staff_claim_branch
       (branch_code,wh_code,shelf_code,pu_doc_format_code,updated_by)
-      VALUES ('0000','WHC03','WHC03','PU','CODEX')`);
+      VALUES ('','WHC03','WHC03','PU','CODEX')`);
     await client.query(`INSERT INTO sml_staff_claim_item (item_code,can_claim,is_claim_item,updated_by)
       VALUES ('01-0048',TRUE,FALSE,'CODEX'),('01-0005',FALSE,TRUE,'CODEX')`);
     await client.query(`INSERT INTO pos_basket

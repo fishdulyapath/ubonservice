@@ -16,7 +16,7 @@ async function call(path, body) {
 async function main() {
   const saleProduct = await call('/claim/product?item_code=01-0048');
   const claimProduct = await call('/claim/product?item_code=01-0005');
-  const branch = await call('/claim/branch?branch_code=0000');
+  const branch = await call('/claim/branch');
   assert.equal(saleProduct.data.can_claim, true);
   assert.equal(claimProduct.data.is_claim_item, true);
   assert.equal(branch.data.wh_code, 'WHC03');

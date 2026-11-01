@@ -1419,13 +1419,13 @@ async function handleSaveTrans(req, res, options = {}) {
       }
 
       if (claimQuotes.length > 0) {
-        const branch = await client.query('SELECT wh_code,shelf_code,pu_doc_format_code FROM sml_staff_claim_branch WHERE branch_code=$1', [branch_code]);
-        if (!branch.rows[0]) throw new Error(`claim warehouse is not configured for branch ${branch_code}`);
+        const branch = await client.query('SELECT wh_code,shelf_code,pu_doc_format_code FROM sml_staff_claim_branch WHERE branch_code=$1', ['']);
+        if (!branch.rows[0]) throw new Error('claim warehouse and PU format are not configured');
         const supplier = await client.query('SELECT 1 FROM ap_supplier WHERE code=$1', ['AP0186']);
         if (!supplier.rows.length) throw new Error('claim supplier AP0186 not found');
         const pu = await savePUDocTransaction(client, buildClaimPUPayload({
           claimQuotes, branch: branch.rows[0], docNo: doc_no, docDate: doc_date,
-          docTime: doc_time, branchCode: branch_code, empCode: emp_code,
+          docTime: doc_time, branchCode: '', empCode: emp_code,
           creatorCode: creator_code,
         }), 'create');
         claimPurchaseDocNo = pu.doc_no;

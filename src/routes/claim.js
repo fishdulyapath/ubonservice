@@ -36,16 +36,16 @@ router.post('/claim/product', async (req, res) => {
 
 router.get('/claim/branch', async (req, res) => {
   try {
-    const result = await query('SELECT * FROM sml_staff_claim_branch WHERE branch_code=$1', [str(req.query.branch_code)]);
+    const result = await query('SELECT * FROM sml_staff_claim_branch WHERE branch_code=$1', ['']);
     res.json({ success: true, data: result.rows[0] || null });
   } catch (ex) { errorResponse(res, ex); }
 });
 
 router.post('/claim/branch', async (req, res) => {
   try {
-    const { branch_code, wh_code, shelf_code, pu_doc_format_code, user_code } = req.body || {};
+    const { wh_code, shelf_code, pu_doc_format_code, user_code } = req.body || {};
     if (!(await canManage(query, str(user_code)))) return res.status(403).json({ success: false, msg: 'permission denied' });
-    if (!str(branch_code) || !str(wh_code) || !str(shelf_code) || !str(pu_doc_format_code)) throw new Error('branch, warehouse, shelf and PU format are required');
+    if (!str(wh_code) || !str(shelf_code) || !str(pu_doc_format_code)) throw new Error('warehouse, shelf and PU format are required');
     const checks = await Promise.all([
       query('SELECT 1 FROM ic_warehouse WHERE code=$1', [str(wh_code)]),
       query('SELECT 1 FROM ic_shelf WHERE whcode=$1 AND code=$2', [str(wh_code), str(shelf_code)]),
@@ -54,7 +54,7 @@ router.post('/claim/branch', async (req, res) => {
     if (checks.some((row) => !row.rows.length)) throw new Error('invalid warehouse, shelf or PU format');
     await query(`INSERT INTO sml_staff_claim_branch (branch_code,wh_code,shelf_code,pu_doc_format_code,updated_by)
       VALUES ($1,$2,$3,$4,$5) ON CONFLICT (branch_code) DO UPDATE SET wh_code=$2,shelf_code=$3,pu_doc_format_code=$4,updated_by=$5,updated_at=NOW()`,
-      [str(branch_code), str(wh_code), str(shelf_code), str(pu_doc_format_code), str(user_code)]);
+      ['', str(wh_code), str(shelf_code), str(pu_doc_format_code), str(user_code)]);
     res.json({ success: true });
   } catch (ex) { errorResponse(res, ex); }
 });
