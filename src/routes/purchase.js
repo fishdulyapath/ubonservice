@@ -23,6 +23,19 @@ function normalizeDate(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : '';
 }
 
+async function resolvePUCreditDate(queryFn, docDate, creditDay) {
+  const result = await queryFn(
+    `SELECT CASE WHEN COALESCE(o.use_credit_pay_bill_calc,0) = 1 AND c.day_to_due IS NOT NULL
+       THEN (date_trunc('month',$1::date)::date + COALESCE(c.month_to_due,0)::int * interval '1 month'
+         + (COALESCE(c.day_to_due,1)::int - 1) * interval '1 day')::date
+       ELSE $1::date + $2::int END::text AS credit_date
+     FROM (SELECT COALESCE((SELECT use_credit_pay_bill_calc FROM erp_option LIMIT 1),0) AS use_credit_pay_bill_calc) o
+     LEFT JOIN ar_credit_pay_bill c ON c.credit_day=$2::int`,
+    [docDate, creditDay],
+  );
+  return result.rows[0]?.credit_date || docDate;
+}
+
 function splitFormCodes(value) {
   return String(value || '')
     .split(',')
@@ -38,6 +51,31 @@ function uniqueCodes(codes) {
     seen.add(key);
     return true;
   });
+}
+
+async function loadPUUnitMap(client, items) {
+  const codes = uniqueCodes(items.map((item) => safeText(item?.item_code)).filter(Boolean));
+  if (!codes.length) return new Map();
+  const result = await client.query(
+    `SELECT i.code AS item_code,
+       COALESCE(NULLIF(u.code,''), NULLIF(i.unit_standard,''), NULLIF(i.unit_cost,'')) AS unit_code,
+       COALESCE(u.stand_value,i.unit_standard_stand_value,1) AS stand_value,
+       COALESCE(u.divide_value,i.unit_standard_divide_value,1) AS divide_value
+     FROM ic_inventory i LEFT JOIN ic_unit_use u ON u.ic_code=i.code
+     WHERE i.code=ANY($1::text[])`, [codes],
+  );
+  return new Map(result.rows.map((row) => [`${row.item_code}::${row.unit_code}`, row]));
+}
+
+async function loadPOUnitMap(client, items) {
+  const refs = uniqueCodes(items.map((item) => safeText(item?.ref_doc_no || item?.doc_no)).filter(Boolean));
+  if (!refs.length) return new Map();
+  const result = await client.query(
+    `SELECT doc_no,item_code,unit_code,stand_value,divide_value
+     FROM ic_trans_detail WHERE trans_flag=$1 AND doc_no=ANY($2::text[])`,
+    [PO_TRANS_FLAG, refs],
+  );
+  return new Map(result.rows.map((row) => [`${row.doc_no}::${row.item_code}::${row.unit_code}`, row]));
 }
 
 function lowerCodes(codes) {
@@ -217,6 +255,8 @@ async function validatePUSavePlan(client, body) {
   const warnings = [];
 
   const docDate = normalizeDate(payload.doc_date);
+  const creditDay = Number(payload.credit_day ?? 0);
+  const creditDate = normalizeDate(payload.credit_date);
   const docNo = String(payload.doc_no || '').trim();
   const docFormatCode = String(payload.doc_format_code || '').trim();
   const supplierCode = String(payload.cust_code || payload.ap_cust_code || '').trim();
@@ -234,6 +274,8 @@ async function validatePUSavePlan(client, body) {
 
   if (mode === 'update' && !docNo) errors.push('doc_no is required for update');
   if (!docDate) errors.push('doc_date is required as YYYY-MM-DD');
+  if (!Number.isInteger(creditDay)) errors.push('credit_day must be an integer');
+  if (payload.credit_date && !creditDate) errors.push('credit_date is required as YYYY-MM-DD');
   if (!docTime) warnings.push('doc_time is empty; save should send current document time');
   if (!supplierCode) errors.push('cust_code is required');
   if (!docFormatCode && mode === 'create') errors.push('doc_format_code is required for PU create');
@@ -270,6 +312,20 @@ async function validatePUSavePlan(client, body) {
   if (missingShelfRows.length) errors.push(`item shelf_code is required: ${missingShelfRows.join(', ')}`);
   if (recalculatedAmountRows.length) {
     warnings.push(`line discount_amount/sum_amount will be recalculated on save: ${recalculatedAmountRows.join(', ')}`);
+  }
+  const unitMap = await loadPUUnitMap(client, items);
+  const invalidUnits = items.map((item, index) => {
+    if (safeText(item?.ref_doc_no || item?.doc_no)) return null;
+    return unitMap.has(`${safeText(item?.item_code)}::${safeText(item?.unit_code)}`) ? null : index + 1;
+  }).filter(Boolean);
+  if (invalidUnits.length) errors.push(`unit_code is not in item master: ${invalidUnits.join(', ')}`);
+  const poUnits = await loadPOUnitMap(client, items);
+  if (items.some((item) => safeText(item?.ref_doc_no || item?.doc_no))) {
+    const invalidPoUnits = items.map((item, index) => {
+      const ref = safeText(item?.ref_doc_no || item?.doc_no);
+      return ref && !poUnits.has(`${ref}::${safeText(item?.item_code)}::${safeText(item?.unit_code)}`) ? index + 1 : null;
+    }).filter(Boolean);
+    if (invalidPoUnits.length) errors.push(`item unit_code does not match PO: ${invalidPoUnits.join(', ')}`);
   }
   if (freeItemRows.length) {
     warnings.push(`free/bonus items (is_permium=1): lines ${freeItemRows.join(', ')}`);
@@ -418,6 +474,8 @@ async function validatePUSavePlan(client, body) {
 
 function normalizedPUSaveFields(payload, optionRow = {}) {
   const docDate = normalizeDate(payload.doc_date);
+  const creditDay = toInt(payload.credit_day, 0);
+  const creditDate = normalizeDate(payload.credit_date) || docDate;
   const taxDocDate = normalizeDate(payload.tax_doc_date) || docDate;
   const docRefDate = normalizeDate(payload.doc_ref_date);
   const saleType = toInt(payload.sale_type ?? payload.inquiry_type, 0);
@@ -433,6 +491,8 @@ function normalizedPUSaveFields(payload, optionRow = {}) {
 
   return {
     docDate,
+    creditDay,
+    creditDate,
     docTime: safeText(payload.doc_time),
     docFormatCode: safeText(payload.doc_format_code),
     custCode: safeText(payload.cust_code || payload.ap_cust_code),
@@ -711,6 +771,8 @@ async function insertOrUpdatePUGL(client, docNo, fields, supplier, mode) {
 async function insertPULog(client, docNo, fields, mode) {
   const data1 = logXml({
     doc_date: fields.docDate,
+    credit_day: fields.creditDay,
+    credit_date: fields.creditDate,
     doc_time: fields.docTime,
     doc_no: docNo,
     doc_format_code: fields.docFormatCode,
@@ -800,6 +862,27 @@ async function insertPUCashbook(client, docNo, fields) {
 
 async function savePUDocTransaction(client, payload, mode) {
   const fields = normalizedPUSaveFields(payload, await loadPUPricingOptions(client));
+  if (!normalizeDate(payload.credit_date) && payload.credit_day != null) {
+    fields.creditDate = await resolvePUCreditDate(client.query.bind(client), fields.docDate, fields.creditDay);
+  }
+  const unitMap = await loadPUUnitMap(client, fields.items);
+  const poUnitMap = await loadPOUnitMap(client, fields.items);
+  for (const item of fields.items) {
+    const poRef = safeText(item.ref_doc_no || item.doc_no);
+    const unit = poRef
+      ? poUnitMap.get(`${poRef}::${safeText(item.item_code)}::${safeText(item.unit_code)}`)
+      : unitMap.get(`${safeText(item.item_code)}::${safeText(item.unit_code)}`);
+    if (!unit) throw new Error(poRef
+      ? `item unit_code does not match PO: ${poRef}/${item.item_code}/${item.unit_code}`
+      : `unit_code is not in item master: ${item.item_code}/${item.unit_code}`);
+    const standValue = Number(unit.stand_value ?? 1);
+    const divideValue = Number(unit.divide_value ?? 1);
+    if (!Number.isFinite(standValue) || standValue <= 0 || !Number.isFinite(divideValue) || divideValue <= 0) {
+      throw new Error(`invalid unit ratio: ${item.item_code}/${item.unit_code}`);
+    }
+    item.stand_value = standValue;
+    item.divide_value = divideValue;
+  }
   if (fields.isCashSale && fields.cashAmount + fields.transferAmount + 0.000001 < fields.totalAfterRounded) {
     throw new Error(`cash PU payment is not enough: required ${fields.totalAfterRounded}`);
   }
@@ -858,13 +941,14 @@ async function savePUDocTransaction(client, payload, mode) {
          cust_code, vat_rate, user_request, doc_format_code, creator_code, remark,
          branch_code, total_value, total_before_vat, total_vat_value, total_after_vat,
          total_except_vat, total_amount, balance_amount, tax_doc_no, tax_doc_date,
-         total_discount, discount_word, doc_ref, doc_ref_date, wh_from, location_from)
+         total_discount, discount_word, doc_ref, doc_ref_date, wh_from, location_from,
+         credit_day, credit_date)
        VALUES
         (1, $1, $2::date, $3, $4, $5, $6,
          $7, $8, $9, $10, $11, $12,
          $13, $14, $15, $16, $17,
          $18, $19, 0, $20, $21::date,
-         $22, $23, $24, NULLIF($25,'')::date, $26, $27)`,
+         $22, $23, $24, NULLIF($25,'')::date, $26, $27, $28, $29::date)`,
       [
         PU_TRANS_FLAG,
         fields.docDate,
@@ -893,6 +977,8 @@ async function savePUDocTransaction(client, payload, mode) {
         fields.docRefDate,
         fields.whFrom,
         fields.locationFrom,
+        fields.creditDay,
+        fields.creditDate,
       ],
     );
   } else {
@@ -905,7 +991,8 @@ async function savePUDocTransaction(client, payload, mode) {
            discount_word = $14, wh_from = $15, location_from = $16, inquiry_type = $17,
            tax_doc_no = $18, tax_doc_date = $19::date, doc_ref = $20,
            doc_ref_date = NULLIF($21,'')::date,
-           creator_code = $22, last_editor_code = $23, lastedit_datetime = NOW()
+           creator_code = $22, last_editor_code = $23, lastedit_datetime = NOW(),
+           credit_day = $26, credit_date = $27::date
        WHERE doc_no = $24 AND trans_flag = $25`,
       [
         fields.docDate,
@@ -933,6 +1020,8 @@ async function savePUDocTransaction(client, payload, mode) {
         fields.creatorCode,
         docNo,
         PU_TRANS_FLAG,
+        fields.creditDay,
+        fields.creditDate,
       ],
     );
     await client.query('DELETE FROM ic_trans_detail WHERE doc_no = $1 AND trans_flag = $2', [docNo, PU_TRANS_FLAG]);
@@ -1281,6 +1370,7 @@ router.get('/getPurchaseProductDetail', async (req, res) => {
           u.item_code,
           u.item_name,
           u.unit_code,
+          COALESCE(mu.name_1,'') AS unit_name,
           COALESCE(barcode.barcode,'') AS barcode,
           u.stand_value,
           u.divide_value,
@@ -1290,6 +1380,7 @@ router.get('/getPurchaseProductDetail', async (req, res) => {
           COALESCE(last_pu.doc_no,'') AS last_purchase_doc_no,
           COALESCE(last_pu.doc_date::text,'') AS last_purchase_doc_date
        FROM unit_rows u
+       LEFT JOIN ic_unit mu ON mu.code = u.unit_code
        LEFT JOIN LATERAL (
          SELECT b.barcode
          FROM ic_inventory_barcode b
@@ -1355,6 +1446,15 @@ router.get('/getSupplierList', async (req, res) => {
 });
 
 // GET /service/v1/getSupplierDetail?cust_code=
+router.get('/getPurchaseCreditDate', async (req, res) => {
+  const docDate = normalizeDate(req.query.doc_date);
+  const creditDay = Number(req.query.credit_day);
+  if (!docDate || !Number.isInteger(creditDay)) return failResponse(res, 'invalid document date or credit day', 400);
+  try {
+    return successResponse(res, { credit_date: await resolvePUCreditDate(query, docDate, creditDay) });
+  } catch (ex) { return failResponse(res, ex.message, 500); }
+});
+
 router.get('/getSupplierDetail', async (req, res) => {
   const custCode = String(req.query.cust_code || '').trim();
   if (!custCode) return failResponse(res, 'cust_code is required', 400);
@@ -1367,6 +1467,7 @@ router.get('/getSupplierDetail', async (req, res) => {
           COALESCE(s.address,'') AS address,
           COALESCE(s.telephone,'') AS telephone,
           COALESCE(d.tax_id,'') AS tax_id,
+          COALESCE(d.credit_day,0) AS credit_day,
           COALESCE(d.branch_code,'') AS branch_code,
           COALESCE(d.branch_type::text,'0') AS branch_type
        FROM ap_supplier s

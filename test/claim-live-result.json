@@ -1,0 +1,79 @@
+{
+  "db": "wawacrm",
+  "sale_item": "01-0004",
+  "sale_price": 92,
+  "claim_prices": [
+    {
+      "item_code": "01-0005",
+      "unit_code": "ชิ้น",
+      "configured_unit_price": 70,
+      "original_amount": 70
+    },
+    {
+      "item_code": "01-0009",
+      "unit_code": "ชิ้น",
+      "configured_unit_price": 50,
+      "original_amount": 50
+    }
+  ],
+  "other_unit": {
+    "item_code": "01-0005",
+    "unit_code": "ลัง24",
+    "configured_unit_price": 2186
+  },
+  "applied_claims": [
+    {
+      "item_code": "01-0005",
+      "qty": 1,
+      "configured_unit_price": 70,
+      "applied_unit_price": 70,
+      "amount": 70
+    },
+    {
+      "item_code": "01-0009",
+      "qty": 1,
+      "configured_unit_price": 50,
+      "applied_unit_price": 22,
+      "amount": 22
+    }
+  ],
+  "sale": {
+    "discount": 92,
+    "net_before_vat": 0,
+    "vat": 0,
+    "total": 0
+  },
+  "pu": {
+    "doc_no": "PU-26110001",
+    "total_value": "92",
+    "total_vat_value": "0",
+    "total_amount": "92"
+  },
+  "pu_details": [
+    {
+      "line_number": 0,
+      "item_code": "01-0005",
+      "unit_code": "ชิ้น",
+      "qty": "1",
+      "price": "70",
+      "sum_amount": "70"
+    },
+    {
+      "line_number": 1,
+      "item_code": "01-0009",
+      "unit_code": "ชิ้น",
+      "qty": "1",
+      "price": "22",
+      "sum_amount": "22"
+    }
+  ],
+  "print": {
+    "total_amount": "92",
+    "detail_amounts": [
+      70,
+      22
+    ]
+  },
+  "doc_no": "PU-26110001",
+  "rolled_back": true
+}

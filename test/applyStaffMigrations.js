@@ -12,6 +12,7 @@ const files = [
   '20261005_staff_cart_order_item_basket_idx.sql',
   '20261007_sale_premium_backlog_cancel.sql',
   '20261028_sale_claim.sql',
+  '20261102_claim_unit_price.sql',
 ];
 
 const pool = new Pool({

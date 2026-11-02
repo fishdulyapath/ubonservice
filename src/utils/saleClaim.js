@@ -1,16 +1,28 @@
-const { getProductPriceLocalx } = require('./priceHelper');
-const { calcAfterDiscount } = require('../routes/purchase');
-
 const money = (value) => Math.round((Number(value) || 0) * 100) / 100;
 
-function claimNetPrice(price, qty, discountWord = '') {
-  const gross = money(price * qty);
-  const amount = money(calcAfterDiscount(discountWord, gross, 2, qty));
-  const unitPrice = Math.round((amount / qty) * 10000) / 10000;
-  if (!Number.isFinite(unitPrice) || unitPrice < 0 || Math.abs(money(unitPrice * qty) - amount) > 0.005) {
-    throw new Error('claim price cannot be represented at four decimal places');
-  }
-  return { unit_price: unitPrice, amount };
+function capClaimQuotes(quotes, maximum) {
+  let remaining = Math.max(0, money(maximum));
+  return quotes.map((quote) => {
+    const configuredAmount = money(quote.configured_amount ?? quote.amount);
+    const amount = Math.min(remaining, configuredAmount);
+    const unit_price = amount === configuredAmount
+      ? Number(quote.configured_unit_price ?? quote.unit_price)
+      : Math.round((amount / Number(quote.qty)) * 10000) / 10000;
+    if (!Number.isFinite(unit_price) || Math.abs(money(unit_price * Number(quote.qty)) - amount) > 0.005) {
+      throw new Error(`claim amount cannot be represented at four decimal places: ${quote.item_code}/${quote.unit_code}`);
+    }
+    remaining = money(remaining - amount);
+    return { ...quote, unit_price, amount, is_capped: amount < configuredAmount };
+  });
+}
+
+function claimQuoteChanged(saved, fresh) {
+  if (saved.configured_unit_price === null || saved.configured_unit_price === undefined) return true;
+  const savedPrice = Number(saved.configured_unit_price);
+  const savedAmount = Number(saved.quoted_amount);
+  if (!Number.isFinite(savedPrice) || !Number.isFinite(savedAmount)) return true;
+  return Math.abs(savedPrice - Number(fresh.configured_unit_price)) > 0.00005
+    || Math.abs(savedAmount - Number(fresh.amount)) > 0.005;
 }
 
 function applyClaimDiscount(line, original, claimAmount) {
@@ -57,7 +69,7 @@ function buildClaimPUPayload({ claimQuotes, branch, docNo, docDate, docTime, bra
   };
 }
 
-async function quoteClaim(queryFn, input, priceFn = getProductPriceLocalx) {
+async function quoteClaim(queryFn, input) {
   const itemCode = String(input.item_code || '').trim();
   const unitCode = String(input.unit_code || '').trim();
   const qty = Number(input.qty);
@@ -67,27 +79,28 @@ async function quoteClaim(queryFn, input, priceFn = getProductPriceLocalx) {
   const item = await queryFn(
     `SELECT i.code, i.name_1, i.unit_standard, COALESCE(u.stand_value,1) AS stand_value,
             COALESCE(u.divide_value,1) AS divide_value,
-            COALESCE(b.barcode,'') AS barcode
+            COALESCE(b.barcode,'') AS barcode, p.claim_price
        FROM ic_inventory i
        JOIN sml_staff_claim_item c ON c.item_code=i.code AND c.is_claim_item=TRUE
        JOIN ic_unit_use u ON u.ic_code=i.code AND u.code=$2
+       LEFT JOIN sml_staff_claim_unit_price p ON p.item_code=i.code AND p.unit_code=u.code
        LEFT JOIN LATERAL (SELECT barcode FROM ic_inventory_barcode WHERE ic_code=i.code AND unit_code=$2 ORDER BY barcode LIMIT 1) b ON TRUE
       WHERE i.code=$1 LIMIT 1`,
     [itemCode, unitCode],
   );
   if (!item.rows[0]) throw new Error(`item is not configured for claim: ${itemCode}/${unitCode}`);
   const row = item.rows[0];
-  const result = await priceFn(itemCode, unitCode, String(qty), String(input.cust_code || ''),
-    Number(input.vat_type ?? 1), Number(input.vat_rate ?? 7), Number(input.sale_type ?? 1), row.barcode);
-  const priceRow = result.data?.[0];
-  const price = Number(priceRow?.price);
-  if (!Number.isFinite(price) || price < 0) throw new Error(`claim price unavailable: ${itemCode}/${unitCode}`);
-  const discountWord = String(priceRow.defaultDiscount ?? priceRow.default_discount ?? '').trim();
-  const { amount, unit_price } = claimNetPrice(price, qty, discountWord);
+  if (row.claim_price === null || row.claim_price === undefined) {
+    throw new Error(`ยังไม่ได้ตั้งราคารับเคลม: ${itemCode}/${unitCode}`);
+  }
+  const price = Number(row.claim_price);
+  if (!Number.isFinite(price) || price < 0) throw new Error(`invalid claim price: ${itemCode}/${unitCode}`);
+  const amount = money(price * qty);
+  const unit_price = price;
   if (amount < 0) throw new Error('claim amount is negative');
   return {
     item_code: itemCode, item_name: row.name_1, unit_code: unitCode, qty,
-    unit_price, amount, discount_word: discountWord,
+    unit_price, amount, configured_unit_price: price, configured_amount: amount,
     stand_value: Number(row.stand_value) || 1, divide_value: Number(row.divide_value) || 1,
     barcode: row.barcode,
   };
@@ -103,4 +116,4 @@ async function cartClaims(queryFn, cartKey, saleGuid = '') {
   return result.rows;
 }
 
-module.exports = { money, claimNetPrice, applyClaimDiscount, buildClaimPUPayload, quoteClaim, cartClaims };
+module.exports = { money, capClaimQuotes, claimQuoteChanged, applyClaimDiscount, buildClaimPUPayload, quoteClaim, cartClaims };

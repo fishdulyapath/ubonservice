@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
 const { query, withTransaction } = require('../db');
-const { cartClaims, quoteClaim, money, applyClaimDiscount, buildClaimPUPayload } = require('../utils/saleClaim');
+const { cartClaims, quoteClaim, capClaimQuotes, claimQuoteChanged, money, applyClaimDiscount, buildClaimPUPayload } = require('../utils/saleClaim');
 const { savePUDocTransaction } = require('./purchase');
 const { calcDiscount, calcVat } = require('../utils/vatHelper');
 const { validateSaleItemsStock } = require('../utils/cartStockValidator');
@@ -1055,8 +1055,9 @@ async function handleSaveTrans(req, res, options = {}) {
         unit_code: String(claim.unit_code || ''),
         qty: Number(claim.qty),
         quoted_amount: Number(claim.quoted_amount),
+        configured_unit_price: Number(claim.configured_unit_price),
       })));
-      const claimKey = (row) => `${row.sale_guid}\0${row.claim_item_code}\0${row.unit_code}\0${Number(row.qty)}\0${Number(row.quoted_amount)}`;
+      const claimKey = (row) => `${row.sale_guid}\0${row.claim_item_code}\0${row.unit_code}\0${Number(row.qty)}\0${Number(row.quoted_amount)}\0${Number(row.configured_unit_price)}`;
       const savedClaimKeys = persistedClaims.map(claimKey).sort();
       const requestClaimKeys = requestClaims.map(claimKey).sort();
       if (requestClaimKeys.length !== savedClaimKeys.length || requestClaimKeys.some((key, index) => key !== savedClaimKeys[index])) {
@@ -1082,22 +1083,28 @@ async function handleSaveTrans(req, res, options = {}) {
         if (!eligible.rows[0]?.can_claim) throw new Error('sale item no longer accepts claims');
         const quote = await quoteClaim(client.query.bind(client), {
           item_code: claim.claim_item_code, unit_code: claim.unit_code, qty: claim.qty,
-          cust_code, sale_type: inquiry_type, vat_type, vat_rate,
         });
-        if (Math.abs(quote.amount - Number(claim.quoted_amount)) > 0.005) {
-          const err = new Error('claim price changed; review cart and payment again');
-          err.statusCode = 409;
-          err.claim_price_changed = true;
-          throw err;
-        }
         if (!claimByGuid.has(claim.sale_guid)) claimByGuid.set(claim.sale_guid, []);
-        claimByGuid.get(claim.sale_guid).push(quote);
-        claimQuotes.push({ ...quote, sale_guid: claim.sale_guid });
+        claimByGuid.get(claim.sale_guid).push({ quote, persisted: claim });
       }
-      for (const [guid, quotes] of claimByGuid) {
+      for (const [guid, entries] of claimByGuid) {
         const line = detailItems.find((item) => String(item.guid_code || '') === guid);
         const original = items.find((item) => String(item.guid_code || '') === guid);
         if (!line || Number(line.qty) !== Number(original.qty)) throw new Error('claim sale quantity changed; review cart again');
+        const previousClaim = money(entries.reduce((sum, entry) => sum + Number(entry.persisted.quoted_amount), 0));
+        const available = money(Number(line.sum_amount) + (line === original ? previousClaim : 0));
+        const quotes = capClaimQuotes(entries.map((entry) => entry.quote), available);
+        for (let index = 0; index < quotes.length; index++) {
+          const quote = quotes[index];
+          const saved = entries[index].persisted;
+          if (claimQuoteChanged(saved, quote)) {
+            const err = new Error('claim price changed; review cart and payment again');
+            err.statusCode = 409;
+            err.claim_price_changed = true;
+            throw err;
+          }
+          claimQuotes.push({ ...quote, sale_guid: guid });
+        }
         const claimAmount = money(quotes.reduce((sum, row) => sum + row.amount, 0));
         try { applyClaimDiscount(line, original, claimAmount); }
         catch (error) { error.statusCode = 409; throw error; }
@@ -1419,7 +1426,9 @@ async function handleSaveTrans(req, res, options = {}) {
       }
 
       if (claimQuotes.length > 0) {
-        const branch = await client.query('SELECT wh_code,shelf_code,pu_doc_format_code FROM sml_staff_claim_branch WHERE branch_code=$1', ['']);
+        const branch = await client.query(`SELECT wh_code,shelf_code,pu_doc_format_code FROM sml_staff_claim_branch
+          WHERE branch_code IN ('','0000')
+          ORDER BY CASE WHEN branch_code='' THEN 0 ELSE 1 END LIMIT 1`);
         if (!branch.rows[0]) throw new Error('claim warehouse and PU format are not configured');
         const supplier = await client.query('SELECT 1 FROM ap_supplier WHERE code=$1', ['AP0186']);
         if (!supplier.rows.length) throw new Error('claim supplier AP0186 not found');
@@ -1432,9 +1441,9 @@ async function handleSaveTrans(req, res, options = {}) {
         for (let i = 0; i < claimQuotes.length; i++) {
           const row = claimQuotes[i];
           await client.query(`INSERT INTO sml_staff_sale_claim
-            (sale_doc_no,sale_line_no,pu_doc_no,pu_line_no,claim_item_code,unit_code,qty,unit_price,amount)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-            [doc_no, claimSaleLines.get(row.sale_guid), claimPurchaseDocNo, i, row.item_code, row.unit_code, row.qty, row.unit_price, row.amount]);
+            (sale_doc_no,sale_line_no,pu_doc_no,pu_line_no,claim_item_code,unit_code,qty,unit_price,amount,configured_unit_price)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+            [doc_no, claimSaleLines.get(row.sale_guid), claimPurchaseDocNo, i, row.item_code, row.unit_code, row.qty, row.unit_price, row.amount, row.configured_unit_price]);
         }
         const saleRemark = [String(remark).trim(), `รับสินค้าเคลม ใบซื้อ/ตั้งหนี้ ${claimPurchaseDocNo}`]
           .filter(Boolean).join('\n');
@@ -1940,7 +1949,7 @@ router.get('/getDocSaleHistoryDetail', async (req, res) => {
         `SELECT to_regclass('public.ic_trans_detail_promotion') IS NOT NULL AS table_exists`,
         []
       ),
-      query(`SELECT c.sale_line_no,c.pu_doc_no,c.claim_item_code,c.unit_code,c.qty,c.unit_price,c.amount,
+      query(`SELECT c.sale_line_no,c.pu_doc_no,c.claim_item_code,c.unit_code,c.qty,c.unit_price,c.amount,c.configured_unit_price,
               COALESCE(i.name_1,'') AS claim_item_name
              FROM sml_staff_sale_claim c LEFT JOIN ic_inventory i ON i.code=c.claim_item_code
             WHERE c.sale_doc_no=$1 ORDER BY c.sale_line_no,c.pu_line_no`, [doc_no]),

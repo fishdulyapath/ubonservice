@@ -538,7 +538,7 @@ router.get('/getcartitemlist', async (req, res) => {
     const dataResult = await query(dataSql, dataParams);
     const claimGuids = dataResult.rows.map((row) => row.guid_code).filter(Boolean);
     const claimResult = claimGuids.length
-      ? await query(`SELECT sale_guid,line_no,claim_item_code,unit_code,qty,quoted_unit_price,quoted_amount
+      ? await query(`SELECT sale_guid,line_no,claim_item_code,unit_code,qty,quoted_unit_price,quoted_amount,configured_unit_price
           FROM sml_staff_cart_claim WHERE cart_key=$1 AND sale_guid=ANY($2::text[]) ORDER BY sale_guid,line_no`, [custCode, claimGuids])
       : { rows: [] };
     const claimsByGuid = new Map();

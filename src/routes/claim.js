@@ -3,7 +3,9 @@ const router = express.Router();
 const { query, withTransaction } = require('../db');
 const { assertBasketAccessFromCartKey } = require('../utils/basketAccess');
 const { getEmployeePermissions } = require('../utils/permissions');
-const { quoteClaim, cartClaims } = require('../utils/saleClaim');
+const { quoteClaim, capClaimQuotes, money, cartClaims } = require('../utils/saleClaim');
+const { getProductPriceLocalx } = require('../utils/priceHelper');
+const { calcAfterDiscount } = require('./purchase');
 
 const str = (value) => String(value || '').trim();
 const errorResponse = (res, ex) => res.status(ex.statusCode || 400).json({ success: false, msg: ex.message });
@@ -16,27 +18,53 @@ async function canManage(queryFn, userCode) {
 
 router.get('/claim/product', async (req, res) => {
   try {
-    const result = await query('SELECT can_claim,is_claim_item FROM sml_staff_claim_item WHERE item_code=$1', [str(req.query.item_code)]);
-    res.json({ success: true, data: result.rows[0] || { can_claim: false, is_claim_item: false } });
+    const result = await query(`SELECT c.can_claim,c.is_claim_item,
+      COALESCE((SELECT json_agg(json_build_object('unit_code',p.unit_code,'claim_price',p.claim_price) ORDER BY p.unit_code)
+        FROM sml_staff_claim_unit_price p WHERE p.item_code=c.item_code),'[]'::json) AS prices
+      FROM sml_staff_claim_item c WHERE c.item_code=$1`, [str(req.query.item_code)]);
+    res.json({ success: true, data: result.rows[0] || { can_claim: false, is_claim_item: false, prices: [] } });
   } catch (ex) { errorResponse(res, ex); }
 });
 
 router.post('/claim/product', async (req, res) => {
   try {
-    const { item_code, can_claim, is_claim_item, user_code } = req.body || {};
+    const { item_code, can_claim, is_claim_item, user_code, prices } = req.body || {};
     if (!(await canManage(query, str(user_code)))) return res.status(403).json({ success: false, msg: 'permission denied' });
     const exists = await query('SELECT 1 FROM ic_inventory WHERE code=$1', [str(item_code)]);
     if (!exists.rows.length) throw new Error('item not found');
-    await query(`INSERT INTO sml_staff_claim_item (item_code,can_claim,is_claim_item,updated_by)
-      VALUES ($1,$2,$3,$4) ON CONFLICT (item_code) DO UPDATE SET can_claim=$2,is_claim_item=$3,updated_by=$4,updated_at=NOW()`,
-      [str(item_code), can_claim === true, is_claim_item === true, str(user_code)]);
+    if (!Array.isArray(prices)) throw new Error('claim prices are required');
+    const seen = new Set();
+    for (const row of prices) {
+      const unit = str(row?.unit_code);
+      const price = Number(row?.claim_price);
+      if (!unit || seen.has(unit) || row?.claim_price === null || row?.claim_price === ''
+        || !Number.isFinite(price) || price < 0 || Math.round(price * 10000) / 10000 !== price) {
+        throw new Error('invalid claim price or unit');
+      }
+      seen.add(unit);
+    }
+    await withTransaction(async (client) => {
+      const units = await client.query('SELECT code FROM ic_unit_use WHERE ic_code=$1', [str(item_code)]);
+      const validUnits = new Set(units.rows.map((row) => row.code));
+      if (prices.some((row) => !validUnits.has(str(row.unit_code)))) throw new Error('claim price unit is not in item master');
+      await client.query(`INSERT INTO sml_staff_claim_item (item_code,can_claim,is_claim_item,updated_by)
+        VALUES ($1,$2,$3,$4) ON CONFLICT (item_code) DO UPDATE SET can_claim=$2,is_claim_item=$3,updated_by=$4,updated_at=NOW()`,
+        [str(item_code), can_claim === true, is_claim_item === true, str(user_code)]);
+      await client.query('DELETE FROM sml_staff_claim_unit_price WHERE item_code=$1', [str(item_code)]);
+      for (const row of prices) {
+        await client.query(`INSERT INTO sml_staff_claim_unit_price (item_code,unit_code,claim_price,updated_by)
+          VALUES ($1,$2,$3,$4)`, [str(item_code), str(row.unit_code), Number(row.claim_price), str(user_code)]);
+      }
+    });
     res.json({ success: true });
   } catch (ex) { errorResponse(res, ex); }
 });
 
 router.get('/claim/branch', async (req, res) => {
   try {
-    const result = await query('SELECT * FROM sml_staff_claim_branch WHERE branch_code=$1', ['']);
+    const result = await query(`SELECT * FROM sml_staff_claim_branch
+      WHERE branch_code IN ('','0000')
+      ORDER BY CASE WHEN branch_code='' THEN 0 ELSE 1 END LIMIT 1`);
     res.json({ success: true, data: result.rows[0] || null });
   } catch (ex) { errorResponse(res, ex); }
 });
@@ -76,9 +104,14 @@ router.post('/claim/quote', async (req, res) => {
     const input = req.body || {};
     const rows = Array.isArray(input.items) ? input.items : [];
     if (rows.length > 30) throw new Error('too many claim items');
-    const quotes = [];
-    for (const row of rows) quotes.push(await quoteClaim(query, { ...row, ...input, item_code: row.item_code, unit_code: row.unit_code, qty: row.qty }));
-    res.json({ success: true, data: { items: quotes, total: quotes.reduce((sum, row) => sum + row.amount, 0) } });
+    let quotes = [];
+    for (const row of rows) quotes.push(await quoteClaim(query, { ...row, item_code: row.item_code, unit_code: row.unit_code, qty: row.qty }));
+    if (input.max_amount !== undefined) {
+      const maximum = Number(input.max_amount);
+      if (!Number.isFinite(maximum) || maximum < 0) throw new Error('invalid maximum claim amount');
+      quotes = capClaimQuotes(quotes, maximum);
+    }
+    res.json({ success: true, data: { items: quotes, total: money(quotes.reduce((sum, row) => sum + row.amount, 0)) } });
   } catch (ex) { errorResponse(res, ex); }
 });
 
@@ -99,19 +132,29 @@ router.post('/claim/cart', async (req, res) => {
     if (!saleGuid || !cartKey || items.length > 30) throw new Error('invalid cart claim');
     await withTransaction(async (client) => {
       await assertBasketAccessFromCartKey(client.query.bind(client), str(body.user_code), cartKey, 'can_edit_items');
-      const sale = await client.query('SELECT item_code,qty FROM staff_cart_order WHERE cust_code=$1 AND guid_code=$2 FOR UPDATE', [cartKey, saleGuid]);
+      const sale = await client.query('SELECT item_code,unit_code,qty,price,barcode FROM staff_cart_order WHERE cust_code=$1 AND guid_code=$2 FOR UPDATE', [cartKey, saleGuid]);
       if (sale.rows.length !== 1) throw new Error('sale cart item not found');
       const eligible = await client.query('SELECT can_claim FROM sml_staff_claim_item WHERE item_code=$1', [sale.rows[0].item_code]);
       if (!eligible.rows[0]?.can_claim) throw new Error('sale item does not accept claims');
-      const quotes = [];
-      for (const row of items) quotes.push(await quoteClaim(client.query.bind(client), { ...body, ...row }));
+      const saleRow = sale.rows[0];
+      const salePriceResult = await getProductPriceLocalx(saleRow.item_code, saleRow.unit_code,
+        String(saleRow.qty), str(body.cust_code), Number(body.vat_type ?? 1),
+        Number(body.vat_rate ?? 7), Number(body.sale_type ?? 1), saleRow.barcode || '');
+      const salePrice = salePriceResult.data?.[0];
+      if (!salePrice || !Number.isFinite(Number(salePrice.price))) throw new Error('sale price unavailable for claim cap');
+      const saleNet = Math.max(0, money(calcAfterDiscount(
+        str(salePrice.defaultDiscount ?? salePrice.default_discount),
+        money(Number(salePrice.price) * Number(saleRow.qty)), 2, Number(saleRow.qty))));
+      const rawQuotes = [];
+      for (const row of items) rawQuotes.push(await quoteClaim(client.query.bind(client), row));
+      const quotes = capClaimQuotes(rawQuotes, saleNet);
       await client.query('DELETE FROM sml_staff_cart_claim WHERE cart_key=$1 AND sale_guid=$2', [cartKey, saleGuid]);
       for (let i = 0; i < quotes.length; i++) {
         const row = quotes[i];
         await client.query(`INSERT INTO sml_staff_cart_claim
-          (cart_key,sale_guid,line_no,claim_item_code,unit_code,qty,quoted_unit_price,quoted_amount)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-        [cartKey, saleGuid, i, row.item_code, row.unit_code, row.qty, row.unit_price, row.amount]);
+          (cart_key,sale_guid,line_no,claim_item_code,unit_code,qty,quoted_unit_price,quoted_amount,configured_unit_price)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [cartKey, saleGuid, i, row.item_code, row.unit_code, row.qty, row.unit_price, row.amount, row.configured_unit_price]);
       }
     });
     res.json({ success: true });
