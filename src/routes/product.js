@@ -841,6 +841,7 @@ router.get("/getProductDetail", async (req, res) => {
         GROUP BY ic_code
       )
       SELECT a.ic_code, b.name_1 AS item_name, a.code AS unit_code, b.item_type,
+        b.unit_standard,
         COALESCE(b.tax_type,0) AS tax_type,
         COALESCE((SELECT barcode FROM ic_inventory_barcode ib WHERE ib.ic_code=a.ic_code AND ib.unit_code=a.code LIMIT 1),'') AS barcode,
         CASE WHEN COALESCE(b.item_grade,'') = upper('r') THEN '1' ELSE '0' END AS is_return,
@@ -889,6 +890,7 @@ router.get("/getProductDetail", async (req, res) => {
         item_code: r.ic_code,
         item_name: r.item_name,
         unit_code: r.unit_code,
+        unit_standard: r.unit_standard,
         balance_qty: Number(r.balance_qty || 0),
         sum_balance_qty: Number(r.sum_balance_qty || 0),
         sold_out: r.sold_out,

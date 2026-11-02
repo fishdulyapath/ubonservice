@@ -6,6 +6,7 @@ const { cartClaims, quoteClaim, capClaimQuotes, claimQuoteChanged, money, applyC
 const { savePUDocTransaction } = require('./purchase');
 const { calcDiscount, calcVat } = require('../utils/vatHelper');
 const { validateSaleItemsStock } = require('../utils/cartStockValidator');
+const { quotePartialUnitSale } = require('../utils/partialUnitSale');
 const { getEmployeePermissions } = require('../utils/permissions');
 const { assertBasketAccess } = require('../utils/basketAccess');
 const { querySaleAdvanceDepositBalances } = require('../utils/saleAdvanceDeposit');
@@ -962,6 +963,43 @@ async function handleSaveTrans(req, res, options = {}) {
       const smlPromotionFulfillments = [];
       const allocatedSmlPromotionBaseQty = new Map();
       const cartKeyForStock = basket_id ? `BASKET-${basket_id}` : '';
+      const partialCartRows = cartKeyForStock
+        ? await client.query(`SELECT guid_code,item_code,unit_code,qty,COALESCE(partial_source_unit_code,'') AS partial_source_unit_code
+            FROM staff_cart_order WHERE cust_code=$1 AND COALESCE(partial_source_unit_code,'')<>'' FOR UPDATE`, [cartKeyForStock])
+        : { rows: [] };
+      for (const saved of partialCartRows.rows) {
+        const item = items.find(row => String(row.guid_code || '') === String(saved.guid_code));
+        if (!item || item.item_code !== saved.item_code || item.unit_code !== saved.unit_code
+          || String(item.partial_source_unit_code || '') !== saved.partial_source_unit_code
+          || Number(item.qty) !== Number(saved.qty)) {
+          const error = new Error('partial unit cart changed; review cart again');
+          error.statusCode = 409;
+          throw error;
+        }
+        const quote = await quotePartialUnitSale(client.query.bind(client), {
+          item_code: saved.item_code, source_unit_code: saved.partial_source_unit_code,
+          target_unit_code: saved.unit_code, cust_code,
+          sale_type: inquiry_type, vat_type, vat_rate, doc_date,
+        });
+        if (Math.abs(Number(item.price) - quote.price) > 0.00005) {
+          const error = new Error('partial unit price changed; review cart and payment again');
+          error.statusCode = 409;
+          throw error;
+        }
+        if (!(Array.isArray(item.claim_items) && item.claim_items.length)
+          && Math.abs(Number(item.sum_amount) - roundMoney(quote.price * Number(item.qty))) > 0.01) {
+          const error = new Error('partial unit line amount changed; review cart again');
+          error.statusCode = 409;
+          throw error;
+        }
+      }
+      if (items.some(item => item.partial_source_unit_code && !partialCartRows.rows.some(
+        row => String(row.guid_code) === String(item.guid_code)
+      ))) {
+        const error = new Error('partial unit cart item is unavailable');
+        error.statusCode = 409;
+        throw error;
+      }
       for (const item of items) {
         const itemTypeForExpand = String(item?.item_type ?? '0');
         const backlogDetailId = parseInt(item?.sale_premium_backlog_detail_id || 0, 10) || 0;
@@ -978,6 +1016,8 @@ async function handleSaveTrans(req, res, options = {}) {
           });
           salePremiumFulfillments.push(fulfillment);
           detailItems.push(...fulfillment.deliveredItems);
+        } else if (!backlogDetailId && !smlBacklogDetailId && item.partial_source_unit_code) {
+          detailItems.push(item);
         } else if (!backlogDetailId && !smlBacklogDetailId) {
           const fulfillment = await buildSmlPromotionFulfillment(client.query.bind(client), item, {
             custCode: cust_code,
@@ -987,7 +1027,7 @@ async function handleSaveTrans(req, res, options = {}) {
             docDate: doc_date,
             excludeCartKey: cartKeyForStock,
             basketId: basket_id,
-            fullItems: items,
+            fullItems: items.filter(row => !row.partial_source_unit_code),
             allocatedBaseQty: allocatedSmlPromotionBaseQty,
           });
           if (fulfillment) {
@@ -1139,6 +1179,15 @@ async function handleSaveTrans(req, res, options = {}) {
         err.statusCode = 409;
         err.claim_price_changed = true;
         throw err;
+      }
+
+      if (partialCartRows.rows.length) {
+        const lineTotal = roundMoney(detailItems.reduce((sum, row) => sum + toNumber(row.sum_amount), 0));
+        if (Math.abs(lineTotal - total_value_dbl) > 0.01) {
+          const error = new Error('partial unit sale total changed; review payment again');
+          error.statusCode = 409;
+          throw error;
+        }
       }
 
       const stockValidation = await validateSaleItemsStock(client, detailItems, {

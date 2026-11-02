@@ -94,13 +94,15 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', uptime: process.uptime() });
 });
 
-require('./db/migrateClaimSchema').migrateClaimSchema().then(() => {
+require('./db/migrateClaimSchema').migrateClaimSchema().then(() =>
+  require('./db/migratePartialUnitSale').migratePartialUnitSale()
+).then(() => {
   app.listen(PORT, () => {
     console.log(`MarketPlaceWebService Express running on port ${PORT}`);
     console.log(`Base URL: http://localhost:${PORT}/service/v1/`);
   });
 }).catch((error) => {
-  console.error('Claim schema migration failed:', error.message);
+  console.error('Staff schema migration failed:', error.message);
   process.exitCode = 1;
   require('./db').pool.end().catch(() => {});
 });

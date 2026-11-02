@@ -4,6 +4,8 @@ const { query, withTransaction } = require('../db');
 const { safePage, safePageSize } = require('../utils/response');
 const { validateCartStock, validateSaleItemsStock } = require('../utils/cartStockValidator');
 const { assertBasketAccessFromCartKey } = require('../utils/basketAccess');
+const { quotePartialUnitSale } = require('../utils/partialUnitSale');
+const partialPriceCustomer = (code) => /^BASKET-\d+$/i.test(String(code || '')) ? '' : (code || '');
 const { buildSalePremiumFulfillment } = require('../utils/salePremiumBacklogHelper');
 const {
   buildSmlPromotionFulfillment,
@@ -366,6 +368,28 @@ async function resolveBasketPricingContext(custCode) {
   return { custCode: requestedCode, saleType: null, vatType: null, vatRate: null };
 }
 
+// POST /service/v1/getPartialUnitSaleQuote
+router.post('/getPartialUnitSaleQuote', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const cartKey = safeText(body.cart_key);
+    await assertBasketAccessFromCartKey(query, safeText(body.user_code || req.get('x-user-code')), cartKey, 'can_enter');
+    const basket = await resolveBasketPricingContext(cartKey);
+    const quote = await quotePartialUnitSale(query, {
+      item_code: body.item_code,
+      source_unit_code: body.source_unit_code,
+      target_unit_code: body.target_unit_code,
+      cust_code: partialPriceCustomer(basket.custCode),
+      sale_type: basket.saleType,
+      vat_type: basket.vatType,
+      vat_rate: basket.vatRate,
+    });
+    return res.json({ success: true, data: quote });
+  } catch (error) {
+    return res.status(error.statusCode || 400).json({ success: false, msg: error.message });
+  }
+});
+
 // POST /service/v1/additemtocart
 // Body: JSON Array [...] — เลียนแบบ Java: รับ String data แล้ว new JSONArray(data)
 router.post('/additemtocart', async (req, res) => {
@@ -400,15 +424,30 @@ router.post('/additemtocart', async (req, res) => {
         const item_code = item.item_code || '';
         const item_name = item.item_name || '';
         const unit_code = item.unit_code || '';
-        const barcode = item.barcode || '';
+        let barcode = item.barcode || '';
         const qty = item.qty !== undefined ? item.qty.toString() : '1';
-        const price = item.price !== undefined ? item.price.toString() : '0';
+        let price = item.price !== undefined ? item.price.toString() : '0';
         const item_type = item.item_type !== undefined ? item.item_type.toString() : '0';
         const wh_code = item.wh_code || '';
         const shelf_code = item.shelf_code || '';
-        const stand_value = item.stand_value !== undefined ? item.stand_value.toString() : '1';
-        const divide_value = item.divide_value !== undefined ? item.divide_value.toString() : '1';
-        const ratio = item.ratio !== undefined ? item.ratio.toString() : '1';
+        let stand_value = item.stand_value !== undefined ? item.stand_value.toString() : '1';
+        let divide_value = item.divide_value !== undefined ? item.divide_value.toString() : '1';
+        let ratio = item.ratio !== undefined ? item.ratio.toString() : '1';
+        const partial_source_unit_code = safeText(item.partial_source_unit_code);
+        if (partial_source_unit_code) {
+          if (item_type !== '0' || toNumber(qty) <= 0) throw new Error('invalid partial sale item');
+          const basket = await resolveBasketPricingContext(cust_code);
+          const quote = await quotePartialUnitSale(client.query.bind(client), {
+            item_code, source_unit_code: partial_source_unit_code, target_unit_code: unit_code,
+            cust_code: partialPriceCustomer(basket.custCode), sale_type: basket.saleType,
+            vat_type: basket.vatType, vat_rate: basket.vatRate,
+          });
+          price = String(quote.price);
+          barcode = quote.target_barcode;
+          stand_value = String(quote.target_stand_value);
+          divide_value = String(quote.target_divide_value);
+          ratio = String(quote.target_ratio);
+        }
         const remark = item.remark || '';
         const sale_premium_code = item.sale_premium_code || '';
         const sale_premium_name = item.sale_premium_name || '';
@@ -444,11 +483,12 @@ router.post('/additemtocart', async (req, res) => {
         });
 
         // DELETE เดิมก่อน (เหมือน Java) แต่รายการคงค้างต้องแยกตาม guid ไม่ merge ข้าม backlog
-        const deleteSql = sale_premium_backlog_detail_id > 0 || sml_promotion_backlog_detail_id > 0
+        const deleteSql = sale_premium_backlog_detail_id > 0 || sml_promotion_backlog_detail_id > 0 || partial_source_unit_code
           ? `DELETE FROM staff_cart_order WHERE guid_code = $1 AND cust_code = $2`
           : `DELETE FROM staff_cart_order
-             WHERE item_code = $1 AND unit_code = $2 AND barcode = $3 AND cust_code = $4`;
-        const deleteParams = sale_premium_backlog_detail_id > 0 || sml_promotion_backlog_detail_id > 0
+             WHERE item_code = $1 AND unit_code = $2 AND barcode = $3 AND cust_code = $4
+               AND COALESCE(partial_source_unit_code,'')=''`;
+        const deleteParams = sale_premium_backlog_detail_id > 0 || sml_promotion_backlog_detail_id > 0 || partial_source_unit_code
           ? [guid_code, cust_code]
           : [item_code, unit_code, barcode, cust_code];
         await client.query(deleteSql, deleteParams);
@@ -460,13 +500,15 @@ router.post('/additemtocart', async (req, res) => {
             qty, price, wh_code, shelf_code, creator_code, create_datetime,
             stand_value, divide_value, ratio, remark, sale_premium_code, sale_premium_name, sale_premium_data,
             sale_premium_line_type, sale_premium_backlog_id, sale_premium_backlog_detail_id, is_permium,
-            sml_promotion_backlog_id, sml_promotion_backlog_detail_id, sml_promotion_full_qty)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
+            sml_promotion_backlog_id, sml_promotion_backlog_detail_id, sml_promotion_full_qty,
+            partial_source_unit_code)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)`,
           [item_type, cust_code, guid_code, item_code, item_name, unit_code, barcode,
            qty, price, wh_code, shelf_code, emp_code,
            stand_value, divide_value, ratio, remark, sale_premium_code, sale_premium_name, sale_premium_data,
            sale_premium_line_type, sale_premium_backlog_id, sale_premium_backlog_detail_id, is_permium,
-           sml_promotion_backlog_id, sml_promotion_backlog_detail_id, sml_promotion_full_qty]
+           sml_promotion_backlog_id, sml_promotion_backlog_detail_id, sml_promotion_full_qty,
+           partial_source_unit_code]
         );
       }
       resp.success = true;
@@ -523,6 +565,7 @@ router.get('/getcartitemlist', async (req, res) => {
              COALESCE(sco.sml_promotion_backlog_id,0) AS sml_promotion_backlog_id,
              COALESCE(sco.sml_promotion_backlog_detail_id,0) AS sml_promotion_backlog_detail_id,
              COALESCE(sco.sml_promotion_full_qty,0) AS sml_promotion_full_qty,
+             COALESCE(sco.partial_source_unit_code,'') AS partial_source_unit_code,
              COALESCE(sml_backlog.pricing_context,'{}'::jsonb) AS sml_promotion_pricing_context,
              COALESCE(sco.is_permium,0) AS is_permium, 0 AS balance_qty,
              COALESCE(i.tax_type, 0) AS tax_type
@@ -575,6 +618,7 @@ router.get('/getcartitemlist', async (req, res) => {
       sml_promotion_backlog_id: Number(r.sml_promotion_backlog_id || 0),
       sml_promotion_backlog_detail_id: Number(r.sml_promotion_backlog_detail_id || 0),
       sml_promotion_full_qty: toNumber(r.sml_promotion_full_qty),
+      partial_source_unit_code: r.partial_source_unit_code || '',
       sml_promotion_pricing_context: r.sml_promotion_pricing_context || null,
       is_permium: Number(r.is_permium || 0),
       balance_qty: 0,
@@ -722,7 +766,7 @@ router.get('/getcartorder', async (req, res) => {
 
     const data = result.rows.map(r => {
       // price_confirm: ถ้า item_type != '3' → '0', ถ้า '3' → price (เหมือน Java)
-      const priceConfirm = ['3', '4'].includes(String(r.item_type)) ? r.price : '0';
+      const priceConfirm = ['3', '4'].includes(String(r.item_type)) || r.partial_source_unit_code ? r.price : '0';
       return {
         tax_type: r.tax_type,
         cust_code: r.cust_code,
@@ -751,6 +795,7 @@ router.get('/getcartorder', async (req, res) => {
         sml_promotion_backlog_id: Number(r.sml_promotion_backlog_id || 0),
         sml_promotion_backlog_detail_id: Number(r.sml_promotion_backlog_detail_id || 0),
         sml_promotion_full_qty: toNumber(r.sml_promotion_full_qty),
+        partial_source_unit_code: r.partial_source_unit_code || '',
       };
     });
 
@@ -798,7 +843,17 @@ router.post('/getcartorderprice', async (req, res) => {
       const o = { item_code: itemCode, unit_code: unitCode };
       try {
         let priceConfirm = 0;
-        if (!['3', '4'].includes(itemType)) {
+        if (it.partial_source_unit_code) {
+          const quote = await quotePartialUnitSale(query, {
+            item_code: itemCode, source_unit_code: it.partial_source_unit_code,
+            target_unit_code: unitCode, cust_code: partialPriceCustomer(basketCtx.custCode || cust_code),
+            sale_type: Number.isNaN(bodySaleType) ? basketCtx.saleType : bodySaleType,
+            vat_type: Number.isNaN(bodyVatType) ? basketCtx.vatType : bodyVatType,
+            vat_rate: Number.isNaN(bodyVatRate) ? basketCtx.vatRate : bodyVatRate,
+            doc_date: docDate,
+          });
+          priceConfirm = quote.price;
+        } else if (!['3', '4'].includes(itemType)) {
           let vatType = parseInt(it.vat_type, 10);
           if (Number.isNaN(vatType)) vatType = Number.isNaN(bodyVatType) ? basketCtx.vatType : bodyVatType;
           if (Number.isNaN(vatType)) vatType = parseInt(it.tax_type, 10);
@@ -859,6 +914,7 @@ router.get('/getcartfinalsummary', async (req, res) => {
   try {
     const sql = `
             SELECT c.cust_code, c.item_code, c.item_name, c.unit_code, c.item_type, c.qty, c.price, c.barcode,
+             COALESCE(c.partial_source_unit_code,'') AS partial_source_unit_code,
              COALESCE(c.sml_promotion_full_qty,0) AS sml_promotion_full_qty,
              COALESCE(i.tax_type,0) AS tax_type
       FROM staff_cart_order c
@@ -880,7 +936,17 @@ router.get('/getcartfinalsummary', async (req, res) => {
       totalQty += qty;
 
       let priceConfirm = 0;
-      if (!['3', '4'].includes(String(r.item_type))) {
+      if (r.partial_source_unit_code) {
+        const quote = await quotePartialUnitSale(query, {
+          item_code: r.item_code, source_unit_code: r.partial_source_unit_code,
+          target_unit_code: r.unit_code, cust_code: partialPriceCustomer(basketCtx.custCode || custCode),
+          sale_type: Number.isNaN(saleTypeReq) ? basketCtx.saleType : saleTypeReq,
+          vat_type: Number.isNaN(vatTypeReq) ? basketCtx.vatType : vatTypeReq,
+          vat_rate: Number.isNaN(vatRateReq) ? basketCtx.vatRate : vatRateReq,
+          doc_date: docDate,
+        });
+        priceConfirm = quote.price;
+      } else if (!['3', '4'].includes(String(r.item_type))) {
         try {
           const saleType = Number.isNaN(saleTypeReq) ? (Number.isNaN(basketCtx.saleType) ? 0 : basketCtx.saleType) : saleTypeReq;
           const vatType = Number.isNaN(vatTypeReq)
@@ -984,6 +1050,8 @@ router.get('/validatecartstock', async (req, res) => {
             pending_details: fulfillment.pendingDetails,
           });
         }
+      } else if (!backlogDetailId && !smlBacklogDetailId && item.partial_source_unit_code) {
+        detailItems.push(item);
       } else if (!backlogDetailId && !smlBacklogDetailId) {
         const fulfillment = await buildSmlPromotionFulfillment(query, item, {
           custCode: promotionCustCode,
@@ -992,7 +1060,7 @@ router.get('/validatecartstock', async (req, res) => {
           vatRate: basketCtx.vatRate,
           excludeCartKey: custCode.trim(),
           basketId: basketMatch ? Number(basketMatch[1]) : 0,
-          fullItems: cartRes.rows,
+          fullItems: cartRes.rows.filter(row => !row.partial_source_unit_code),
           allocatedBaseQty: allocatedSmlPromotionBaseQty,
         });
         if (fulfillment) {
