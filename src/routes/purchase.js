@@ -247,6 +247,49 @@ async function getCurrentPURefs(client, currentDocNo) {
   return new Set(result.rows.map((row) => safeText(row.billing_no)).filter(Boolean));
 }
 
+async function checkAutoPurchaseDefaults(client, payload) {
+  const items = normalizeArray(payload.items);
+  const supplierCode = safeText(payload.cust_code || payload.ap_cust_code);
+  const docDate = normalizeDate(payload.doc_date);
+  if (!supplierCode || !docDate) return [];
+  const errors = [];
+  const checked = items.map((item, index) => ({ ...item, request_id: index }))
+    .filter((item) => !safeText(item.ref_doc_no || item.doc_no)
+      && !isPermiumItem(item) && (item.auto_purchase_price === true || item.auto_purchase_discount === true));
+  if (checked.length) {
+    const defaults = await lookupPurchaseItemDefaults(client.query.bind(client), {
+      supplierCode, docDate,
+      taxType: toNumber(payload.tax_type ?? payload.vat_type),
+      saleType: toNumber(payload.sale_type ?? payload.inquiry_type),
+      items: normalizePurchaseDefaultItems(checked),
+    });
+    const byIndex = new Map(defaults.map((row) => [Number(row.request_id), row]));
+    for (const item of checked) {
+      const current = byIndex.get(item.request_id);
+      if (!current) { errors.push(`purchase default not found: line ${item.request_id + 1}`); continue; }
+      if (item.auto_purchase_price === true
+        && (!current.has_purchase_price || toNumber(current.price) <= 0
+          || Math.abs(toNumber(item.price) - toNumber(current.price)) > 0.001)) {
+        errors.push(`purchase price changed: line ${item.request_id + 1}`);
+      }
+      if (item.auto_purchase_discount === true
+        && safeText(item.discount) !== safeText(current.discount)) {
+        errors.push(`purchase discount changed: line ${item.request_id + 1}`);
+      }
+    }
+  }
+  if (payload.auto_bill_discount === true) {
+    const result = await client.query(
+      `SELECT COALESCE(discount_bill,'') AS discount_bill FROM ap_supplier_detail WHERE ap_code=$1 LIMIT 1`,
+      [supplierCode],
+    );
+    if (safeText(payload.discount_word) !== safeText(result.rows[0]?.discount_bill)) {
+      errors.push('supplier bill discount changed');
+    }
+  }
+  return errors;
+}
+
 async function validatePUSavePlan(client, body) {
   const payload = normalizeSavePayload(body);
   const optionRow = await loadPUPricingOptions(client);
@@ -330,6 +373,7 @@ async function validatePUSavePlan(client, body) {
   if (freeItemRows.length) {
     warnings.push(`free/bonus items (is_permium=1): lines ${freeItemRows.join(', ')}`);
   }
+  if (supplierCode && docDate) errors.push(...await checkAutoPurchaseDefaults(client, payload));
   const calculatedTotals = calculatePUDocument(items, payload.discount_word, payload.vat_rate, taxType, optionRow).totals;
   if (Math.abs(toNumber(payload.total_amount) - calculatedTotals.total_amount) > 0.01) {
     warnings.push(`header total_amount will be recalculated on save: ${calculatedTotals.total_amount}`);
@@ -861,6 +905,8 @@ async function insertPUCashbook(client, docNo, fields) {
 }
 
 async function savePUDocTransaction(client, payload, mode) {
+  const defaultErrors = await checkAutoPurchaseDefaults(client, payload);
+  if (defaultErrors.length) throw new Error(defaultErrors.join('; '));
   const fields = normalizedPUSaveFields(payload, await loadPUPricingOptions(client));
   if (!normalizeDate(payload.credit_date) && payload.credit_day != null) {
     fields.creditDate = await resolvePUCreditDate(client.query.bind(client), fields.docDate, fields.creditDay);
@@ -1239,6 +1285,77 @@ router.post('/getPurchaseLatestItemPrices', async (req, res) => {
   }
 });
 
+// Resolve the same purchase discount hierarchy used when SMLERP inserts an item.
+// A matching purchase-price row owns its discount, including an intentionally blank one.
+function normalizePurchaseDefaultItems(input) {
+  return normalizeArray(input).map((item, index) => ({
+    request_id: Number.isInteger(Number(item?.request_id)) ? Number(item.request_id) : index,
+    item_code: safeText(item?.item_code),
+    unit_code: safeText(item?.unit_code),
+    qty: toNumber(item?.qty),
+  })).filter((item) => item.item_code && item.unit_code && item.qty > 0);
+}
+
+async function lookupPurchaseItemDefaults(queryFn, { supplierCode, docDate, taxType, saleType, items }) {
+  const result = await queryFn(
+    `WITH requested AS (
+       SELECT * FROM jsonb_to_recordset($1::jsonb)
+         AS x(request_id integer, item_code text, unit_code text, qty numeric)
+     ), option_row AS (
+       SELECT COALESCE((SELECT get_purchase_price FROM erp_option LIMIT 1),0) AS get_purchase_price
+     )
+     SELECT r.request_id, r.item_code, r.unit_code,
+            CASE WHEN opt.get_purchase_price = 1 AND pr.roworder IS NOT NULL
+                 THEN CASE WHEN $4::integer = 0 THEN pr.sale_price1 ELSE pr.sale_price2 END
+                 ELSE NULL END AS price,
+            CASE WHEN opt.get_purchase_price = 1 AND pr.roworder IS NOT NULL THEN COALESCE(pr.discount,'')
+                 WHEN NULLIF(BTRIM(COALESCE(d.discount,'')),'') IS NOT NULL
+                      AND BTRIM(d.discount) NOT IN ('0','0.0') THEN d.discount
+                 WHEN BTRIM(COALESCE(sd.discount_item,'')) NOT IN ('','0','0.0') THEN COALESCE(sd.discount_item,'')
+                 ELSE '' END AS discount,
+            CASE WHEN opt.get_purchase_price = 1 AND pr.roworder IS NOT NULL THEN 'purchase_price'
+                 WHEN NULLIF(BTRIM(COALESCE(d.discount,'')),'') IS NOT NULL
+                      AND BTRIM(d.discount) NOT IN ('0','0.0') THEN 'item'
+                 WHEN BTRIM(COALESCE(sd.discount_item,'')) NOT IN ('','0','0.0') THEN 'supplier'
+                 ELSE 'none' END AS discount_source,
+            opt.get_purchase_price = 1 AND pr.roworder IS NOT NULL AS has_purchase_price
+     FROM requested r
+     LEFT JOIN ic_inventory_detail d ON d.ic_code = r.item_code
+     LEFT JOIN ap_supplier_detail sd ON sd.ap_code = $2
+     CROSS JOIN option_row opt
+     LEFT JOIN LATERAL (
+       SELECT p.roworder, p.sale_price1, p.sale_price2, p.discount
+       FROM ic_inventory_purchase_price p
+       WHERE p.ic_code = r.item_code AND p.unit_code = r.unit_code
+         AND $3::date >= p.from_date AND $3::date <= p.to_date
+         AND r.qty >= p.from_qty AND r.qty <= p.to_qty
+         AND p.sale_type IN (0, CASE WHEN $5::integer IN (0,2) THEN 2 ELSE 1 END)
+         AND ((p.price_type = 3 AND p.supplier_code = $2) OR p.price_type = 1)
+       ORDER BY CASE WHEN p.price_type = 3 THEN 0 ELSE 1 END,
+                p.sale_type DESC, p.transport_type DESC, p.roworder
+       LIMIT 1
+     ) pr ON opt.get_purchase_price = 1
+     ORDER BY r.request_id`,
+    [JSON.stringify(items), supplierCode, docDate, taxType, saleType],
+  );
+  return result.rows;
+}
+
+router.post('/getPurchaseItemDefaults', async (req, res) => {
+  const supplierCode = safeText(req.body?.cust_code);
+  const docDate = normalizeDate(req.body?.doc_date);
+  const taxType = Number(req.body?.tax_type);
+  const saleType = Number(req.body?.sale_type);
+  const items = normalizePurchaseDefaultItems(req.body?.items);
+  if (!supplierCode || !docDate || ![0, 1, 2, 3].includes(taxType) || ![0, 1, 2, 3].includes(saleType)) {
+    return failResponse(res, 'cust_code, doc_date, tax_type and sale_type are required', 400);
+  }
+  if (!items.length) return successResponse(res, []);
+  try {
+    return successResponse(res, await lookupPurchaseItemDefaults(query, { supplierCode, docDate, taxType, saleType, items }));
+  } catch (ex) { return failResponse(res, ex.message, 500); }
+});
+
 // POST /service/v1/checkPurchasePriceIncrease
 // Returns only rows whose net unit cost is higher than the latest usable PU.
 router.post('/checkPurchasePriceIncrease', async (req, res) => {
@@ -1468,6 +1585,8 @@ router.get('/getSupplierDetail', async (req, res) => {
           COALESCE(s.telephone,'') AS telephone,
           COALESCE(d.tax_id,'') AS tax_id,
           COALESCE(d.credit_day,0) AS credit_day,
+           COALESCE(d.discount_bill,'') AS discount_bill,
+           COALESCE(d.discount_item,'') AS discount_item,
           COALESCE(d.branch_code,'') AS branch_code,
           COALESCE(d.branch_type::text,'0') AS branch_type
        FROM ap_supplier s
@@ -1677,6 +1796,7 @@ router.get('/getDocPoDetail', async (req, res) => {
           COALESCE(SUM(pu.qty),0) AS pu_qty,
           po.qty - COALESCE(SUM(pu.qty),0) AS balance_qty,
           po.price,
+           COALESCE(po.discount,'') AS discount,
           COALESCE(po.wh_code,'') AS wh_code,
           COALESCE(po.shelf_code,'') AS shelf_code,
           COALESCE(po.barcode,'') AS barcode,
@@ -1700,7 +1820,7 @@ router.get('/getDocPoDetail', async (req, res) => {
        LEFT JOIN ic_inventory_detail det ON det.ic_code = po.item_code
        WHERE po.doc_no = $1 AND po.trans_flag = ${PO_TRANS_FLAG}
        GROUP BY
-          po.item_code, po.item_name, po.unit_code, po.qty, po.price,
+           po.item_code, po.item_name, po.unit_code, po.qty, po.price, po.discount,
           po.wh_code, po.shelf_code, po.barcode, po.stand_value,
           po.divide_value, po.ratio, inv.tax_type, det.maximum_qty, det.minimum_qty,
           COALESCE(po.is_permium,0)
@@ -1882,3 +2002,5 @@ router.get('/getPurchasePrintForms', async (req, res) => {
 module.exports = router;
 module.exports.savePUDocTransaction = savePUDocTransaction;
 module.exports.calcAfterDiscount = calcAfterDiscount;
+module.exports.lookupPurchaseItemDefaults = lookupPurchaseItemDefaults;
+module.exports.checkAutoPurchaseDefaults = checkAutoPurchaseDefaults;

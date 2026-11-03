@@ -954,6 +954,56 @@ router.get('/ar-billing/advance-payments', async (req, res) => {
   }
 });
 
+async function loadBillingPaymentHistory(docNo) {
+  const result = await query(
+    `SELECT p.doc_no AS receipt_no, r.doc_date, r.doc_time,
+            p.billing_no, p.bill_type,
+            ROUND(SUM(COALESCE(p.sum_pay_money,0)),2) AS paid_amount,
+            COALESCE(r.remark,'') AS receipt_remark
+     FROM ap_ar_trans_detail p
+     JOIN ap_ar_trans r ON r.doc_no = p.doc_no AND r.trans_flag = p.trans_flag
+     WHERE p.trans_flag = 239 AND p.doc_ref = $1
+       AND COALESCE(p.last_status,0) = 0 AND COALESCE(r.last_status,0) = 0
+       AND COALESCE(r.is_cancel,0) = 0
+     GROUP BY p.doc_no, r.doc_date, r.doc_time, p.billing_no, p.bill_type, r.remark
+     ORDER BY r.doc_date, r.doc_time, p.doc_no, p.billing_no`,
+    [docNo],
+  );
+  return result.rows;
+}
+
+function escapeBillingHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[char]);
+}
+
+function renderBillingPaymentHistory(header, rows) {
+  if (!rows.length) return '';
+  const detailRows = rows.map((row) => `<tr>
+    <td>${escapeBillingHtml(dateToISO(row.doc_date))} ${escapeBillingHtml(row.doc_time)}</td>
+    <td>${escapeBillingHtml(row.receipt_no)}</td>
+    <td>${escapeBillingHtml(row.billing_no)}</td>
+    <td class="amount">${roundMoney(row.paid_amount).toFixed(2)}</td>
+    <td>${escapeBillingHtml(row.receipt_remark)}</td>
+  </tr>`).join('');
+  return `<style>
+    .billing-payment-history { max-width: 190mm; margin: 16px auto; padding: 12mm;
+      background: #fff; color: #111827; font: 11pt sans-serif; }
+    .billing-payment-history h2 { margin: 0 0 4mm; font-size: 15pt; }
+    .billing-payment-history table { width: 100%; border-collapse: collapse; font-size: 9pt; }
+    .billing-payment-history th, .billing-payment-history td { border: 1px solid #cbd5e1; padding: 2mm; text-align: left; }
+    .billing-payment-history .amount { text-align: right; white-space: nowrap; }
+    .billing-payment-history .remark { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 5mm; }
+    @media print { .billing-payment-history { break-before: page; margin: 0; box-shadow: none; } }
+  </style><section class="billing-payment-history">
+    <h2>ประวัติการรับชำระ ใบวางบิล ${escapeBillingHtml(header.doc_no)}</h2>
+    <table><thead><tr><th>วันที่ / เวลา</th><th>ใบรับชำระ</th><th>บิลขาย</th><th class="amount">ยอดตัดหนี้</th><th>หมายเหตุ</th></tr></thead>
+    <tbody>${detailRows}</tbody></table>
+    <div class="remark"><strong>หมายเหตุใบวางบิล</strong><br>${escapeBillingHtml(header.remark)}</div>
+  </section>`;
+}
+
 router.get('/ar-billing/detail', async (req, res) => {
   const docNo = safeText(req.query.doc_no);
   if (!docNo) return res.status(400).json({ success: false, msg: 'doc_no is required' });
@@ -990,10 +1040,14 @@ router.get('/ar-billing/detail', async (req, res) => {
     ]);
     const headerRow = header.rows[0];
     if (!headerRow) return res.status(404).json({ success: false, msg: 'document not found' });
-    const advancePayments = await loadArBillingAdvancePayments(query, headerRow.cust_code);
+    const [advancePayments, paymentHistory] = await Promise.all([
+      loadArBillingAdvancePayments(query, headerRow.cust_code),
+      loadBillingPaymentHistory(docNo),
+    ]);
     return res.json({
       success: true,
-      data: { header: headerRow, details: details.rows, advance_payments: advancePayments },
+      data: { header: headerRow, details: details.rows, advance_payments: advancePayments,
+        payment_history: paymentHistory },
     });
   } catch (ex) {
     if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
@@ -1022,9 +1076,10 @@ router.get('/ar-billing/print/render', async (req, res) => {
 
   try {
     await assertPermission(query, user_code || req.query.emp_code, AR_BILLING_VIEW_PERMISSION);
-    const [options, printData] = await Promise.all([
+    const [options, printData, paymentHistory] = await Promise.all([
       loadPrintFormOptions(docNo),
       loadArBillingPrintDocument(docNo),
+      loadBillingPaymentHistory(docNo),
     ]);
 
     if (!options || !printData) return res.status(404).type('text/plain').send('document not found');
@@ -1053,8 +1108,9 @@ router.get('/ar-billing/print/render', async (req, res) => {
       coordinateScale: 0.72,
       csharpTextAlignment: true,
     });
+    const printableHtml = html.replace('</body>', `${renderBillingPaymentHistory(printData.header, paymentHistory)}</body>`);
     res.setHeader('Cache-Control', 'no-store');
-    return res.status(200).type('html').send(html);
+    return res.status(200).type('html').send(printableHtml);
   } catch (ex) {
     if (isPermissionError(ex)) return res.status(403).type('text/plain').send(ex.message);
     return res.status(500).type('text/plain').send(ex.message);

@@ -57,6 +57,19 @@ function amountExceedsBalance(amount, balance) {
   return Math.abs(roundMoney(amount)) > Math.abs(roundMoney(balance)) + 0.01;
 }
 
+function payableBalance(invoiceBalance, billingBalance) {
+  const invoice = roundMoney(invoiceBalance);
+  const billed = roundMoney(billingBalance);
+  if (!isNonZeroAmount(invoice) || !isNonZeroAmount(billed) || Math.sign(invoice) !== Math.sign(billed)) return 0;
+  return Math.sign(invoice) * Math.min(Math.abs(invoice), Math.abs(billed));
+}
+
+function billingPaymentNote({ docDate, docTime, receiptNo, rows, remark }) {
+  const items = rows.map((row) => `${row.billing_no} ${roundMoney(row.sum_pay_money).toFixed(2)}`).join(', ');
+  const noteRemark = safeText(remark).replace(/\s+/g, ' ');
+  return `[รับชำระ ${docDate} ${docTime} ${receiptNo}] ${items}${noteRemark ? ` | ${noteRemark}` : ''}`;
+}
+
 function boolFlag(value) {
   if (typeof value === 'boolean') return value;
   const text = String(value ?? '').trim().toLowerCase();
@@ -1228,6 +1241,98 @@ router.get('/ar-debt-payment/list', async (req, res) => {
   }
 });
 
+router.get('/ar-debt-payment/search-bills', async (req, res) => {
+  const search = safeText(req.query.search);
+  if (search.length < 2) return res.json({ success: true, data: [] });
+  const docDate = normalizeDate(req.query.doc_date);
+  const dueDate = normalizeDate(req.query.due_date, docDate);
+  const userCode = req.query.user_code || req.query.emp_code;
+  try {
+    await assertPermission(query, userCode, VIEW_PERMISSION);
+    const profile = await loadArDebtPaymentProfile(query, userCode);
+    const branchCode = safeText(req.query.branch_code) || profile.userBranchCode;
+    const includeBranch = profile.branchStatus === 1 && profile.showBranchDocOnly && !profile.userCanChangeBranch && !!branchCode;
+    const candidates = await query(
+      `SELECT b.doc_no AS source_billing_no, h.doc_date AS source_billing_date,
+              b.billing_no, MIN(b.billing_date) AS billing_date, b.bill_type,
+              MIN(b.line_number) AS line_number,
+              h.cust_code, COALESCE(c.name_1,'') AS cust_name,
+              SUM(COALESCE(b.sum_pay_money,0)) AS billed_amount,
+              ROUND(SUM(COALESCE(b.sum_pay_money,0)) - COALESCE((
+                SELECT SUM(p.sum_pay_money)
+                FROM ap_ar_trans_detail p
+                WHERE p.trans_flag = $2 AND COALESCE(p.last_status,0) = 0
+                  AND p.doc_ref = b.doc_no AND p.billing_no = b.billing_no
+                  AND p.bill_type = b.bill_type
+              ),0),2) AS billing_balance
+       FROM ap_ar_trans_detail b
+       JOIN ap_ar_trans h ON h.doc_no = b.doc_no AND h.trans_flag = b.trans_flag
+       LEFT JOIN ar_customer c ON c.code = h.cust_code
+       WHERE b.trans_flag = $3 AND b.billing_no ILIKE $1
+         AND b.bill_type = ANY($4::int[])
+         AND h.doc_date <= $5::date
+         AND COALESCE(h.doc_success,0) = 0 AND COALESCE(h.last_status,0) = 0
+         AND COALESCE(h.is_cancel,0) = 0 AND COALESCE(b.last_status,0) = 0
+         ${includeBranch ? 'AND COALESCE(h.branch_code,\'\') = $6' : ''}
+       GROUP BY b.doc_no, h.doc_date, b.billing_no, b.bill_type,
+                h.cust_code, c.name_1
+       ORDER BY CASE WHEN UPPER(b.billing_no) = UPPER($${includeBranch ? 7 : 6}) THEN 0 ELSE 1 END,
+                h.doc_date DESC, b.doc_no, MIN(b.line_number)
+       LIMIT 80`,
+      includeBranch
+        ? [`%${search}%`, TRANS_FLAG, BILLING_TRANS_FLAG, DEBT_DOC_FLAGS, docDate, branchCode, search]
+        : [`%${search}%`, TRANS_FLAG, BILLING_TRANS_FLAG, DEBT_DOC_FLAGS, docDate, search],
+    );
+    const byCustomer = new Map();
+    for (const row of candidates.rows) {
+      if (!byCustomer.has(row.cust_code)) byCustomer.set(row.cust_code, []);
+      byCustomer.get(row.cust_code).push(row);
+    }
+    const resultRows = [];
+    for (const [custCode, rows] of byCustomer) {
+      const params = [];
+      const idx = {
+        custCode: params.push(custCode), docDate: params.push(docDate),
+        saleFlags: params.push(SALE_FLAGS), debitFlags: params.push(DEBIT_NOTE_FLAGS),
+        creditFlags: params.push(CREDIT_NOTE_FLAGS),
+        docNos: params.push(rows.map((row) => row.billing_no)),
+        billTypes: params.push(rows.map((row) => toInt(row.bill_type))),
+      };
+      if (includeBranch) idx.branch = params.push(branchCode);
+      if (profile.useCreditPayBillCalc) idx.dueDate = params.push(dueDate);
+      const cte = withDebtBalanceParams(arDebtBalanceCte({
+        includeDocKeys: true, includeBranch, useCreditPayBillCalc: profile.useCreditPayBillCalc,
+      }), idx);
+      const balances = await query(
+        `${cte} SELECT doc_no, doc_date, due_date, bill_type, bill_type_name,
+                        ref_doc_no, ref_doc_date, sum_debt_amount,
+                        ROUND(balance_ref,2) AS balance_ref
+                 FROM debt_balance_docs`,
+        params,
+      );
+      const balanceMap = new Map(balances.rows.map((row) => [`${row.doc_no}|${row.bill_type}`, row]));
+      for (const row of rows) {
+        const balance = balanceMap.get(`${row.billing_no}|${row.bill_type}`);
+        if (!balance) continue;
+        const available = payableBalance(balance.balance_ref, row.billing_balance);
+        if (!isNonZeroAmount(available)) continue;
+        resultRows.push({
+          ...balance, source_mode: 'billing_note',
+          source_billing_no: row.source_billing_no,
+          source_billing_date: row.source_billing_date,
+          billing_no: row.billing_no, billing_date: balance.doc_date,
+          cust_code: row.cust_code, cust_name: row.cust_name,
+          billed_amount: row.billed_amount, balance_ref: available,
+        });
+      }
+    }
+    return res.json({ success: true, data: resultRows });
+  } catch (ex) {
+    if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
+    return res.status(500).json({ success: false, msg: ex.message });
+  }
+});
+
 router.get('/ar-debt-payment/open-billings', async (req, res) => {
   const custCode = safeText(req.query.cust_code);
   const search = safeText(req.query.search);
@@ -1471,6 +1576,12 @@ router.get('/ar-debt-payment/billing-detail', async (req, res) => {
       `SELECT b.doc_no AS source_billing_no, h.doc_date AS source_billing_date,
               b.billing_no, b.billing_date, b.bill_type, b.line_number, b.roworder,
               COALESCE(b.sum_pay_money,0) AS billed_amount,
+              ROUND(COALESCE(b.sum_pay_money,0) - COALESCE((
+                SELECT SUM(p.sum_pay_money) FROM ap_ar_trans_detail p
+                WHERE p.trans_flag = $4 AND COALESCE(p.last_status,0) = 0
+                  AND p.doc_ref = b.doc_no AND p.billing_no = b.billing_no
+                  AND p.bill_type = b.bill_type
+              ),0),2) AS billing_balance,
               COALESCE(b.remark,'') AS billing_remark
        FROM ap_ar_trans_detail b
        JOIN ap_ar_trans h ON h.doc_no = b.doc_no AND h.trans_flag = b.trans_flag
@@ -1479,9 +1590,10 @@ router.get('/ar-debt-payment/billing-detail', async (req, res) => {
          AND h.cust_code = $3
          AND COALESCE(h.doc_success,0) = 0
          AND COALESCE(h.last_status,0) = 0
+         AND COALESCE(h.is_cancel,0) = 0
          AND COALESCE(b.last_status,0) = 0
        ORDER BY h.doc_date, b.doc_no, b.line_number, b.roworder`,
-      [BILLING_TRANS_FLAG, docNos, custCode],
+      [BILLING_TRANS_FLAG, docNos, custCode, TRANS_FLAG],
     );
     const selectedRows = selected.rows.filter((row) => !excludeKeySet.has(debtDocKey(row)));
     if (!selectedRows.length) return res.json({ success: true, data: [] });
@@ -1522,6 +1634,8 @@ router.get('/ar-debt-payment/billing-detail', async (req, res) => {
     for (const source of selectedRows) {
       const balance = balanceMap.get(debtDocKey(source));
       if (!balance) continue;
+      const available = payableBalance(balance.balance_ref, source.billing_balance);
+      if (!isNonZeroAmount(available)) continue;
       rows.push({
         source_mode: 'billing_note',
         source_billing_no: source.source_billing_no,
@@ -1538,7 +1652,7 @@ router.get('/ar-debt-payment/billing-detail', async (req, res) => {
         due_day: balance.due_day,
         credit_day: balance.credit_day,
         sum_debt_amount: balance.sum_debt_amount,
-        balance_ref: balance.balance_ref,
+        balance_ref: available,
         sum_debt_amount_2: balance.sum_debt_amount_2,
         balance_ref_2: balance.balance_ref_2,
         currency_code: balance.currency_code,
@@ -1551,74 +1665,6 @@ router.get('/ar-debt-payment/billing-detail', async (req, res) => {
       });
     }
     return res.json({ success: true, data: rows });
-  } catch (ex) {
-    if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
-    return res.status(500).json({ success: false, msg: ex.message });
-  }
-});
-
-router.get('/ar-debt-payment/billing-detail', async (req, res) => {
-  const custCode = safeText(req.query.cust_code);
-  const docNos = String(req.query.doc_nos || '')
-    .split(',')
-    .map(safeText)
-    .filter(Boolean);
-  if (!custCode || !docNos.length) return res.json({ success: true, data: [] });
-  try {
-    await assertPermission(query, req.query.user_code || req.query.emp_code, VIEW_PERMISSION);
-    const result = await query(
-      `SELECT b.doc_no AS source_billing_no, h.doc_date AS source_billing_date,
-              b.billing_no, b.billing_date, b.bill_type,
-              CASE b.bill_type
-                WHEN 44 THEN 'ขายเชื่อ'
-                WHEN 46 THEN 'เพิ่มหนี้'
-                WHEN 48 THEN 'ลดหนี้'
-                WHEN 93 THEN 'ตั้งหนี้ยกมา'
-                WHEN 95 THEN 'เพิ่มหนี้ยกมา'
-                WHEN 97 THEN 'ลดหนี้ยกมา'
-                WHEN 99 THEN 'ตั้งหนี้อื่น'
-                WHEN 101 THEN 'เพิ่มหนี้อื่น'
-                WHEN 103 THEN 'ลดหนี้อื่น'
-                ELSE b.bill_type::text
-              END AS bill_type_name,
-              COALESCE(b.ref_doc_no,'') AS ref_doc_no, b.ref_doc_date, b.due_date,
-              COALESCE(b.sum_debt_amount,0) AS sum_debt_amount,
-              COALESCE(b.sum_pay_money,0) AS billed_amount,
-              GREATEST(ROUND(
-                COALESCE(b.sum_pay_money,0)
-                - COALESCE((
-                  SELECT SUM(p.sum_pay_money)
-                  FROM ap_ar_trans_detail p
-                  WHERE p.trans_flag = $3
-                    AND COALESCE(p.last_status,0) = 0
-                    AND p.doc_ref = b.doc_no
-                    AND p.billing_no = b.billing_no
-                    AND p.bill_type = b.bill_type
-                ),0), 2), 0) AS balance_ref,
-              COALESCE(b.remark,'') AS remark
-       FROM ap_ar_trans_detail b
-       JOIN ap_ar_trans h ON h.doc_no = b.doc_no AND h.trans_flag = b.trans_flag
-       WHERE b.trans_flag = $1
-         AND b.doc_no = ANY($2::text[])
-         AND h.cust_code = $4
-         AND COALESCE(h.doc_success,0) = 0
-         AND COALESCE(h.last_status,0) = 0
-         AND COALESCE(b.last_status,0) = 0
-         AND GREATEST(ROUND(
-           COALESCE(b.sum_pay_money,0)
-           - COALESCE((
-             SELECT SUM(p.sum_pay_money)
-             FROM ap_ar_trans_detail p
-             WHERE p.trans_flag = $3
-               AND COALESCE(p.last_status,0) = 0
-               AND p.doc_ref = b.doc_no
-               AND p.billing_no = b.billing_no
-               AND p.bill_type = b.bill_type
-           ),0), 2), 0) > 0
-       ORDER BY h.doc_date, b.doc_no, b.line_number, b.roworder`,
-      [BILLING_TRANS_FLAG, docNos, TRANS_FLAG, custCode],
-    );
-    return res.json({ success: true, data: result.rows });
   } catch (ex) {
     if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
     return res.status(500).json({ success: false, msg: ex.message });
@@ -1839,22 +1885,39 @@ router.post('/ar-debt-payment/save', async (req, res) => {
       savedDocFormatCode = doc.doc_format_code;
       savedFormCode = doc.form_code || '';
 
-      const sourceBillingNos = [...new Set(details.map((row) => row.source_billing_no).filter(Boolean))];
+      const sourceBillingNos = [...new Set(details.map((row) => row.source_billing_no).filter(Boolean))].sort();
       const billNoteRows = details.filter((row) => row.source_billing_no);
       const directRows = details.filter((row) => !row.source_billing_no);
       if (profile.arPayFromBillNote && directRows.length) {
         throw new Error('billing note reference is required');
       }
 
+      if (sourceBillingNos.length) {
+        await client.query(
+          `SELECT doc_no FROM ap_ar_trans
+           WHERE trans_flag = $1 AND doc_no = ANY($2::text[])
+           ORDER BY doc_no FOR UPDATE`,
+          [BILLING_TRANS_FLAG, sourceBillingNos],
+        );
+        await client.query(
+          `SELECT doc_no FROM ic_trans
+           WHERE doc_no = ANY($1::text[]) AND trans_flag = ANY($2::int[])
+           ORDER BY doc_no, trans_flag FOR UPDATE`,
+          [[...new Set(billNoteRows.map((row) => row.billing_no))],
+            [...new Set(billNoteRows.map((row) => row.bill_type))]],
+        );
+      }
+
       const validMap = new Map();
       if (billNoteRows.length) {
         const validation = await client.query(
           `SELECT b.doc_no AS source_billing_no, b.billing_no, b.bill_type,
-                  COALESCE(b.sum_debt_amount,0) AS sum_debt_amount,
-                  COALESCE(b.sum_pay_money,0) AS billed_amount,
-                  b.billing_date, b.due_date, b.ref_doc_no, b.ref_doc_date,
+                  MAX(COALESCE(b.sum_debt_amount,0)) AS sum_debt_amount,
+                  SUM(COALESCE(b.sum_pay_money,0)) AS billed_amount,
+                  MIN(b.billing_date) AS billing_date, MIN(b.due_date) AS due_date,
+                  MIN(b.ref_doc_no) AS ref_doc_no, MIN(b.ref_doc_date) AS ref_doc_date,
                   GREATEST(ROUND(
-                    COALESCE(b.sum_pay_money,0)
+                    SUM(COALESCE(b.sum_pay_money,0))
                     - COALESCE((
                       SELECT SUM(p.sum_pay_money)
                       FROM ap_ar_trans_detail p
@@ -1871,7 +1934,9 @@ router.post('/ar-debt-payment/save', async (req, res) => {
              AND h.cust_code = $4
              AND COALESCE(h.doc_success,0) = 0
              AND COALESCE(h.last_status,0) = 0
-             AND COALESCE(b.last_status,0) = 0`,
+             AND COALESCE(h.is_cancel,0) = 0
+             AND COALESCE(b.last_status,0) = 0
+           GROUP BY b.doc_no, b.billing_no, b.bill_type`,
           [BILLING_TRANS_FLAG, sourceBillingNos, TRANS_FLAG, custCode],
         );
         for (const row of validation.rows) {
@@ -1905,7 +1970,9 @@ router.post('/ar-debt-payment/save', async (req, res) => {
         for (const [key, row] of validMap.entries()) {
           if (!row.source_billing_no) continue;
           const balance = balanceMap.get(`${row.billing_no}|${row.bill_type}`);
-          if (balance) validMap.set(key, { ...row, ...balance });
+          if (balance) validMap.set(key, { ...row, ...balance,
+            balance_ref: payableBalance(balance.balance_ref, row.balance_ref) });
+          else validMap.delete(key);
         }
       }
 
@@ -2171,6 +2238,33 @@ router.post('/ar-debt-payment/save', async (req, res) => {
       }
 
       await updateBillingStatuses(client, sourceBillingNos, details);
+      if (sourceBillingNos.length) {
+        const remarkColumn = await client.query(
+          `SELECT character_maximum_length
+           FROM information_schema.columns
+           WHERE table_schema = current_schema() AND table_name = 'ap_ar_trans' AND column_name = 'remark'
+           LIMIT 1`,
+        );
+        const maxLength = remarkColumn.rows[0]?.character_maximum_length;
+        for (const billingNo of sourceBillingNos) {
+          const rows = details.filter((row) => row.source_billing_no === billingNo);
+          const note = billingPaymentNote({ docDate, docTime, receiptNo: savedDocNo, rows, remark });
+          const existing = await client.query(
+            `SELECT COALESCE(remark,'') AS remark FROM ap_ar_trans
+             WHERE trans_flag = $1 AND doc_no = $2 FOR UPDATE`,
+            [BILLING_TRANS_FLAG, billingNo],
+          );
+          const oldRemark = existing.rows[0]?.remark || '';
+          const updatedRemark = `${oldRemark}${oldRemark ? '\n' : ''}${note}`;
+          if (maxLength !== null && maxLength !== undefined && updatedRemark.length > Number(maxLength)) {
+            throw new Error(`หมายเหตุใบวางบิล ${billingNo} ยาวเกิน ${maxLength} ตัวอักษร กรุณาลดข้อความหมายเหตุ`);
+          }
+          await client.query(
+            `UPDATE ap_ar_trans SET remark = $1 WHERE trans_flag = $2 AND doc_no = $3`,
+            [updatedRemark, BILLING_TRANS_FLAG, billingNo],
+          );
+        }
+      }
     });
 
     return res.json({
@@ -2184,7 +2278,7 @@ router.post('/ar-debt-payment/save', async (req, res) => {
   } catch (ex) {
     if (ex.message && ex.message.includes('not found')) return res.status(404).json({ success: false, msg: ex.message });
     if (isPermissionError(ex)) return res.status(403).json({ success: false, msg: ex.message });
-    if (ex.message && (ex.message.includes('exceeds balance') || ex.message.includes('reference is required'))) return res.status(400).json({ success: false, msg: ex.message });
+    if (ex.message && (ex.message.includes('exceeds balance') || ex.message.includes('reference is required') || ex.message.includes('ยาวเกิน'))) return res.status(400).json({ success: false, msg: ex.message });
     return res.status(500).json({ success: false, msg: ex.message });
   }
 });
