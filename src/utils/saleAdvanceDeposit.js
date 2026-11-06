@@ -54,11 +54,40 @@ async function querySaleAdvanceDepositBalances(queryFn, custCode, docNos = []) {
   return result.rows;
 }
 
+async function queryCustomerAdvanceBalanceTotal(queryFn, custCode) {
+  const result = await queryFn(
+    `SELECT COALESCE(SUM(GREATEST(ROUND(
+              COALESCE(h.total_amount,0)
+              - COALESCE((
+                  SELECT SUM(COALESCE(r.total_amount,0))
+                  FROM ic_trans r
+                  WHERE COALESCE(r.last_status,0) = 0
+                    AND r.trans_flag = 42
+                    AND r.doc_ref = h.doc_no
+                ),0)
+              - COALESCE((
+                  SELECT SUM(COALESCE(d.amount,0))
+                  FROM cb_trans_detail d
+                  WHERE COALESCE(d.last_status,0) = 0
+                    AND d.doc_type = 5
+                    AND d.trans_number = h.doc_no
+                ),0), 2), 0)), 0) AS advance_balance_total
+     FROM ic_trans h
+     WHERE h.trans_flag IN (40,9040)
+       AND h.cust_code = $1
+       AND COALESCE(h.last_status,0) = 0
+       AND COALESCE(h.is_doc_copy,0) <> 1`,
+    [String(custCode || '').trim()],
+  );
+  return toNumber(result.rows[0]?.advance_balance_total);
+}
+
 function summarizeSaleAdvanceDepositBalances(rows = []) {
   return rows.reduce((sum, row) => sum + toNumber(row?.balance_amount), 0);
 }
 
 module.exports = {
   querySaleAdvanceDepositBalances,
+  queryCustomerAdvanceBalanceTotal,
   summarizeSaleAdvanceDepositBalances,
 };

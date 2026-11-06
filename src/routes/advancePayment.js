@@ -4,6 +4,7 @@ const { withTransaction, query } = require('../db');
 const { resolveDocumentNo } = require('../utils/docFormat');
 const { getEmployeePermissions } = require('../utils/permissions');
 const { renderSalePrintHtml } = require('../utils/salePrintRenderer');
+const { queryCustomerAdvanceBalanceTotal } = require('../utils/saleAdvanceDeposit');
 
 const TRANS_TYPE = 2;
 const TRANS_FLAG = 40;
@@ -338,6 +339,7 @@ async function loadAdvancePaymentPrintDocument(docNo) {
 
   const header = headerRes.rows[0];
   if (!header) return null;
+  header.advance_balance_total = await queryCustomerAdvanceBalanceTotal(query, header.cust_code);
   const company = companyRes.rows[0] || {};
   company.tax_text = company.tax_number ? `หมายเลขประจำตัวผู้เสียภาษี ${company.tax_number}` : '';
   company.telephone_text = company.telephone_number ? `โทร. ${company.telephone_number}` : '';
