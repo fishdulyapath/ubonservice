@@ -10,6 +10,8 @@ const { quotePartialUnitSale } = require('../utils/partialUnitSale');
 const { getEmployeePermissions } = require('../utils/permissions');
 const { assertBasketAccess } = require('../utils/basketAccess');
 const { querySaleAdvanceDepositBalances } = require('../utils/saleAdvanceDeposit');
+const { scheduleSaleAudit } = require('../utils/saleAuditLog');
+const { normalizeSaveRequestId, newSaveRequestId, findSavedStaffSale, claimStaffSaleSave } = require('../utils/saleSaveRequest');
 const {
   buildSalePremiumFulfillment,
   createSalePremiumBacklogs,
@@ -857,6 +859,9 @@ async function handleSaveTrans(req, res, options = {}) {
     const branch_code = obj.branch_code || '';
     const emp_code = obj.emp_code || '';
     const creator_code = String(obj.creator_code || '').trim();
+    const isStaffSale = creator_code.toLowerCase() === 'smlstaff';
+    const providedSaveRequestId = isStaffSale ? normalizeSaveRequestId(obj.save_request_id) : '';
+    const staffSaveRequestId = isStaffSale ? (providedSaveRequestId || newSaveRequestId()) : '';
     const pos_id = obj.pos_id || '';
     const shelf_code = obj.shelf_code || '';
     const remark = obj.remark || '';
@@ -947,6 +952,7 @@ async function handleSaveTrans(req, res, options = {}) {
     let money_change = Math.max(0, roundMoney(total_amount_pay - total_net_amount_dbl));
 
     let doc_no;
+    let reusedSale = false;
     let promotion_count = 0;
     let createdPremiumBacklogs = [];
     let appliedPremiumBacklogDeliveries = [];
@@ -955,6 +961,21 @@ async function handleSaveTrans(req, res, options = {}) {
     let smlPromotionBacklogOnly = false;
     let claimPurchaseDocNo = '';
     await withTransaction(async (client) => {
+      if (isStaffSale) {
+        const previous = await claimStaffSaleSave(client, {
+          requestId: staffSaveRequestId,
+          basketId: basket_id,
+          basketEpoch: obj.basket_epoch,
+          requireBasketEpoch: Boolean(providedSaveRequestId),
+          itemGuids: items.map((item) => item.guid_code),
+        });
+        if (previous) {
+          doc_no = previous.doc_no;
+          doc_format_code = previous.doc_format_code;
+          reusedSale = true;
+          return;
+        }
+      }
       if (basket_id) {
         await assertBasketAccess(client.query.bind(client), user_code || emp_code, basket_id, 'can_save_sale');
       }
@@ -1249,8 +1270,8 @@ async function handleSaveTrans(req, res, options = {}) {
           cust_code,branch_code,send_date,vat_rate,total_value,total_vat_value,total_after_vat,
           total_amount,total_before_vat,total_except_vat,doc_time,doc_format_code,creator_code,sale_code,
           total_discount,discount_word,remark,send_type,send_sms,remark_3,remark_4,remark_5,pos_id,
-          credit_day,credit_date
-        ) VALUES ($1,$2,2,44,$3::date,$4,$4,$3::date,$5,$6,$3::date,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,0,$21,$22,$23,$24,$25,$26,$27::date)`,
+          credit_day,credit_date,guid_code
+        ) VALUES ($1,$2,2,44,$3::date,$4,$4,$3::date,$5,$6,$3::date,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,0,$21,$22,$23,$24,$25,$26,$27::date,$28)`,
         [
           inquiry_type, vat_type,
           doc_date, doc_no,
@@ -1261,7 +1282,7 @@ async function handleSaveTrans(req, res, options = {}) {
           creator_code, emp_code,
           total_disc, discount_word, remark,
           tigerSendSms, tiger_order_id, shelf_code, tigerRemark5, pos_id,
-          customerCredit.credit_day, customerCredit.credit_date,
+          customerCredit.credit_day, customerCredit.credit_date, staffSaveRequestId,
         ]
       );
 
@@ -1701,9 +1722,14 @@ async function handleSaveTrans(req, res, options = {}) {
       );
     });
 
+    if (isStaffSale && doc_no && !reusedSale) {
+      scheduleSaleAudit({ docNo: doc_no, basketId: basket_id, userCode: user_code || emp_code });
+    }
+
     return res.json({
       success: true,
       doc_no: doc_no || '',
+      duplicate: reusedSale,
       doc_format_code,
       form_code,
       promotion_count,
@@ -1743,6 +1769,19 @@ async function handleSaveTrans(req, res, options = {}) {
     return res.status(ex.statusCode || 500).json({ success: false, msg });
   }
 }
+
+// A timed-out browser request can check whether its original sale committed.
+router.get('/sales/save-status', async (req, res) => {
+  try {
+    const requestId = normalizeSaveRequestId(req.query.save_request_id);
+    if (!requestId) return res.status(400).json({ success: false, msg: 'save_request_id is required' });
+    const saved = await findSavedStaffSale(query, requestId);
+    return res.json({ success: true, found: Boolean(saved), doc_no: saved?.doc_no || '',
+      doc_format_code: saved?.doc_format_code || '' });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ success: false, msg: error.message });
+  }
+});
 
 // -- POST /service/v1/saveTrans ---------------------------------------------
 router.post('/saveTrans', async (req, res) => {

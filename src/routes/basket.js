@@ -2,6 +2,7 @@
 const router = express.Router();
 const { query, withTransaction } = require('../db');
 const { successResponse, failResponse } = require('../utils/response');
+const { lockSaleBasket } = require('../utils/saleSaveRequest');
 const {
   assertBasketAccess,
   getEmployeeBasketAccess,
@@ -126,6 +127,7 @@ router.get('/getBasketList', async (req, res) => {
       SELECT
         b.basket_id, b.cust_code, b.cust_name, b.inquiry_type, b.vat_type, b.vat_rate,
         b.sale_code, b.sale_name, b.status, b.updated_at,
+        to_char(b.updated_at, 'YYYY-MM-DD HH24:MI:SS.US') AS basket_epoch,
         COALESCE(NULLIF(b.doc_format_code,''), dd.code, '') AS doc_format_code,
         COALESCE(df.name_1, dd.name_1, '') AS doc_format_name,
         COALESCE(df.format, dd.format, '') AS doc_format,
@@ -203,45 +205,38 @@ router.post('/setBasketInfo', async (req, res) => {
   }
 
   try {
-    await assertBasketAccess(query, userCode, basket_id, 'can_edit_basket');
-    let docFormatRes;
-    const docFormatCode = String(doc_format_code || '').trim();
-    if (docFormatCode) {
-      docFormatRes = await query(
-        `SELECT code, COALESCE(form_code,'') AS form_code
-         FROM erp_doc_format
-         WHERE screen_code = 'SI' AND code = $1
-         LIMIT 1`,
-        [docFormatCode],
+    const updated = await withTransaction(async (client) => {
+      await lockSaleBasket(client, basket_id);
+      await assertBasketAccess(client.query.bind(client), userCode, basket_id, 'can_edit_basket');
+      const docFormatCode = String(doc_format_code || '').trim();
+      const docFormatRes = docFormatCode
+        ? await client.query(
+          `SELECT code, COALESCE(form_code,'') AS form_code
+           FROM erp_doc_format WHERE screen_code='SI' AND code=$1 LIMIT 1`,
+          [docFormatCode],
+        )
+        : await client.query(
+          `SELECT code, COALESCE(form_code,'') AS form_code
+           FROM erp_doc_format WHERE screen_code='SI' ORDER BY code LIMIT 1`,
+        );
+      const docFormat = docFormatRes.rows[0];
+      if (!docFormat) {
+        const error = new Error('ไม่พบรหัสเอกสารขาย');
+        error.statusCode = 400;
+        throw error;
+      }
+      return client.query(
+        `UPDATE pos_basket
+         SET cust_code=$2, cust_name=$3, inquiry_type=$4, vat_type=$5, vat_rate=$6,
+             sale_code=$7, sale_name=$8, doc_format_code=$9, form_code=$10,
+             status='active', updated_at=NOW()
+         WHERE basket_id=$1
+         RETURNING to_char(updated_at, 'YYYY-MM-DD HH24:MI:SS.US') AS basket_epoch`,
+        [basket_id, cust_code, cust_name, inquiry_type, vat_type, vat_rate,
+          sale_code, sale_name, docFormat.code, docFormat.form_code],
       );
-    } else {
-      docFormatRes = await query(
-        `SELECT code, COALESCE(form_code,'') AS form_code
-         FROM erp_doc_format
-         WHERE screen_code = 'SI'
-         ORDER BY code
-         LIMIT 1`,
-        [],
-      );
-    }
-
-    const docFormat = docFormatRes.rows[0];
-    if (!docFormat) {
-      return failResponse(res, 'ไม่พบรหัสเอกสารขาย', 400);
-    }
-
-    await query(
-      `UPDATE pos_basket
-       SET cust_code=$2, cust_name=$3, inquiry_type=$4, vat_type=$5, vat_rate=$6,
-           sale_code=$7, sale_name=$8, doc_format_code=$9, form_code=$10,
-           status='active', updated_at=NOW()
-       WHERE basket_id=$1`,
-      [
-        basket_id, cust_code, cust_name, inquiry_type, vat_type, vat_rate,
-        sale_code, sale_name, docFormat.code, docFormat.form_code,
-      ],
-    );
-    return successResponse(res, null);
+    });
+    return successResponse(res, updated.rows[0] || null);
   } catch (ex) {
     console.error('setBasketInfo error:', ex.message);
     return failResponse(res, ex.message, ex.statusCode || 500);
@@ -260,6 +255,7 @@ router.post('/clearBasket', async (req, res) => {
 
   try {
     await withTransaction(async (client) => {
+      await lockSaleBasket(client, basket_id);
       await assertBasketAccess(client.query.bind(client), userCode, basket_id, 'can_edit_basket');
       await client.query(`DELETE FROM sml_staff_cart_claim WHERE cart_key = 'BASKET-' || $1::text`, [basket_id]);
       await client.query(

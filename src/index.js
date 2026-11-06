@@ -100,6 +100,7 @@ require('./db/migrateClaimSchema').migrateClaimSchema().then(() =>
   app.listen(PORT, () => {
     console.log(`MarketPlaceWebService Express running on port ${PORT}`);
     console.log(`Base URL: http://localhost:${PORT}/service/v1/`);
+    require('./utils/saleAuditLog').startSaleAuditRecovery();
   });
 }).catch((error) => {
   console.error('Staff schema migration failed:', error.message);

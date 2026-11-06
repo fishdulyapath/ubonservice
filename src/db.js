@@ -22,6 +22,22 @@ const dbConfig = {
 
 const pool = new Pool({ ...dbConfig, database: process.env.DB_NAME || 'demo' });
 const poolImages = new Pool({ ...dbConfig, database: process.env.DB_IMAGES_NAME || 'demo_images' });
+let poolLogs;
+
+function getLogsPool() {
+  if (!poolLogs) {
+    poolLogs = new Pool({
+      ...dbConfig,
+      database: process.env.DB_LOGS_NAME || `${process.env.DB_NAME || 'demo'}_logs`,
+      max: 2,
+      connectionTimeoutMillis: 3000,
+    });
+    poolLogs.on('error', (err) => {
+      console.error('PostgreSQL logs pool error:', err.message);
+    });
+  }
+  return poolLogs;
+}
 
 pool.on('connect', (client) => {
   client.query('SET enable_seqscan = false').catch(() => {});
@@ -70,4 +86,4 @@ async function queryImages(sql, params) {
   }
 }
 
-module.exports = { pool, poolImages, query, queryImages, withTransaction };
+module.exports = { pool, poolImages, getLogsPool, query, queryImages, withTransaction };
